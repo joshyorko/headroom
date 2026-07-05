@@ -31,19 +31,10 @@ permissions:
   id-token: write # For cosign keyless signing via Sigstore OIDC
 
 jobs:
-  # ─── Per-arch fan-out ──────────────────────────────────────────────────────
-  # Build each variant on its native architecture in parallel:
-  #   linux/amd64 → ubuntu-24.04 (native x86_64)
-  #   linux/arm64 → ubuntu-24.04-arm (native aarch64, GA Jan 2025)
-  #
-  # Pre-#377 we ran a single matrix job per variant on `ubuntu-latest` and
-  # let bake's `platforms = ["linux/amd64", "linux/arm64"]` do multi-arch
-  # via QEMU emulation — ~1h per variant. Native arm64 runners drop QEMU
-  # entirely and cut each variant to ~10 min on each arch in parallel.
-  #
-  # Each per-arch build pushes by digest only (no tags). The
-  # `docker-manifest` job below combines the per-arch digests into the
-  # final multi-arch tagged manifest, which is what users pull by tag.
+  # Self-hosted fork lane: publish the single image Kamal deploys.
+  # Upstream builds a catalog of slim/code/root/nonroot variants across both
+  # arches. This fork only needs the root GHCR tag for the configured Kamal
+  # architecture, so keep the fan-out to one build job and one manifest/sign job.
   docker-build:
     runs-on: ${{ matrix.arch.runs_on }}
     timeout-minutes: 75
@@ -51,17 +42,9 @@ jobs:
       fail-fast: false
       matrix:
         variant:
-          - { name: "", bake_target: runtime }
-          - { name: nonroot, bake_target: runtime-nonroot }
-          - { name: code, bake_target: runtime-code }
-          - { name: code-nonroot, bake_target: runtime-code-nonroot }
-          - { name: slim, bake_target: runtime-slim }
-          - { name: slim-nonroot, bake_target: runtime-slim-nonroot }
-          - { name: code-slim, bake_target: runtime-code-slim }
-          - { name: code-slim-nonroot, bake_target: runtime-code-slim-nonroot }
+          - { name: "", bake_target: runtime-self-hosted }
         arch:
           - { name: amd64, runs_on: ubuntu-24.04, platform: linux/amd64 }
-          - { name: arm64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
 
     steps:
       - uses: actions/checkout@v6
@@ -196,20 +179,16 @@ jobs:
       - name: Upload digest marker
         uses: actions/upload-artifact@v7
         with:
-          # Variant + arch in the artifact name so the manifest job can
-          # download with `pattern: digests-<variant>-*` to gather all
-          # arches for one variant. `root` substitutes the empty-string
-          # variant since GHA artifact names can't end in a hyphen.
+          # Keep the variant + arch naming even though the self-hosted lane
+          # currently builds one root amd64 image; the manifest job already
+          # consumes this artifact shape.
           name: digests-${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
-  # ─── Per-variant manifest merge ────────────────────────────────────────────
-  # One job per variant, after both arch builds for that variant complete.
-  # `docker buildx imagetools create` stitches the two per-arch digests
-  # into a single multi-arch index manifest, applies the metadata-action
-  # tags, and that manifest is what users pull by `:tag`.
+  # ─── Manifest tagging ─────────────────────────────────────────────────────
+  # Tag the one self-hosted image digest that Kamal pulls from GHCR.
   docker-manifest:
     needs: docker-build
     runs-on: ubuntu-24.04
@@ -218,20 +197,12 @@ jobs:
       fail-fast: false
       matrix:
         variant:
-          - { name: "", bake_target: runtime }
-          - { name: nonroot, bake_target: runtime-nonroot }
-          - { name: code, bake_target: runtime-code }
-          - { name: code-nonroot, bake_target: runtime-code-nonroot }
-          - { name: slim, bake_target: runtime-slim }
-          - { name: slim-nonroot, bake_target: runtime-slim-nonroot }
-          - { name: code-slim, bake_target: runtime-code-slim }
-          - { name: code-slim-nonroot, bake_target: runtime-code-slim-nonroot }
+          - { name: "", bake_target: runtime-self-hosted }
 
     steps:
       # No `actions/checkout` here: the manifest job only calls
       # `docker buildx imagetools` against the registry and runs
-      # cosign — neither needs the repo on disk. Skipping checkout
-      # saves a few seconds across 8 parallel manifest jobs.
+      # cosign — neither needs the repo on disk.
       - name: Normalize image name
         id: image-name
         run: |
@@ -375,10 +346,8 @@ jobs:
           done
 
   promote-latest:
-    # Re-push the :latest tag pointing at the root variant *after* every
-    # variant manifest job has finished, so GHCR's package version
-    # listing (sorted by created_at) shows the root image with :latest
-    # at the top instead of whichever variant happened to finish last.
+    # Re-push the :latest tag after versioned release builds so GHCR's
+    # package version listing shows the root self-hosted image at the top.
     needs: docker-manifest
     runs-on: ubuntu-24.04
     timeout-minutes: 10

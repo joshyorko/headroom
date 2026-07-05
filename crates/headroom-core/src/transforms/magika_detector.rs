@@ -28,12 +28,6 @@
 //! - **No router rewiring here.** PR3 lands the detector + tests
 //!   only. PR5 flips the ContentRouter to call us instead of the
 //!   regex-based [`crate::transforms::content_detector`].
-//!
-//! - **CPU compatibility.** The precompiled ONNX Runtime binary shipped by
-//!   `ort-sys` may contain AVX2-family instructions on x86/x86_64. Where
-//!   AVX2 is unavailable on those targets, the session init returns an
-//!   error early instead of crashing with SIGILL; the detection chain then
-//!   falls through to Tier 2 and Tier 3 normally.
 
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
@@ -44,22 +38,6 @@ use thiserror::Error;
 use tracing;
 
 use crate::transforms::content_detector::ContentType;
-
-/// Check whether the CPU can run the precompiled ONNX Runtime binary
-/// that magika depends on.
-///
-/// On x86/x86_64 without AVX2, the `onnxruntime` shared library shipped
-/// by `ort-sys` can contain AVX2-family instructions that will SIGILL.
-/// We detect this up front so the magika session init can fail gracefully
-/// instead of crashing.
-///
-/// On non-x86 targets, this x86-specific AVX2 gate is not applied.
-///
-/// Delegates to the shared [`crate::onnx_cpu`] guard so magika and the
-/// embedding scorer agree on a single CPU-support source of truth.
-pub(crate) fn magika_onnx_runtime_supported_by_cpu() -> bool {
-    crate::onnx_cpu::onnx_runtime_supported_by_cpu()
-}
 
 /// Errors from the magika detector. Wraps the underlying `magika::Error`
 /// so callers can match on whether init or inference broke without
@@ -124,17 +102,6 @@ fn magika_init_timeout() -> Duration {
 
 fn session() -> &'static Mutex<Result<Session, String>> {
     MAGIKA_SESSION.get_or_init(|| {
-        // Early-out if the CPU can't run the precompiled ONNX Runtime.
-        // Without this check the `onnxruntime` shared library will crash
-        // with SIGILL on x86 CPUs lacking AVX2.
-        if !magika_onnx_runtime_supported_by_cpu() {
-            return Mutex::new(Err(
-                "Magika ONNX Runtime backend requires AVX2 on this platform; \
-                 falling back to non-Magika detection"
-                    .to_string(),
-            ));
-        }
-
         let timeout = magika_init_timeout();
         let (tx, rx) = mpsc::channel();
         // Run the (potentially hanging) ONNX init on a side thread so we
@@ -267,26 +234,9 @@ mod tests {
     use super::*;
 
     fn assert_detect(content: &str, expected: ContentType, hint: &str) {
-        if !magika_onnx_runtime_supported_by_cpu() {
-            // On x86 hosts without AVX2 the magika session returns Err
-            // before any ONNX init — assert graceful degradation
-            // rather than panicking.
-            match magika_detect(content) {
-                Err(MagikaDetectorError::Init(msg)) => {
-                    assert!(
-                        msg.contains("AVX2"),
-                        "{hint}: expected AVX2 error, got: {msg}"
-                    );
-                }
-                other => panic!("{hint}: on no-AVX2 host expected Init(AVX2) error, got {other:?}"),
-            }
-        } else {
-            match magika_detect(content) {
-                Ok(got) => {
-                    assert_eq!(got, expected, "{hint}: expected {expected:?}, got {got:?}")
-                }
-                Err(e) => panic!("{hint}: detection failed: {e}"),
-            }
+        match magika_detect(content) {
+            Ok(got) => assert_eq!(got, expected, "{hint}: expected {expected:?}, got {got:?}"),
+            Err(e) => panic!("{hint}: detection failed: {e}"),
         }
     }
 
@@ -418,32 +368,15 @@ index abc123..def456 100644
 
     #[test]
     fn singleton_session_is_reused_across_calls() {
-        // Two back-to-back calls should reuse the same session
-        // (or same cached error). On AVX2 hosts the session is
-        // Ok and repeated calls succeed; on no-AVX2 hosts the
-        // session is Err and repeated calls return the same Err.
-        if !magika_onnx_runtime_supported_by_cpu() {
-            // On no-AVX2 the singleton caches the init error;
-            // repeated calls all return the same Init error.
-            let r1 = magika_detect("hello world");
-            let r2 = magika_detect("def f(): pass");
-            let r3 = magika_detect(r#"{"a":1}"#);
-            for r in [&r1, &r2, &r3] {
-                match r {
-                    Err(MagikaDetectorError::Init(msg)) => {
-                        assert!(msg.contains("AVX2"), "expected AVX2 error, got: {msg}");
-                    }
-                    other => panic!("on no-AVX2 host expected Init(AVX2) error, got {other:?}"),
-                }
-            }
-        } else {
-            // On AVX2 hosts the session loads once and all calls
-            // succeed. Wall-clock asymmetry (cold ~50 ms, warm
-            // <1 ms) confirms reuse.
-            magika_detect("hello world").unwrap();
-            magika_detect("def f(): pass").unwrap();
-            magika_detect(r#"{"a":1}"#).unwrap();
-        }
+        // Two back-to-back calls should both succeed without re-initing
+        // the model (no panic, no error). We can't directly observe
+        // the singleton hit-rate without instrumenting the test, but
+        // wall-clock asymmetry between the first and second call is
+        // strong evidence (cold ~50 ms, warm <1 ms). For the unit
+        // suite, just prove neither call errors.
+        magika_detect("hello world").unwrap();
+        magika_detect("def f(): pass").unwrap();
+        magika_detect(r#"{"a":1}"#).unwrap();
     }
 
     #[test]

@@ -184,8 +184,71 @@ def test_agent_key_normalizes_claude_code_cli_alias() -> None:
     assert _normalize_agent_key("claude-code-cli") == "claude-code"
 
 
+def test_agent_key_normalizes_copilot_aliases() -> None:
+    assert _normalize_agent_key("github-copilot") == "copilot"
+
+
 def test_agent_label_title_cases_unknown_agent_key() -> None:
     assert _agent_label("custom-agent") == "Custom Agent"
+
+
+def test_agent_usage_groups_copilot_client_rows() -> None:
+    summary = _build_agent_usage_summary(
+        [
+            {
+                "provider": "openai",
+                "model": "gpt-5.5",
+                "tags": {"client": "github-copilot"},
+                "input_tokens_original": 1200,
+                "input_tokens_optimized": 900,
+                "output_tokens": 150,
+                "tokens_saved": 300,
+            }
+        ],
+        requests_by_provider={},
+        requests_by_model={},
+        global_before_tokens=1200,
+        global_after_tokens=900,
+        global_tokens_saved=300,
+        global_output_tokens=150,
+    )
+
+    row = summary["agents"][0]
+
+    assert row["agent"] == "copilot"
+    assert row["label"] == "GitHub Copilot"
+    assert row["source"] == "client"
+    assert row["requests"] == 1
+    assert row["tokens_saved"] == 300
+
+
+def test_agent_usage_groups_hermes_client_rows() -> None:
+    summary = _build_agent_usage_summary(
+        [
+            {
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "tags": {"client": "hermes"},
+                "input_tokens_original": 100,
+                "input_tokens_optimized": 80,
+                "output_tokens": 10,
+                "tokens_saved": 20,
+            }
+        ],
+        requests_by_provider={},
+        requests_by_model={},
+        global_before_tokens=100,
+        global_after_tokens=80,
+        global_tokens_saved=20,
+        global_output_tokens=10,
+    )
+
+    row = summary["agents"][0]
+
+    assert row["agent"] == "hermes"
+    assert row["label"] == "Hermes"
+    assert row["source"] == "client"
+    assert row["requests"] == 1
 
 
 def test_agent_classifier_uses_stack_tag_before_model() -> None:

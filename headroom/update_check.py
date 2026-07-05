@@ -54,15 +54,10 @@ def _env_on(name: str) -> bool:
 def is_update_check_enabled() -> bool:
     """Whether the update check / banner should run at all.
 
-    Disabled by ``HEADROOM_UPDATE_CHECK=off``, offline mode
-    (``HEADROOM_OFFLINE``), stateless mode
+    Disabled by ``HEADROOM_UPDATE_CHECK=off``, stateless mode
     (``HEADROOM_STATELESS=true``/``1``/``yes``/``on``, matching the proxy's own
     parsing), or any CI environment (``CI`` set).
     """
-    from headroom.offline import is_offline
-
-    if is_offline():
-        return False
     if _env_off("HEADROOM_UPDATE_CHECK"):
         return False
     if _env_on("HEADROOM_STATELESS"):

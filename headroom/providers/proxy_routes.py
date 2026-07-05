@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, cast
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
 
+from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
 
 logger = logging.getLogger("headroom.proxy.routes")
@@ -218,6 +220,154 @@ def _synthetic_model_get_response(model_id: str) -> Response:
             }
         ),
         status_code=200,
+        headers={"content-type": "application/json"},
+    )
+
+
+_OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+_OPENROUTER_MODEL_PREFIX = "openrouter/"
+
+
+def _openrouter_prefixed_model_id(model_id: str) -> str:
+    normalized = model_id.strip()
+    if normalized.startswith(_OPENROUTER_MODEL_PREFIX):
+        return normalized
+    return f"{_OPENROUTER_MODEL_PREFIX}{normalized}"
+
+
+def _openrouter_model_response_entry(upstream_entry: dict[str, Any]) -> dict[str, Any] | None:
+    raw_model_id = upstream_entry.get("id")
+    if not isinstance(raw_model_id, str) or not raw_model_id.strip():
+        return None
+    entry = dict(upstream_entry)
+    entry["id"] = _openrouter_prefixed_model_id(raw_model_id)
+    if not isinstance(entry.get("object"), str) or not entry["object"]:
+        entry["object"] = "model"
+    if not isinstance(entry.get("created"), int):
+        entry["created"] = 0
+    if not isinstance(entry.get("owned_by"), str) or not entry["owned_by"]:
+        entry["owned_by"] = "openrouter"
+    return entry
+
+
+def _openrouter_models_response_entries(payload: Any) -> tuple[dict[str, Any], ...]:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return ()
+    return tuple(
+        entry
+        for raw_entry in data
+        if isinstance(raw_entry, dict)
+        for entry in (_openrouter_model_response_entry(raw_entry),)
+        if entry is not None
+    )
+
+
+def _openrouter_catalog_headers() -> dict[str, str]:
+    headers = {"accept": "application/json"}
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if api_key:
+        headers["authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _openrouter_error_response(
+    message: str,
+    *,
+    status_code: int = 502,
+    code: str = "openrouter_catalog_error",
+) -> Response:
+    return Response(
+        content=json.dumps(
+            {
+                "error": {
+                    "message": message,
+                    "type": "server_error",
+                    "code": code,
+                }
+            }
+        ),
+        status_code=status_code,
+        headers={"content-type": "application/json"},
+    )
+
+
+async def _fetch_openrouter_model_entries(proxy: Any) -> tuple[dict[str, Any], ...] | Response:
+    try:
+        assert proxy.http_client is not None
+        resp = await proxy.http_client.get(
+            _OPENROUTER_MODELS_URL,
+            headers=_openrouter_catalog_headers(),
+            timeout=15.0,
+        )
+    except Exception as exc:
+        logger.exception("OpenRouter model catalog fetch failed")
+        return _openrouter_error_response(f"OpenRouter model catalog fetch failed: {exc}")
+
+    if resp.status_code >= 400:
+        logger.warning(
+            "OpenRouter model catalog fetch failed: HTTP %s: %s",
+            resp.status_code,
+            resp.text[:300],
+        )
+        return _openrouter_error_response(
+            f"OpenRouter model catalog fetch failed with HTTP {resp.status_code}",
+            status_code=502,
+        )
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        logger.warning("OpenRouter model catalog response was not valid JSON")
+        return _openrouter_error_response("OpenRouter model catalog response was not valid JSON")
+
+    entries = _openrouter_models_response_entries(payload)
+    if not entries:
+        logger.warning("OpenRouter model catalog response did not contain data[] model ids")
+        return _openrouter_error_response("OpenRouter model catalog returned no model ids")
+    return entries
+
+
+async def _handle_openrouter_model_metadata(
+    proxy: Any,
+    request: Request,
+    model_id: str | None = None,
+) -> Response | None:
+    if classify_client(request.headers) != "hermes":
+        return None
+
+    entries_or_response = await _fetch_openrouter_model_entries(proxy)
+    if isinstance(entries_or_response, Response):
+        return entries_or_response
+
+    entries = entries_or_response
+    if model_id is None:
+        return Response(
+            content=json.dumps({"object": "list", "data": list(entries)}),
+            status_code=200,
+            headers={"content-type": "application/json"},
+        )
+
+    prefixed_model_id = _openrouter_prefixed_model_id(model_id)
+    for entry in entries:
+        if entry.get("id") == prefixed_model_id:
+            return Response(
+                content=json.dumps(entry),
+                status_code=200,
+                headers={"content-type": "application/json"},
+            )
+
+    return Response(
+        content=json.dumps(
+            {
+                "error": {
+                    "message": f"Model {prefixed_model_id!r} not found in OpenRouter catalog",
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                }
+            }
+        ),
+        status_code=404,
         headers={"content-type": "application/json"},
     )
 
@@ -733,25 +883,22 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         return await vertex_publisher_passthrough(request, publisher, "rawPredict")
 
     @app.post(
-        "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:rawPredict"
+        "/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:rawPredict"
     )
     async def vertex_raw_predict_no_version(
         request: Request,
         project: str,
         location: str,
-        publisher: str,
         model: str,
     ):
-        if publisher == "anthropic":
-            del project
-            target = _vertex_target_for_location(proxy, location).rstrip("/") + "/v1"
-            return await proxy.handle_anthropic_messages(
-                request,
-                target,
-                "vertex:anthropic",
-                model,
-            )
-        return await vertex_publisher_passthrough(request, publisher, "rawPredict")
+        del project
+        target = _vertex_target_for_location(proxy, location).rstrip("/") + "/v1"
+        return await proxy.handle_anthropic_messages(
+            request,
+            target,
+            "vertex:anthropic",
+            model,
+        )
 
     @app.post(
         "/{api_version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
@@ -776,29 +923,30 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         return await vertex_publisher_passthrough(request, publisher, "streamRawPredict")
 
     @app.post(
-        "/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:streamRawPredict"
+        "/projects/{project}/locations/{location}/publishers/anthropic/models/{model}:streamRawPredict"
     )
     async def vertex_stream_raw_predict_no_version(
         request: Request,
         project: str,
         location: str,
-        publisher: str,
         model: str,
     ):
-        if publisher == "anthropic":
-            del project
-            target = _vertex_target_for_location(proxy, location).rstrip("/") + "/v1"
-            return await proxy.handle_anthropic_messages(
-                request,
-                target,
-                "vertex:anthropic",
-                model,
-                True,
-            )
-        return await vertex_publisher_passthrough(request, publisher, "streamRawPredict")
+        del project
+        target = _vertex_target_for_location(proxy, location).rstrip("/") + "/v1"
+        return await proxy.handle_anthropic_messages(
+            request,
+            target,
+            "vertex:anthropic",
+            model,
+            True,
+        )
 
     @app.get("/v1/models")
     async def list_models(request: Request):
+        openrouter_response = await _handle_openrouter_model_metadata(proxy, request)
+        if openrouter_response is not None:
+            return openrouter_response
+
         chatgpt_response = await _handle_chatgpt_model_metadata(
             proxy,
             request,
@@ -815,8 +963,12 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             provider_name,
         )
 
-    @app.get("/v1/models/{model_id}")
+    @app.get("/v1/models/{model_id:path}")
     async def get_model(request: Request, model_id: str):
+        openrouter_response = await _handle_openrouter_model_metadata(proxy, request, model_id)
+        if openrouter_response is not None:
+            return openrouter_response
+
         chatgpt_response = await _handle_chatgpt_model_metadata(
             proxy,
             request,

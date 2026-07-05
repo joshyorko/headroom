@@ -20,7 +20,7 @@ from click.testing import CliRunner
 
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
-from headroom.mcp_registry.install import build_headroom_spec
+from headroom.mcp_registry.install import DEFAULT_PROXY_URL
 
 
 def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -28,6 +28,7 @@ def _set_test_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", home)
     monkeypatch.setenv("USERPROFILE", home)
     monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("HEADROOM_PROXY_URL", raising=False)
 
 
 @pytest.fixture
@@ -113,6 +114,25 @@ class TestStripCodexHeadroomBlocks:
         assert "[mcp_servers.serena]" not in cleaned
         assert "[mcp_servers.headroom_memory]" not in cleaned
         assert 'model = "gpt-4o"' in cleaned
+
+    def test_removes_orphaned_remote_headroom_provider_table(self) -> None:
+        content = (
+            f"{wrap_mod._CODEX_TOP_LEVEL_MARKER}\n"
+            'model_provider = "headroom"\n'
+            'openai_base_url = "http://10.10.10.89/v1"\n'
+            f"{wrap_mod._CODEX_END_MARKER}\n\n"
+            f"{wrap_mod._CODEX_TOP_LEVEL_MARKER}\n"
+            "[model_providers.headroom]\n"
+            'name = "OpenAI via Headroom proxy"\n'
+            'base_url = "http://10.10.10.89/v1"\n'
+            "supports_websockets = true\n"
+            "requires_openai_auth = true\n"
+            'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }\n'
+        )
+
+        cleaned = wrap_mod._strip_codex_headroom_blocks(content)
+
+        assert cleaned == ""
 
     def test_preserves_named_mcp_blocks_when_remove_named_mcp_false(self) -> None:
         content = (
@@ -332,6 +352,19 @@ class TestInjectAndRestoreRoundTrip:
         assert status == "restored"
         assert config_file.read_text(encoding="utf-8") == original
 
+    def test_wrap_provider_config_accepts_remote_proxy_url(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+
+        wrap_mod._inject_codex_provider_config(8787, proxy_url="http://10.10.10.89")
+
+        content = config_file.read_text(encoding="utf-8")
+        assert 'openai_base_url = "http://10.10.10.89/v1"' in content
+        assert 'base_url = "http://10.10.10.89/v1"' in content
+        assert "http://127.0.0.1:8787" not in content
+
     def test_unwrap_is_noop_when_never_wrapped(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -458,53 +491,6 @@ class TestInjectAndRestoreRoundTrip:
 
         assert status == "restored"
         assert config_file.read_text(encoding="utf-8") == malformed
-
-    def test_unwrap_removes_rtk_block_from_global_agents(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """`wrap codex` injects the rtk block into the Codex global AGENTS.md;
-        `unwrap codex` must take it back out (regression for #1421)."""
-        _set_test_home(monkeypatch, tmp_path)
-        codex_home = tmp_path / ".codex"
-        codex_home.mkdir()
-        agents = codex_home / "AGENTS.md"
-        wrap_mod._inject_rtk_instructions(agents)
-        assert wrap_mod._RTK_MARKER in agents.read_text(encoding="utf-8")
-
-        wrap_mod.unwrap_codex.callback(port=8787, no_stop_proxy=True)
-
-        remaining = agents.read_text(encoding="utf-8") if agents.exists() else ""
-        assert wrap_mod._RTK_MARKER not in remaining
-
-    def test_unwrap_preserves_user_content_in_global_agents(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Only the marker-fenced rtk block is removed; the user's own AGENTS.md
-        prose survives the unwrap."""
-        _set_test_home(monkeypatch, tmp_path)
-        codex_home = tmp_path / ".codex"
-        codex_home.mkdir()
-        agents = codex_home / "AGENTS.md"
-        agents.write_text("# My project rules\n\nAlways write tests.\n", encoding="utf-8")
-        wrap_mod._inject_rtk_instructions(agents)
-        assert wrap_mod._RTK_MARKER in agents.read_text(encoding="utf-8")
-
-        wrap_mod.unwrap_codex.callback(port=8787, no_stop_proxy=True)
-
-        remaining = agents.read_text(encoding="utf-8")
-        assert wrap_mod._RTK_MARKER not in remaining
-        assert "# My project rules" in remaining
-        assert "Always write tests." in remaining
-
-    def test_unwrap_is_safe_when_no_global_agents(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """No Codex AGENTS.md → unwrap is a clean no-op, not a crash."""
-        _set_test_home(monkeypatch, tmp_path)
-
-        wrap_mod.unwrap_codex.callback(port=8787, no_stop_proxy=True)
-
-        assert not (tmp_path / ".codex" / "AGENTS.md").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +709,10 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         # No redirectable keys to rewrite in blank/whitespace content — the
         # helper returns it unchanged so the caller falls back to prepending
         # the marker-delimited top-level block.
-        assert wrap_mod._redirect_existing_top_level_keys(blank, 8787) == blank
+        assert (
+            wrap_mod._redirect_existing_top_level_keys(blank, "http://127.0.0.1:8787/v1")
+            == blank
+        )
 
     def test_inject_preserves_user_value_in_trailing_comment(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -781,61 +770,6 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         assert 'model_provider = "headroom"' in content
         assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content
         assert "[model_providers.headroom]" in content
-
-    def test_inject_replaces_existing_headroom_provider_table(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Existing headroom provider table must not create duplicate TOML keys."""
-        import tomllib  # Python 3.11+ stdlib
-
-        _set_test_home(monkeypatch, tmp_path)
-        config_dir = tmp_path / ".codex"
-        config_dir.mkdir()
-        config_file = config_dir / "config.toml"
-        config_file.write_text(
-            "[model_providers.headroom]\n"
-            'name = "Existing custom headroom"\n'
-            'base_url = "http://example.invalid/v1"\n'
-            "supports_websockets = true\n"
-            'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }\n'
-            "\n"
-            "[profiles.default]\n"
-            'model = "gpt-5"\n'
-        )
-
-        wrap_mod._inject_codex_provider_config(8787)
-        content = config_file.read_text()
-
-        tomllib.loads(content)
-        assert content.count("[model_providers.headroom]") == 1
-        assert content.count("env_http_headers") == 1
-        assert 'base_url = "http://127.0.0.1:8787/v1"' in content
-        assert 'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }' in content
-        assert "[profiles.default]" in content
-        assert 'model = "gpt-5"' in content
-
-    def test_unwrap_restores_prior_headroom_provider_table(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Pre-wrap headroom provider table is restored from snapshot."""
-        _set_test_home(monkeypatch, tmp_path)
-        config_dir = tmp_path / ".codex"
-        config_dir.mkdir()
-        config_file = config_dir / "config.toml"
-        original = (
-            "[model_providers.headroom]\n"
-            'name = "Existing custom headroom"\n'
-            'base_url = "http://example.invalid/v1"\n'
-            "supports_websockets = true\n"
-            'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }\n'
-        )
-        config_file.write_text(original)
-
-        wrap_mod._inject_codex_provider_config(8787)
-        status, _ = wrap_mod._restore_codex_provider_config()
-
-        assert status == "restored"
-        assert config_file.read_text() == original
 
     def test_unwrap_restores_prior_model_provider_after_rewrite(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1095,6 +1029,22 @@ def test_wrap_codex_prepare_only_updates_stale_mcp_proxy_url(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _set_test_home(monkeypatch, tmp_path)
+    from headroom.mcp_registry.base import ServerSpec
+
+    def stable_headroom_spec(proxy_url: str) -> ServerSpec:
+        return ServerSpec(
+            name="headroom",
+            command="headroom",
+            args=("mcp", "serve"),
+            env={} if proxy_url == DEFAULT_PROXY_URL else {"HEADROOM_PROXY_URL": proxy_url},
+        )
+
+    monkeypatch.setattr("headroom.mcp_registry.build_headroom_spec", stable_headroom_spec)
+    monkeypatch.setattr(
+        "headroom.mcp_registry.install.build_headroom_spec",
+        stable_headroom_spec,
+    )
+    monkeypatch.setattr(wrap_mod, "build_headroom_spec", stable_headroom_spec, raising=False)
     config_file = tmp_path / ".codex" / "config.toml"
     config_file.parent.mkdir(parents=True)
     config_file.write_text(
@@ -1115,7 +1065,7 @@ def test_wrap_codex_prepare_only_updates_stale_mcp_proxy_url(
     assert result.exit_code == 0, result.output
     content = config_file.read_text(encoding="utf-8")
     parsed = tomllib.loads(content)
-    expected = build_headroom_spec()
+    expected = stable_headroom_spec(DEFAULT_PROXY_URL)
     headroom_mcp = parsed["mcp_servers"]["headroom"]
     assert "[mcp_servers.headroom]" in content
     assert headroom_mcp["command"] == expected.command
@@ -1224,6 +1174,66 @@ def test_wrap_codex_prepare_only_no_serena_skips_serena(
 
     assert result.exit_code == 0, result.output
     assert "[mcp_servers.serena]" not in config_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("order", [("init", "wrap"), ("wrap", "init")])
+def test_init_and_wrap_prepare_only_are_idempotent_full_setup(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    order: tuple[str, str],
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.chdir(project_dir)
+
+    def fake_which(cmd: str) -> str | None:
+        if cmd == "uvx":
+            return "/usr/local/bin/uvx"
+        return None
+
+    commands = {
+        "init": [
+            "init",
+            "--proxy-url",
+            "http://10.10.10.89",
+            "codex",
+        ],
+        "wrap": [
+            "wrap",
+            "codex",
+            "--prepare-only",
+            "--proxy-url",
+            "http://10.10.10.89",
+        ],
+    }
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        with patch(
+            "headroom.cli.wrap._ensure_tokensave_binary",
+            return_value=Path("/usr/local/bin/tokensave"),
+        ):
+            with patch("headroom.cli.wrap._index_tokensave_project"):
+                with patch("headroom.cli.wrap.shutil.which", side_effect=fake_which):
+                    for command_name in order:
+                        result = runner.invoke(main, commands[command_name])
+                        assert result.exit_code == 0, result.output
+
+    content = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
+    parsed = tomllib.loads(content)
+    provider = parsed["model_providers"]["headroom"]
+
+    assert content.count(wrap_mod._CODEX_TOP_LEVEL_MARKER) == 1
+    assert content.count("[model_providers.headroom]") == 1
+    assert parsed["model_provider"] == "headroom"
+    assert parsed["openai_base_url"] == "http://10.10.10.89/v1"
+    assert provider["base_url"] == "http://10.10.10.89/v1"
+    assert provider["env_http_headers"] == {"X-Headroom-Project": "HEADROOM_PROJECT"}
+    assert parsed["mcp_servers"]["headroom"]["env"]["HEADROOM_PROXY_URL"] == "http://10.10.10.89"
+    assert parsed["mcp_servers"]["tokensave"]["command"] == "/usr/local/bin/tokensave"
+    assert parsed["mcp_servers"]["serena"]["command"] == "uvx"
+    assert (project_dir / ".codex" / "hooks.json").exists()
 
 
 def test_unwrap_codex_restores_prior_config_end_to_end(

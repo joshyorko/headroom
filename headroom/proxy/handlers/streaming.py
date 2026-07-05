@@ -13,11 +13,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.auth_mode import classify_client
-from headroom.proxy.helpers import (
-    RETRYABLE_OVERLOAD_STATUSES,
-    jitter_delay_ms,
-    retry_after_ms,
-)
+from headroom.proxy.helpers import jitter_delay_ms, retry_after_ms
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -523,32 +519,8 @@ class StreamingMixin:
                         "input": {},
                     },
                 }
-            elif block.get("type") == "thinking":
-                content_block = {
-                    "type": "thinking",
-                    "thinking": "",
-                }
-                if "signature" in block:
-                    content_block["signature"] = block["signature"]
-                block_start = {
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": content_block,
-                }
-            elif block.get("type") == "redacted_thinking":
-                block_start = {
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": {
-                        "type": "redacted_thinking",
-                        "data": block.get("data", ""),
-                    },
-                }
             else:
-                raise ValueError(
-                    f"Unsupported Anthropic content block type for SSE conversion: "
-                    f"{block.get('type')!r}"
-                )
+                continue
 
             events.append(
                 f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode()
@@ -562,15 +534,6 @@ class StreamingMixin:
                     "delta": {"type": "text_delta", "text": block["text"]},
                 }
                 events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
-                for citation in block.get("citations", []) or []:
-                    citation_delta = {
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "citations_delta", "citation": citation},
-                    }
-                    events.append(
-                        f"event: content_block_delta\ndata: {json.dumps(citation_delta)}\n\n".encode()
-                    )
             elif block.get("type") == "tool_use" and block.get("input"):
                 delta = {
                     "type": "content_block_delta",
@@ -581,25 +544,6 @@ class StreamingMixin:
                     },
                 }
                 events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
-            elif block.get("type") == "thinking":
-                if block.get("thinking"):
-                    delta = {
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "thinking_delta", "thinking": block["thinking"]},
-                    }
-                    events.append(
-                        f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode()
-                    )
-                if block.get("signature"):
-                    delta = {
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "signature_delta", "signature": block["signature"]},
-                    }
-                    events.append(
-                        f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode()
-                    )
 
             # content_block_stop
             block_stop = {"type": "content_block_stop", "index": idx}
@@ -644,17 +588,24 @@ class StreamingMixin:
 
             input_data = block.get("input", {})
             hash_key = input_data.get("hash")
+            query = input_data.get("query")
 
             if not hash_key:
                 continue
 
-            logger.info(f"[{request_id}] CCR Feedback: Recording retrieval hash={hash_key[:8]}...")
+            logger.info(
+                f"[{request_id}] CCR Feedback: Recording retrieval "
+                f"hash={hash_key[:8]}... query={query!r}"
+            )
 
-            # Call store.retrieve() for the side effect of triggering the
-            # feedback chain: _log_retrieval -> process_pending_feedback
+            # Call store.retrieve()/search() for the side effect of triggering
+            # the feedback chain: _log_retrieval -> process_pending_feedback
             # -> toin.record_retrieval(). We discard the returned content.
             try:
-                store.retrieve(hash_key)
+                if query:
+                    store.search(hash_key, query)
+                else:
+                    store.retrieve(hash_key, query=None)
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback recording failed: {e}")
 
@@ -719,15 +670,19 @@ class StreamingMixin:
             if not isinstance(input_data, dict):
                 continue
             hash_key = input_data.get("hash")
+            query = input_data.get("query")
             if not hash_key:
                 continue
 
             logger.info(
                 f"[{request_id}] CCR Feedback (openai stream): Recording retrieval "
-                f"hash={hash_key[:8]}..."
+                f"hash={hash_key[:8]}... query={query!r}"
             )
             try:
-                store.retrieve(hash_key)
+                if query:
+                    store.search(hash_key, query)
+                else:
+                    store.retrieve(hash_key, query=None)
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback (openai stream) failed: {e}")
 
@@ -1053,12 +1008,11 @@ class StreamingMixin:
                             headers=dict(upstream_response.headers),
                             status_code=upstream_response.status_code,
                         )
-                    # Retry transient overloads (429 rate-limit, 529 overloaded)
-                    # honoring Retry-After — the streaming sibling of the
-                    # _retry_request path (#1221); on exhaustion, fall through to
-                    # forward the status to the client.
+                    # Retry upstream 429s honoring Retry-After — the streaming
+                    # sibling of the _retry_request path (#1221); on exhaustion,
+                    # fall through to forward the 429 to the client.
                     if (
-                        upstream_response.status_code in RETRYABLE_OVERLOAD_STATUSES
+                        upstream_response.status_code == 429
                         and self.config.retry_enabled
                         and attempt < retry_attempts - 1
                     ):
@@ -1071,7 +1025,7 @@ class StreamingMixin:
                         )
                         await upstream_response.aclose()
                         logger.warning(
-                            f"[{request_id}] Upstream {upstream_response.status_code} "
+                            f"[{request_id}] Upstream 429 "
                             f"(attempt {attempt + 1}/{retry_attempts}), "
                             f"retrying in {delay_with_jitter:.0f}ms"
                         )
@@ -1662,6 +1616,7 @@ class StreamingMixin:
         waste_signals: dict[str, int] | None = None,
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
+        backend: Any | None = None,
     ) -> StreamingResponse:
         """Stream OpenAI chat completion response from backend.
 
@@ -1696,7 +1651,8 @@ class StreamingMixin:
         from headroom.proxy.handlers.openai import _infer_openai_cache_write_tokens
         from headroom.proxy.outcome import RequestOutcome
 
-        assert self.anthropic_backend is not None
+        backend = backend or self.anthropic_backend
+        assert backend is not None
         client = classify_client(headers)
 
         async def generate():
@@ -1726,7 +1682,7 @@ class StreamingMixin:
                         stream_state[key] = usage[key]
 
             try:
-                async for sse_chunk in self.anthropic_backend.stream_openai_message(body, headers):
+                async for sse_chunk in backend.stream_openai_message(body, headers):
                     chunk_bytes = sse_chunk.encode() if isinstance(sse_chunk, str) else sse_chunk
                     stream_state["sse_buffer"].extend(chunk_bytes)
                     full_sse_bytes.extend(chunk_bytes)
@@ -1828,7 +1784,7 @@ class StreamingMixin:
                 # instead of collapsing the dashboard headline to 0%.
                 outcome = RequestOutcome.from_stream(
                     body=body,
-                    provider=self.anthropic_backend.name,
+                    provider=backend.name,
                     model=model,
                     request_id=request_id,
                     original_tokens=original_tokens,
@@ -1853,7 +1809,7 @@ class StreamingMixin:
                 if tokens_saved > 0:
                     logger.info(
                         f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
-                        f"(saved {tokens_saved:,} tokens) via {self.anthropic_backend.name} [stream]"
+                        f"(saved {tokens_saved:,} tokens) via {backend.name} [stream]"
                     )
 
         return StreamingResponse(

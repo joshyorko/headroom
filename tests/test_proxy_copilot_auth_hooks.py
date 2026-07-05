@@ -161,6 +161,83 @@ def test_openai_passthrough_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch
     assert response.status_code == 200
 
 
+def test_openai_passthrough_routes_copilot_bearer_to_copilot_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    openai_mod = _load_handler_module(
+        monkeypatch,
+        "tests.headroom_proxy_handlers_openai",
+        "headroom/proxy/handlers/openai.py",
+    )
+
+    seen: dict[str, object] = {}
+
+    async def fake_apply(headers: dict[str, str], *, url: str) -> dict[str, str]:
+        seen["url"] = url
+        return {"Authorization": "Bearer upstream-token"}
+
+    monkeypatch.setattr(openai_mod, "apply_copilot_api_auth", fake_apply)
+    from headroom.proxy.project_context import set_current_copilot_api_url
+
+    set_current_copilot_api_url("https://api.individual.githubcopilot.com")
+
+    class Dummy(openai_mod.OpenAIHandlerMixin):
+        OPENAI_API_URL = "https://api.openai.com"
+
+        def __init__(self) -> None:
+            self.metrics = SimpleNamespace(record_request=self._record_request)
+            self.http_client = SimpleNamespace(request=self._request)
+            self.cost_tracker = None
+            self._counter = 0
+
+        async def _record_request(self, **kwargs) -> None:  # noqa: ANN003
+            return None
+
+        async def _next_request_id(self) -> str:
+            self._counter += 1
+            return f"req-{self._counter}"
+
+        async def _record_request_outcome(self, outcome) -> None:  # noqa: ANN001
+            from headroom.proxy.outcome import emit_request_outcome
+
+            await emit_request_outcome(self, outcome)
+
+        def _extract_tags(self, headers: dict) -> dict[str, str]:
+            return {}
+
+        async def _request(self, **kwargs):  # noqa: ANN003
+            seen["request_kwargs"] = kwargs
+            return SimpleNamespace(headers={}, content=b"{}", status_code=200)
+
+    async def body() -> bytes:
+        return b""
+
+    request = SimpleNamespace(
+        url=SimpleNamespace(path="/v1/models", query=""),
+        headers={
+            "authorization": "Bearer tid_test_non_secret",
+            "host": "localhost",
+            "accept-encoding": "gzip",
+        },
+        method="GET",
+        body=body,
+    )
+
+    handler = Dummy()
+    response = asyncio.run(
+        handler.handle_passthrough(
+            request,
+            "https://api.openai.com",
+            "models",
+            "openai",
+        )
+    )
+
+    assert seen["url"] == "https://api.individual.githubcopilot.com/models"
+    assert seen["request_kwargs"]["headers"] == {"Authorization": "Bearer upstream-token"}
+    assert response.status_code == 200
+
+
 def test_streaming_response_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     streaming_mod = _load_handler_module(
         monkeypatch,

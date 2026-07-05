@@ -69,6 +69,16 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
         session_files = list(search_root.rglob("*.json")) + list(search_root.rglob("*.jsonl"))
         return sorted(path for path in session_files if path.is_file())
 
+    def verbosity_session_paths(self, root: Path) -> list[Path]:
+        """Return Codex transcript files usable by ``learn --verbosity``.
+
+        Modern Codex sessions are JSONL rollouts nested by date under
+        ``~/.codex/sessions``. The verbosity analyzer consumes line-oriented
+        transcripts, so keep legacy JSON sessions on the failure-learning path
+        and feed only recursive JSONL files here.
+        """
+        return [path for path in self._iter_session_files(root) if path.suffix == ".jsonl"]
+
     def discover_projects(self) -> list[ProjectInfo]:
         """Codex doesn't organize by project — return a single 'codex' project."""
         if not self.sessions_dir.exists():

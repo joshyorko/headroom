@@ -187,17 +187,17 @@
             <div class="bg-surface rounded-lg p-4 border border-border">
                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Proxy $ Saved</div>
                 <div class="flex items-baseline gap-2">
-                    <span class="text-3xl font-light tabular-nums text-emerald-400" x-text="'$' + formatCurrency(stats.persistent_savings?.lifetime?.compression_savings_usd || 0)"></span>
+                    <span class="text-3xl font-light tabular-nums text-emerald-400" x-text="formatSessionProxyCurrency(stats.summary?.cost?.breakdown?.compression_savings_usd || stats.summary?.cost?.total_saved_usd || 0)"></span>
                 </div>
                 <div class="mt-2 text-xs text-gray-500">
-                    <span x-show="(stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0"
+                    <span x-show="(stats.summary?.cost?.breakdown?.compression_savings_usd || stats.summary?.cost?.total_saved_usd || 0) > 0"
                           x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens only; ' + cliFilteringLabel + ' excluded from $'"></span>
-                    <span x-show="!((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0) && stats.litellm_available !== false"
+                    <span x-show="!((stats.summary?.cost?.breakdown?.compression_savings_usd || stats.summary?.cost?.total_saved_usd || 0) > 0) && stats.litellm_available !== false"
                           x-text="formatNumber(stats.requests?.total || 0) + ' requests processed'"></span>
                     <!-- Pricing is LiteLLM-only. LiteLLM currently can't install on
                          newer Python (e.g. 3.14+); state the fact, not the version,
                          so the hint stays correct if that changes. -->
-                    <span x-show="!((stats.persistent_savings?.lifetime?.compression_savings_usd || 0) > 0) && stats.litellm_available === false">
+                    <span x-show="!((stats.summary?.cost?.breakdown?.compression_savings_usd || stats.summary?.cost?.total_saved_usd || 0) > 0) && stats.litellm_available === false">
                         Cost pricing needs LiteLLM, which isn't installed in this environment. If you're on a Python version LiteLLM doesn't support yet, reinstall Headroom on Python 3.13:
                         <code class="text-gray-400">pipx reinstall headroom-ai --python python3.13</code>
                     </span>
@@ -239,24 +239,36 @@
                 </div>
             </div>
 
-            <!-- Output Tokens Saved (counterfactual) -->
+            <!-- Output Shaping (counterfactual) -->
             <div class="bg-surface rounded-lg p-4 border border-border">
-                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Output Tokens Saved</div>
+                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1"
+                     x-text="stats.tokens?.output_reduction?.estimate_reliable && stats.tokens?.output_reduction?.display_tokens_saved !== null && stats.tokens?.output_reduction?.display_tokens_saved !== undefined ? 'Output Tokens Saved' : 'Output Shaping'"></div>
                 <template x-if="stats.tokens?.output_reduction?.available">
                     <div>
                         <div class="flex items-baseline gap-2">
-                            <span class="text-3xl font-light tabular-nums text-accent" x-text="formatNumber(stats.tokens?.output_saved || 0)"></span>
-                            <span class="text-sm text-accent" x-text="(stats.tokens?.output_reduction_percent || 0).toFixed(1) + '%'"></span>
+                            <template x-if="stats.tokens?.output_reduction?.estimate_reliable && stats.tokens?.output_reduction?.display_tokens_saved !== null && stats.tokens?.output_reduction?.display_tokens_saved !== undefined">
+                                <div class="flex items-baseline gap-2">
+                                    <span class="text-3xl font-light tabular-nums text-accent" x-text="formatNumber(stats.tokens.output_reduction.display_tokens_saved)"></span>
+                                    <span class="text-sm text-accent" x-text="(stats.tokens.output_reduction.display_reduction_percent || 0).toFixed(1) + '% saved'"></span>
+                                </div>
+                            </template>
+                            <template x-if="!stats.tokens?.output_reduction?.estimate_reliable || stats.tokens?.output_reduction?.display_tokens_saved === null || stats.tokens?.output_reduction?.display_tokens_saved === undefined">
+                                <span class="text-2xl font-light text-accent">Applied steering</span>
+                            </template>
                         </div>
-                        <div class="mt-1 text-xs text-gray-500 leading-relaxed">
+                        <div class="mt-1 text-xs text-gray-500 leading-relaxed"
+                             x-show="stats.tokens?.output_reduction?.estimate_reliable && stats.tokens?.output_reduction?.display_tokens_saved !== null && stats.tokens?.output_reduction?.display_tokens_saved !== undefined">
                             <!-- "measured" = A/B holdout (unbiased); "estimated" = vs learned baseline -->
                             <span class="uppercase tracking-wide"
                                   :class="stats.tokens?.output_reduction?.method === 'measured' ? 'text-emerald-400' : 'text-gray-400'"
-                                  x-text="stats.tokens?.output_reduction?.method || ''"></span>
+                                  x-text="stats.tokens?.output_reduction?.method === 'estimated' ? 'estimated counterfactual' : (stats.tokens?.output_reduction?.method || '')"></span>
                             <span x-text="'· 95% CI ' + (stats.tokens?.output_reduction?.ci_low_percent || 0).toFixed(1) + '–' + (stats.tokens?.output_reduction?.ci_high_percent || 0).toFixed(1) + '%'"></span>
                         </div>
                         <div class="mt-1 text-xs text-gray-600 leading-relaxed"
-                             x-text="formatNumber(stats.tokens?.output_reduction?.requests || 0) + ' shaped responses · counterfactual'">
+                             :title="'raw estimate: ' + formatNumber(stats.tokens?.output_reduction?.tokens_saved || 0) + ' tokens, CI ' + (stats.tokens?.output_reduction?.ci_low_percent || 0).toFixed(1) + '–' + (stats.tokens?.output_reduction?.ci_high_percent || 0).toFixed(1) + '%, reasons: ' + ((stats.tokens?.output_reduction?.estimate_reasons || []).join(', ') || 'none')"
+                             x-text="(stats.tokens?.output_reduction?.requests || 0)
+                                ? formatNumber(stats.tokens.output_reduction.requests) + ' shaped responses · ' + (stats.tokens.output_reduction.estimate_reliable && stats.tokens.output_reduction.display_tokens_saved !== null && stats.tokens.output_reduction.display_tokens_saved !== undefined ? (stats.tokens.output_reduction.method === 'estimated' ? 'estimated counterfactual' : (stats.tokens.output_reduction.method || 'measured')) : 'estimate ' + (stats.tokens.output_reduction.estimate_quality || stats.tokens.output_reduction.estimate_status || 'warming'))
+                                : formatNumber(stats.savings?.by_layer?.output_shaping?.applied_requests || 0) + ' shaped responses · steering applied'">
                         </div>
                     </div>
                 </template>
@@ -1026,28 +1038,36 @@
                 <div class="text-sm font-medium mb-4 text-gray-300">Token Usage</div>
                 <div class="space-y-3">
                     <div class="flex justify-between items-center">
-                        <span class="text-sm text-gray-400">Before Compression</span>
+                        <span class="text-sm text-gray-400">Before Headroom layers</span>
                         <span class="font-mono text-sm" x-text="formatNumber(stats.tokens?.total_before_compression || 0)"></span>
                     </div>
-                    <div class="flex justify-between items-center">
-                        <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered (this session)'"></span>
-                        <span class="font-mono text-sm text-emerald-400" x-text="formatNumber(cliFilteringSaved)"></span>
+                    <div class="flex justify-between items-center" x-show="showCliFilteringSessionLine">
+                        <span class="text-sm text-gray-400" x-text="cliFilteringSessionLabel"></span>
+                        <span class="font-mono text-sm text-emerald-400" x-text="formatNumber(cliFilteringSessionValue)"></span>
                     </div>
-                    <div class="flex justify-between items-center" x-show="cliFilteringLifetime > 0">
-                        <span class="text-sm text-gray-500" x-text="cliFilteringLabel + ' Filtered (lifetime)'"></span>
-                        <span class="font-mono text-sm text-emerald-400/70" x-text="formatNumber(cliFilteringLifetime)"></span>
+                    <div class="flex justify-between items-center" x-show="showCliFilteringLifetimeLine">
+                        <span class="text-sm text-gray-500" x-text="cliFilteringLifetimeLabel"></span>
+                        <span class="font-mono text-sm text-emerald-400/70" x-text="cliFilteringLifetimeValue"></span>
+                    </div>
+                    <div class="flex justify-between items-center" x-show="!cliFilteringSessionAvailable && cliFilteringLifetime > 0">
+                        <span class="text-xs text-gray-600">session delta unavailable</span>
+                        <span></span>
                     </div>
                     <div class="flex justify-between items-center">
-                        <span class="text-sm text-gray-400">Proxy Removed</span>
+                        <span class="text-sm text-gray-400">Proxy input after RTK</span>
+                        <span class="font-mono text-sm" x-text="formatNumber(proxyInputAfterCliFiltering)"></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400">Proxy removed</span>
                         <span class="font-mono text-sm text-accent" x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0)"></span>
                     </div>
                     <div class="flex justify-between items-center">
-                        <span class="text-sm text-gray-400">After Compression (sent)</span>
+                        <span class="text-sm text-gray-400">Sent upstream</span>
                         <span class="font-mono text-sm" x-text="formatNumber(stats.tokens?.input || 0)"></span>
                     </div>
                     <div class="border-t border-border my-2"></div>
                     <div class="flex justify-between items-center">
-                        <span class="text-sm text-gray-400">Output Tokens</span>
+                        <span class="text-sm text-gray-400">Output tokens</span>
                         <span class="font-mono text-sm" x-text="formatNumber(stats.tokens?.output || 0)"></span>
                     </div>
                 </div>
@@ -1180,7 +1200,7 @@
                     <div class="text-xs text-gray-500 mb-3">No per-project data yet.</div>
                     <div class="text-xs text-gray-600 font-mono leading-relaxed">
                         Add to each project's <span class="text-gray-400">.claude/settings.local.json</span>:<br>
-                        <span class="text-accent" x-text="'ANTHROPIC_BASE_URL: ' + window.location.origin + '/p/<project-name>'"></span>
+                        <span class="text-accent">ANTHROPIC_BASE_URL: http://127.0.0.1:8787/p/&lt;project-name&gt;</span>
                     </div>
                 </div>
             </template>
@@ -1258,7 +1278,7 @@
                     </div>
                     <!-- Data rows -->
                     <div class="divide-y divide-border">
-                        <template x-for="req in (stats.recent_requests || [])" :key="req.request_id">
+                        <template x-for="req in recentRequests()" :key="req.request_id">
                             <div>
                                 <div class="cursor-pointer" @click="toggleExpanded(req.request_id)">
                                     <div class="grid hover:bg-border/30 transition-colors"
@@ -1327,7 +1347,12 @@
                                 </template>
                             </div>
                         </template>
-                        <template x-if="(stats.recent_requests || []).length === 0">
+                        <template x-if="recentRequests().length === 0 && recentRequestsHidden()">
+                            <div class="px-4 py-8 text-center text-gray-500 italic">
+                                Per-request rows are hidden for network dashboard connections. Aggregates above are still live.
+                            </div>
+                        </template>
+                        <template x-if="recentRequests().length === 0 && !recentRequestsHidden()">
                             <div class="px-4 py-8 text-center text-gray-500 italic">
                                 No requests yet. Start using the proxy to see activity here.
                             </div>
@@ -1871,6 +1896,16 @@
                     }
                 },
 
+                recentRequests() {
+                    return this.stats.recent_requests || [];
+                },
+
+                recentRequestsHidden() {
+                    const requestCount = this.stats.requests?.total || 0;
+                    const loggedCount = this.stats.agent_usage?.coverage?.logged_requests || 0;
+                    return Boolean(this.stats.per_request_metadata_hidden) && (requestCount > 0 || loggedCount > 0);
+                },
+
                 async fetchHistoryStats() {
                     try {
                         const response = await fetch('/stats-history');
@@ -2023,6 +2058,12 @@
                     if (n >= 0.01) return n.toFixed(3);
                     if (n > 0) return n.toFixed(4);
                     return '0.00';
+                },
+
+                formatSessionProxyCurrency(n) {
+                    if (n < 0) return '-' + this.formatSessionProxyCurrency(-n);
+                    if (n > 0 && n < 0.01) return '<$0.01';
+                    return '$' + this.formatCurrency(n);
                 },
 
                 formatResetTime(seconds) {
@@ -2548,6 +2589,41 @@
                         ?? 0;
                 },
 
+                get cliFilteringSessionValue() {
+                    return this.stats.savings?.by_layer?.cli_filtering?.session?.tokens_saved
+                        ?? this.stats.context_tool?.stats?.session?.tokens_saved
+                        ?? this.cliFilteringSaved;
+                },
+
+                get cliFilteringBaselineSaved() {
+                    return this.stats.savings?.by_layer?.cli_filtering?.baseline?.tokens_saved
+                        ?? this.stats.context_tool?.stats?.baseline?.tokens_saved
+                        ?? 0;
+                },
+
+                get cliFilteringCounterResetDetected() {
+                    return this.stats.savings?.by_layer?.cli_filtering?.counter_reset_detected
+                        ?? this.stats.context_tool?.stats?.counter_reset_detected
+                        ?? false;
+                },
+
+                get cliFilteringSessionAvailable() {
+                    const explicit = this.stats.savings?.by_layer?.cli_filtering?.session_delta_available
+                        ?? this.stats.context_tool?.stats?.session_delta_available;
+                    if (explicit !== null && explicit !== undefined) return Boolean(explicit);
+                    return !this.cliFilteringReportedScope;
+                },
+
+                get cliFilteringReportedScope() {
+                    if (this.cliFilteringSessionValue <= 0 || this.cliFilteringLifetime <= 0) return false;
+                    if (this.cliFilteringSessionValue !== this.cliFilteringLifetime) return false;
+                    return this.cliFilteringBaselineSaved <= 0 || this.cliFilteringCounterResetDetected;
+                },
+
+                get cliFilteringSessionLabel() {
+                    return this.cliFilteringLabel + ' filtered this session';
+                },
+
                 get cliFilteringShareOfTotal() {
                     const total = this.compressionTotalBefore;
                     if (total <= 0) return 0;
@@ -2558,6 +2634,31 @@
                     return this.stats.savings?.by_layer?.cli_filtering?.lifetime?.tokens_saved ?? 0;
                 },
 
+                get showCliFilteringLifetimeLine() {
+                    return this.cliFilteringLifetime > 0
+                        && (!this.cliFilteringSessionAvailable
+                            || this.cliFilteringLifetime !== this.cliFilteringSessionValue);
+                },
+
+                get showCliFilteringSessionLine() {
+                    return this.cliFilteringSessionAvailable && this.cliFilteringSessionValue > 0;
+                },
+
+                get cliFilteringLifetimeLabel() {
+                    if (this.showCliFilteringSessionLine) return this.cliFilteringLabel + ' lifetime';
+                    return this.cliFilteringLabel + ' filtered';
+                },
+
+                get cliFilteringLifetimeValue() {
+                    const value = this.formatNumber(this.cliFilteringLifetime);
+                    return this.showCliFilteringSessionLine ? value : value + ' lifetime';
+                },
+
+                get proxyInputAfterCliFiltering() {
+                    return this.stats.tokens?.proxy_total_before_compression
+                        ?? ((this.stats.tokens?.input || 0) + (this.stats.tokens?.proxy_compression_saved || 0));
+                },
+
                 get cliFilteringSessionPctDisplay() {
                     const p = this.stats.savings?.by_layer?.cli_filtering?.session_savings_pct;
                     return (p === null || p === undefined) ? this.cliFilteringShareOfTotal : p;
@@ -2565,14 +2666,26 @@
 
                 // --- Headline savings percent ---
                 //
+                // Active ratio (saved / attempted) is the right metric when we have
+                // a working denominator. Some backend-routed paths don't yet
+                // populate `proxy_attempted_tokens` consistently — in that case
+                // the active number reads 0% even when compression is happening,
+                // so fall back to the whole-request ratio (`proxy_savings_percent`)
+                // instead of showing a misleading zero. Issue #455.
                 get headlineSavingsPercent() {
-                    return this.stats.tokens?.savings_percent
-                        ?? this.stats.tokens?.proxy_savings_percent
-                        ?? 0;
+                    const attempted = this.stats.tokens?.proxy_attempted_tokens || 0;
+                    const active = this.stats.tokens?.active_savings_percent || 0;
+                    if (attempted > 0 && active > 0) return active;
+                    return this.stats.tokens?.proxy_savings_percent || 0;
                 },
 
                 get headlineSavingsTitle() {
-                    return 'Of total wire input tokens';
+                    const attempted = this.stats.tokens?.proxy_attempted_tokens || 0;
+                    const active = this.stats.tokens?.active_savings_percent || 0;
+                    if (attempted > 0 && active > 0) {
+                        return 'Of compressible tokens attempted';
+                    }
+                    return 'Of whole pre-compression request (attempted-tokens metric unavailable)';
                 },
 
                 // --- Expandable Rows ---

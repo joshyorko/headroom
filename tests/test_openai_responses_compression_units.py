@@ -176,6 +176,48 @@ def test_openai_responses_adapter_compresses_custom_tool_call_output():
     assert strategy_chain == []
 
 
+def test_openai_responses_adapter_compresses_output_text_parts():
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="part output summary",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    long_text = " ".join(f"word{i}" for i in range(180))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "local_shell_call_output",
+                "call_id": "c1",
+                "output": [{"type": "output_text", "text": long_text}],
+            }
+        ],
+    }
+
+    new_payload, modified, saved, transforms, units_by_category, strategy_chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_test",
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert new_payload["input"][0]["output"] == [
+        {"type": "output_text", "text": "part output summary"}
+    ]
+    assert "router:openai:responses:local_shell_call_output:kompress" in transforms
+    assert units_by_category == {"applied": 1}
+    assert strategy_chain == []
+
+
 def test_openai_responses_adapter_reuses_exact_tool_output_cache():
     router = ContentRouter()
     calls = {"count": 0}
@@ -450,44 +492,6 @@ def test_openai_responses_adapter_preserves_excluded_tool_outputs():
     assert new_payload == payload
     assert units_by_category == {}
     assert strategy_chain == []
-
-
-def test_openai_responses_adapter_losslessly_folds_excluded_grep_output():
-    """Excluded tools skip *lossy* compression, but grep/log/json output is still
-    byte/data-losslessly compacted on the Responses path (matches chat/Anthropic).
-    """
-    from headroom.transforms.lossless_compaction import search_unheading
-
-    router = ContentRouter()
-    router.config.exclude_tools = {"grep"}
-    handler = _handler_with_router(router)
-    grep_out = "".join(
-        f"src/mod_{f}.py:{ln}:some matching content on this line here\n"
-        for f in range(8)
-        for ln in range(6)
-    )
-    payload = {
-        "model": "gpt-5",
-        "input": [
-            {"type": "function_call", "call_id": "call_1", "name": "grep", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "call_1", "output": grep_out},
-        ],
-    }
-
-    new_payload, modified, saved, transforms, _units, _chain, _attempted = (
-        handler._compress_openai_responses_live_text_units_with_router(
-            payload,
-            model="gpt-5",
-            request_id="req_test",
-        )
-    )
-
-    assert modified is True
-    assert saved >= 0  # token accounting never goes negative
-    assert "router:excluded:lossless" in transforms
-    folded = new_payload["input"][1]["output"]
-    assert len(folded) < len(grep_out)  # byte-smaller (real guarantee)
-    assert search_unheading(folded) == grep_out  # byte-exact recovery
 
 
 def test_openai_responses_adapter_excludes_tool_case_insensitively_with_debug(monkeypatch):

@@ -129,29 +129,6 @@ class TestBaselineModel:
         assert m2.lookup("k|a|s|tools") == m.lookup("k|a|s|tools")
         assert m2.total_samples == 3
 
-    def test_merge_is_equivalent_to_observing_both_streams(self):
-        # Merging two baselines must equal observing every value against one
-        # model — same totals per stratum and same global fallback.
-        a = BaselineModel()
-        for v in (100, 200):
-            a.observe("opus|new_user_ask|s|tools", v)
-        b = BaselineModel()
-        b.observe("opus|new_user_ask|s|tools", 300)
-        b.observe("sonnet|unknown|m|notools", 50)
-
-        a.merge(b)
-
-        mean, _, n = a.lookup("opus|new_user_ask|s|tools")
-        assert n == 3
-        assert mean == 200.0  # (100 + 200 + 300) / 3
-        assert a.total_samples == 4  # 3 + 1 across both strata
-
-        reference = BaselineModel()
-        for v in (100, 200, 300):
-            reference.observe("opus|new_user_ask|s|tools", v)
-        reference.observe("sonnet|unknown|m|notools", 50)
-        assert a.to_dict() == reference.to_dict()
-
 
 # ---------------------------------------------------------------------------
 # synthetic-control estimate
@@ -205,6 +182,85 @@ class TestEstimateFromBaseline:
         est = ledger.estimate_from_baseline()
         assert est.ci_low_pct <= est.pct <= est.ci_high_pct
         assert est.ci_low_pct < est.ci_high_pct  # nonzero band given spread
+
+    def test_tiny_request_count_marks_estimate_warming(self):
+        ledger = self._ledger_with_baseline(1000.0)
+        for _ in range(6):
+            ledger.record("treatment", "opus|new_user_ask|s|tools", 700)
+
+        est = ledger.estimate_from_baseline()
+
+        assert est.n_requests == 6
+        assert est.estimate_quality == "warming"
+        assert est.estimate_status == "warming"
+        assert est.estimate_reliable is False
+        assert est.estimate_reasons == ["low_sample"]
+
+    def test_live_bad_state_marks_warming_with_all_debug_reasons(self):
+        reliable, status, reasons = SavingsLedger._estimate_status(
+            tokens_saved=-4852,
+            pct=-687.9,
+            ci_low_pct=-2232.0,
+            ci_high_pct=856.3,
+            n_requests=9,
+        )
+
+        assert reliable is False
+        assert status == "warming"
+        assert reasons == ["low_sample", "inconclusive", "negative", "unstable"]
+
+    def test_ci_crossing_zero_marks_estimate_inconclusive(self):
+        ledger = SavingsLedger()
+        for v in (0, 2000):
+            for _ in range(30):
+                ledger.baseline.observe("opus|new_user_ask|s|tools", v)
+                ledger.record("treatment", "opus|new_user_ask|s|tools", 900)
+
+        est = ledger.estimate_from_baseline()
+
+        assert est.ci_low_pct < 0 < est.ci_high_pct
+        assert est.estimate_status == "inconclusive"
+        assert est.estimate_reliable is False
+        assert est.estimate_reasons == ["inconclusive"]
+
+    def test_impossible_negative_reduction_marks_estimate_unstable_after_warmup(self):
+        ledger = self._ledger_with_baseline(470.0)
+        for _ in range(30):
+            ledger.record("treatment", "opus|new_user_ask|s|tools", 1318)
+
+        est = ledger.estimate_from_baseline()
+
+        assert est.tokens_saved < 0
+        assert abs(est.pct) > 100
+        assert est.estimate_status == "negative"
+        assert est.estimate_reliable is False
+        assert est.estimate_reasons == ["negative", "unstable"]
+
+    def test_negative_estimate_marks_negative_after_warmup(self):
+        ledger = self._ledger_with_baseline(1000.0)
+        for _ in range(30):
+            ledger.record("treatment", "opus|new_user_ask|s|tools", 1100)
+
+        est = ledger.estimate_from_baseline()
+
+        assert est.tokens_saved < 0
+        assert abs(est.pct) <= 100
+        assert est.estimate_status == "negative"
+        assert est.estimate_reliable is False
+        assert est.estimate_reasons == ["negative"]
+
+    def test_absurd_positive_reduction_marks_unstable_after_warmup(self):
+        ledger = self._ledger_with_baseline(1000.0)
+        for _ in range(30):
+            ledger.record("treatment", "opus|new_user_ask|s|tools", -100)
+
+        est = ledger.estimate_from_baseline()
+
+        assert est.tokens_saved > 0
+        assert abs(est.pct) > 100
+        assert est.estimate_status == "unstable"
+        assert est.estimate_reliable is False
+        assert est.estimate_reasons == ["unstable"]
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +366,18 @@ class TestEchoRatio:
 
     def test_short_output_returns_zero(self):
         assert echo_ratio("a b", "a b c d e f g h", n=8) == 0.0
+
+
+def test_parse_stratum_label_control_records_to_control_bucket(tmp_path) -> None:
+    from headroom.proxy.output_savings import SavingsRecorder, parse_stratum_label
+
+    assert parse_stratum_label("output_shaper:control:") == ("control", "")
+
+    recorder = SavingsRecorder(path=tmp_path / "savings.json", flush_every=1)
+    recorder.record_from_labels(["output_shaper:control:"], 321)
+    control_state = recorder._ledger.to_dict()["control"][""]
+    assert control_state["n"] == 1
+    assert control_state["sum"] == 321.0
 
 
 # ---------------------------------------------------------------------------

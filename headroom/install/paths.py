@@ -112,6 +112,9 @@ def claude_settings_path() -> Path:
 def codex_config_path() -> Path:
     """Return the Codex config path."""
 
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home).expanduser() / "config.toml"
     return Path.home() / ".codex" / "config.toml"
 
 

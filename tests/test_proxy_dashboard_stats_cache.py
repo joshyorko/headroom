@@ -37,10 +37,16 @@ def _reset_rtk_stats_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     proxy_helpers._rtk_stats_cache.update(
         {"expires_at": 0.0, "has_value": False, "tool": None, "value": None}
     )
+    proxy_helpers._context_tool_reported_snapshot.update(
+        {"tool": None, "value": None, "reported_at": 0.0, "source": None}
+    )
+    proxy_helpers._context_tool_reported_project_snapshots.clear()
     proxy_helpers._rtk_session_baseline.update(
         {
             "initialized": False,
             "tool": None,
+            "source": None,
+            "scope": None,
             "total_commands": 0,
             "input_tokens": 0,
             "output_tokens": 0,
@@ -495,39 +501,6 @@ def test_session_summary_uses_generic_cli_filtering_keys() -> None:
     assert payload["compression"]["rtk_tokens_avoided"] == 7
     assert payload["cost"]["breakdown"]["cli_filtering_savings_usd"] is None
     assert payload["cost"]["breakdown"]["rtk_savings_usd"] is None
-    # Metrics fixture has no codex_ws counters -> no codex_ws block.
-    assert "codex_ws" not in payload
-
-
-def test_session_summary_surfaces_codex_ws_counters() -> None:
-    from headroom.proxy.cost import build_session_summary
-
-    proxy = SimpleNamespace(
-        config=SimpleNamespace(mode="token"),
-        logger=SimpleNamespace(_logs=[]),
-        cost_tracker=SimpleNamespace(stats=lambda: {}),
-    )
-    metrics = SimpleNamespace(
-        requests_by_model={},
-        tokens_saved_total=0,
-        codex_ws_units_total=12,
-        codex_ws_units_modified_total=9,
-        codex_ws_unit_tokens_saved_sum=4321,
-    )
-
-    payload = build_session_summary(
-        proxy,
-        metrics,
-        {},
-        cli_tokens_avoided=0,
-        total_tokens_before=0,
-    )
-
-    assert payload["codex_ws"] == {
-        "units_total": 12,
-        "units_modified": 9,
-        "tokens_saved": 4321,
-    }
 
 
 def test_stats_reset_clears_runtime_proxy_counters(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -601,8 +574,221 @@ def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     assert "rtkShareOfTotal" not in html
     assert "Lean-ctx" in html
     assert "Context Tool" in html
-    assert "cliFilteringLabel + ' Filtered (this session)'" in html
-    assert "cliFilteringLabel + ' Filtered (lifetime)'" in html
+    assert "Before Headroom layers" in html
+    assert "Proxy input after RTK" in html
+    assert "Proxy removed" in html
+    assert "Sent upstream" in html
+    assert "Output tokens" in html
+    assert "Before Compression" not in html
+    assert "After Compression (sent)" not in html
+    assert "cliFilteringLabel + ' filtered this session'" in html
+    assert "cliFilteringLabel + ' filtered'" in html
+    assert "cliFilteringLabel + ' lifetime'" in html
+    assert "session delta unavailable" in html
+    assert "session_delta_available" in html
+    assert "showCliFilteringLifetimeLine" in html
+    assert "this.cliFilteringLifetime !== this.cliFilteringSessionValue" in html
+    assert "proxy_total_before_compression" in html
+
+
+def test_dashboard_proxy_dollars_use_current_proxy_cost_not_lifetime_total() -> None:
+    html = get_dashboard_html()
+
+    hero_card = html[html.index("Proxy $ Saved") : html.index("Token Savings")]
+    assert "formatSessionProxyCurrency(" in hero_card
+    assert "stats.summary?.cost?.breakdown?.compression_savings_usd" in hero_card
+    assert "stats.summary?.cost?.total_saved_usd" in hero_card
+    assert "stats.persistent_savings?.lifetime?.compression_savings_usd" not in hero_card
+
+
+def test_dashboard_proxy_dollars_show_sub_cent_positive_savings() -> None:
+    html = get_dashboard_html()
+
+    assert "formatSessionProxyCurrency(n)" in html
+    assert "if (n > 0 && n < 0.01) return '<$0.01';" in html
+
+
+def test_dashboard_output_shaper_card_falls_back_to_applied_activity() -> None:
+    html = get_dashboard_html()
+
+    assert "stats.savings?.by_layer?.output_shaping?.applied_requests" in html
+    assert "shaped responses · steering applied" in html
+
+
+def test_dashboard_output_shaper_uses_estimate_quality_not_negative_saved_headline() -> None:
+    html = get_dashboard_html()
+    start = html.index("Output Shaping (counterfactual)")
+    output_card = html[start : start + 5000]
+
+    assert "estimate_quality" in output_card
+    assert "estimate_status" in output_card
+    assert "estimate_reliable" in output_card
+    assert "estimate_reasons" in output_card
+    assert "display_tokens_saved" in output_card
+    assert "? 'Output Tokens Saved' : 'Output Shaping'" in output_card
+    assert "Applied steering" in output_card
+    assert "' shaped responses · '" in output_card
+    assert "'estimate ' + (stats.tokens.output_reduction.estimate_quality" in output_card
+    assert 'x-show="stats.tokens?.output_reduction?.estimate_reliable &&' in output_card
+    assert "estimated counterfactual" in output_card
+
+
+def _stats_payload_with_output_estimate(
+    monkeypatch: pytest.MonkeyPatch, estimate: SimpleNamespace
+) -> dict:
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import headroom.proxy.output_savings as output_savings
+    import headroom.proxy.server as server
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+
+    class _Recorder:
+        def estimate(self) -> SimpleNamespace:
+            return estimate
+
+    monkeypatch.setattr(output_savings, "get_recorder", lambda: _Recorder())
+    monkeypatch.setattr(
+        server, "get_compression_store", lambda: _StatsStub({"store": 0}, "store", {})
+    )
+    monkeypatch.setattr(
+        server, "get_telemetry_collector", lambda: _StatsStub({"telemetry": 0}, "telemetry", {})
+    )
+    monkeypatch.setattr(
+        server, "get_compression_feedback", lambda: _StatsStub({"feedback": 0}, "feedback", {})
+    )
+    monkeypatch.setattr(server, "_get_context_tool_stats", lambda: {})
+    monkeypatch.setattr(server, "get_toin", lambda: _ToinStub())
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+        )
+    )
+    with TestClient(app) as client:
+        return client.get("/stats").json()
+
+
+def test_stats_exact_live_bad_output_estimate_keeps_raw_fields_but_hides_display_savings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _stats_payload_with_output_estimate(
+        monkeypatch,
+        SimpleNamespace(
+            n_requests=9,
+            kind="estimated",
+            tokens_saved=-4852,
+            baseline_tokens=470,
+            pct=-687.9,
+            ci_low_pct=-2232.0,
+            ci_high_pct=856.3,
+            estimate_reliable=False,
+            estimate_status="warming",
+            estimate_reasons=["low_sample", "inconclusive", "negative", "unstable"],
+        ),
+    )
+
+    output = payload["tokens"]["output_reduction"]
+    assert output["tokens_saved"] == -4852
+    assert output["baseline_tokens"] == 470
+    assert output["reduction_percent"] == -687.9
+    assert output["ci_low_percent"] == -2232.0
+    assert output["ci_high_percent"] == 856.3
+    assert output["estimate_reliable"] is False
+    assert output["estimate_status"] == "warming"
+    assert output["estimate_quality"] == "warming"
+    assert output["estimate_reasons"] == ["low_sample", "inconclusive", "negative", "unstable"]
+    assert output["display_tokens_saved"] is None
+    assert output["display_reduction_percent"] is None
+
+
+def test_stats_ci_crossing_zero_marks_output_estimate_inconclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _stats_payload_with_output_estimate(
+        monkeypatch,
+        SimpleNamespace(
+            n_requests=30,
+            kind="estimated",
+            tokens_saved=120,
+            baseline_tokens=1000,
+            pct=12.0,
+            ci_low_pct=-4.0,
+            ci_high_pct=28.0,
+            estimate_reliable=False,
+            estimate_status="inconclusive",
+            estimate_reasons=["inconclusive"],
+        ),
+    )
+
+    output = payload["tokens"]["output_reduction"]
+    assert output["estimate_status"] == "inconclusive"
+    assert output["estimate_reliable"] is False
+    assert output["estimate_reasons"] == ["inconclusive"]
+    assert output["display_tokens_saved"] is None
+
+
+def test_stats_negative_output_estimate_does_not_render_tokens_saved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _stats_payload_with_output_estimate(
+        monkeypatch,
+        SimpleNamespace(
+            n_requests=30,
+            kind="estimated",
+            tokens_saved=-100,
+            baseline_tokens=1000,
+            pct=-10.0,
+            ci_low_pct=-12.0,
+            ci_high_pct=-8.0,
+            estimate_reliable=False,
+            estimate_status="negative",
+            estimate_reasons=["negative"],
+        ),
+    )
+
+    output = payload["tokens"]["output_reduction"]
+    assert output["tokens_saved"] == -100
+    assert output["estimate_status"] == "negative"
+    assert output["estimate_reliable"] is False
+    assert output["estimate_reasons"] == ["negative"]
+    assert output["display_tokens_saved"] is None
+
+
+def test_stats_stable_positive_output_estimate_renders_display_savings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _stats_payload_with_output_estimate(
+        monkeypatch,
+        SimpleNamespace(
+            n_requests=30,
+            kind="estimated",
+            tokens_saved=240,
+            baseline_tokens=1000,
+            pct=24.0,
+            ci_low_pct=18.0,
+            ci_high_pct=30.0,
+            estimate_reliable=True,
+            estimate_status="stable",
+            estimate_reasons=[],
+        ),
+    )
+
+    output = payload["tokens"]["output_reduction"]
+    assert output["estimate_status"] == "stable"
+    assert output["estimate_reliable"] is True
+    assert output["estimate_reasons"] == []
+    assert output["display_tokens_saved"] == 240
+    assert output["display_reduction_percent"] == 24.0
 
 
 def test_proxy_throughput_in_stats_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -668,3 +854,152 @@ def test_proxy_throughput_in_stats_endpoint(monkeypatch: pytest.MonkeyPatch) -> 
     payload = response.json()
     assert "throughput" in payload
     assert payload["throughput"] == {"input_wall_clock": 99.0}
+
+
+def test_stats_output_shaping_reports_recent_codex_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import headroom.proxy.output_savings as output_savings
+    import headroom.proxy.server as server
+    from headroom.proxy.models import RequestLog
+    from headroom.proxy.request_logger import RequestLogger
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+
+    class _NoOutputSavingsRecorder:
+        def estimate(self):
+            return type("Estimate", (), {"n_requests": 0})()
+
+    monkeypatch.setattr(output_savings, "get_recorder", lambda: _NoOutputSavingsRecorder())
+    calls = {"store": 0, "telemetry": 0, "feedback": 0}
+    monkeypatch.setattr(
+        server,
+        "get_compression_store",
+        lambda: _StatsStub(calls, "store", {"entry_count": 0, "max_entries": 100}),
+    )
+    monkeypatch.setattr(
+        server,
+        "get_telemetry_collector",
+        lambda: _StatsStub(calls, "telemetry", {"enabled": True}),
+    )
+    monkeypatch.setattr(
+        server,
+        "get_compression_feedback",
+        lambda: _StatsStub(calls, "feedback", {}),
+    )
+    monkeypatch.setattr(server, "_get_context_tool_stats", lambda: {})
+    monkeypatch.setattr(server, "get_toin", lambda: _ToinStub())
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+        )
+    )
+    app.state.proxy.logger = RequestLogger(log_file=None, log_full_messages=False)
+    app.state.proxy.logger.log(
+        RequestLog(
+            request_id="r1",
+            timestamp="2026-06-21T19:20:00Z",
+            provider="openai",
+            model="gpt-5.5",
+            input_tokens_original=100,
+            input_tokens_optimized=90,
+            output_tokens=10,
+            tokens_saved=10,
+            savings_percent=10.0,
+            optimization_latency_ms=1.0,
+            total_latency_ms=20.0,
+            tags={"client": "codex"},
+            cache_hit=False,
+            transforms_applied=["output_shaper:verbosity:L2"],
+        )
+    )
+
+    with TestClient(app) as client:
+        payload = client.get("/stats").json()
+
+    output_shaping = payload["savings"]["by_layer"]["output_shaping"]
+    assert output_shaping["enabled"] is True
+    assert output_shaping["applied"] is True
+    assert output_shaping["available"] is True
+    assert output_shaping["estimate_available"] is False
+    assert output_shaping["method"] == "request_steering"
+    assert output_shaping["applied_requests"] == 1
+    assert output_shaping["level_counts"] == {"L2": 1}
+    assert output_shaping["by_client"] == {"codex": 1}
+    assert output_shaping["latest_label"] == "output_shaper:verbosity:L2"
+
+
+def test_output_shaping_control_label_does_not_count_as_applied_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.request_logger import RequestLog, RequestLogger
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+        )
+    )
+    app.state.proxy.logger = RequestLogger(log_file=None, log_full_messages=False)
+    app.state.proxy.logger.log(
+        RequestLog(
+            request_id="control",
+            timestamp="2026-06-23T00:00:00Z",
+            provider="openai",
+            model="gpt-5.4",
+            input_tokens_original=10,
+            input_tokens_optimized=10,
+            output_tokens=1,
+            tokens_saved=0,
+            savings_percent=0.0,
+            optimization_latency_ms=0.0,
+            total_latency_ms=1.0,
+            transforms_applied=["output_shaper:control:tiny"],
+            tags={"client": "codex"},
+            cache_hit=False,
+        )
+    )
+    app.state.proxy.logger.log(
+        RequestLog(
+            request_id="shaped",
+            timestamp="2026-06-23T00:00:01Z",
+            provider="openai",
+            model="gpt-5.4",
+            input_tokens_original=10,
+            input_tokens_optimized=10,
+            output_tokens=1,
+            tokens_saved=0,
+            savings_percent=0.0,
+            optimization_latency_ms=0.0,
+            total_latency_ms=1.0,
+            transforms_applied=["output_shaper:verbosity:L2"],
+            tags={"client": "codex"},
+            cache_hit=False,
+        )
+    )
+
+    with TestClient(app) as client:
+        output_shaping = client.get("/stats").json()["savings"]["by_layer"]["output_shaping"]
+
+    assert output_shaping["applied_requests"] == 1
+    assert output_shaping["level_counts"] == {"L2": 1}
+    assert output_shaping["latest_label"] == "output_shaper:verbosity:L2"

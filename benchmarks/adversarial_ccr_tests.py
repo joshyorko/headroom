@@ -252,14 +252,13 @@ def test_needle_looks_exactly_like_hay() -> AdversarialResult:
         tool_name="user_search",
     )
 
-    # Recover the target user via CCR retrieval (hash-only → full content)
-    entry_for_search = store.retrieve(hash_key)
-    search_results = json.loads(entry_for_search.original_content) if entry_for_search else []
+    # Try to find user 456 via search
+    search_results = store.search(hash_key, "user_id 456")
 
     found_target = any(item.get("user_id") == target_id for item in search_results)
 
     if found_target:
-        result.actual_behavior = "Found target user via CCR retrieval"
+        result.actual_behavior = "Found target user via CCR search"
         result.passed = True
     else:
         # Try full retrieval as fallback
@@ -719,16 +718,12 @@ def test_extremely_long_strings() -> AdversarialResult:
 
 def test_query_injection_in_search() -> AdversarialResult:
     """
-    ATTACK: Malicious input on the retrieval surface.
-
-    Retrieval is hash-only (no query/search parameter), so the only
-    attacker-controlled input is the hash. A malicious string must never
-    crash the store or return another entry's data — it must be a clean miss.
+    ATTACK: Malicious search query.
     """
     result = AdversarialResult(
-        name="Retrieval Hash Injection",
+        name="Search Query Injection",
         category="injection",
-        expected_behavior="Malicious hash input is a safe cache miss, never a crash",
+        expected_behavior="Should sanitize search queries",
         severity="high",
     )
 
@@ -737,36 +732,35 @@ def test_query_injection_in_search() -> AdversarialResult:
 
     items = [{"id": i, "data": f"item {i}"} for i in range(100)]
 
-    store.store(
+    hash_key = store.store(
         original=json.dumps(items),
         compressed=json.dumps(items[:10]),
         original_item_count=100,
         compressed_item_count=10,
     )
 
-    # Various injection attempts, now aimed at the hash (the only input)
-    malicious_hashes = [
+    # Various injection attempts
+    malicious_queries = [
         "'; DROP TABLE items; --",
         "<script>alert('xss')</script>",
         "{{7*7}}",  # Template injection
         "${7*7}",  # Expression injection
         "\\x00\\x01\\x02",  # Null bytes
-        "*" * 10000,  # Long input
+        "*" * 10000,  # Long query
         ".*",  # Regex wildcard
         "(a]",  # Invalid regex
     ]
 
     failures = []
-    for bad_hash in malicious_hashes:
+    for query in malicious_queries:
         try:
-            entry = store.retrieve(bad_hash)
-            if entry is not None:
-                failures.append(f"{bad_hash[:20]}: unexpected hit")
+            store.search(hash_key, query)
+            # If it returns without error, it handled the injection
         except Exception as e:
-            failures.append(f"{bad_hash[:20]}: {type(e).__name__}")
+            failures.append(f"{query[:20]}: {type(e).__name__}")
 
     if not failures:
-        result.actual_behavior = "All malicious hashes handled safely (clean miss)"
+        result.actual_behavior = "All malicious queries handled safely"
         result.passed = True
     else:
         result.actual_behavior = f"Failures: {failures}"
@@ -1267,7 +1261,7 @@ def test_catastrophic_regex_in_search() -> AdversarialResult:
     result = AdversarialResult(
         name="Regex Catastrophic Backtracking",
         category="extreme",
-        expected_behavior="Should not hang on malicious hash input",
+        expected_behavior="Should not hang on malicious search patterns",
         severity="critical",
     )
 
@@ -1276,7 +1270,7 @@ def test_catastrophic_regex_in_search() -> AdversarialResult:
 
     items = [{"id": i, "content": "a" * 50 + "b"} for i in range(100)]
 
-    store.store(
+    hash_key = store.store(
         original=json.dumps(items),
         compressed=json.dumps(items[:10]),
         original_item_count=100,
@@ -1284,9 +1278,7 @@ def test_catastrophic_regex_in_search() -> AdversarialResult:
         tool_name="regex_test",
     )
 
-    # Retrieval is hash-only, so the only attacker input is the hash. These
-    # patterns could cause catastrophic backtracking in a naive matcher;
-    # the hash lookup must not hang on any of them.
+    # These patterns could cause catastrophic backtracking in naive regex
     evil_patterns = [
         "(a+)+$",
         "(a|aa)+$",
@@ -1298,23 +1290,23 @@ def test_catastrophic_regex_in_search() -> AdversarialResult:
         import signal
 
         def timeout_handler(signum, frame):
-            raise TimeoutError("Retrieval took too long")
+            raise TimeoutError("Search took too long")
 
         # Set 2 second timeout
         old_handler = signal.signal(signal.SIGALRM, timeout_handler)
         signal.alarm(2)
 
         for pattern in evil_patterns:
-            # Hash lookup is a plain dict/store get — no regex, so it is safe
-            store.retrieve(pattern)
+            # BM25 search doesn't use regex, so should be safe
+            store.search(hash_key, pattern)
 
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
 
-        result.actual_behavior = "Retrieval completed without hanging"
+        result.actual_behavior = "Search completed without hanging"
         result.passed = True
     except TimeoutError:
-        result.actual_behavior = "Retrieval hung on regex-like input"
+        result.actual_behavior = "Search hung on regex-like pattern"
         result.passed = False
     except Exception as e:
         result.actual_behavior = f"Error: {type(e).__name__}: {e}"
@@ -1541,6 +1533,7 @@ def test_concurrent_reset_during_operation() -> AdversarialResult:
                     tool_name="reset_test",
                 )
                 store.retrieve(hash_key)
+                store.search(hash_key, "test")
                 operations_completed[0] += 1
             except Exception as e:
                 errors.append(f"Op error: {type(e).__name__}: {e}")

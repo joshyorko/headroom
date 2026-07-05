@@ -338,6 +338,25 @@ class TestTrafficLearner:
         assert stats["patterns_extracted"] >= 1
 
     @pytest.mark.asyncio
+    async def test_preference_from_openai_responses_input_text_blocks(
+        self, learner: TrafficLearner
+    ):
+        """OpenAI Responses ``input_text`` blocks should feed --learn."""
+        await learner.on_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "No, use httpx not requests."},
+                    ],
+                },
+            ]
+        )
+
+        stats = learner.get_stats()
+        assert stats["patterns_extracted"] >= 1
+
+    @pytest.mark.asyncio
     async def test_evidence_accumulation(self):
         """Test that patterns need min_evidence before saving."""
         learner = TrafficLearner(backend=None, min_evidence=3)
@@ -776,6 +795,7 @@ class _FakeBackend:
 
         self._config = _types.SimpleNamespace(db_path=str(db_path))
         self._db_path = str(db_path)
+        self.saved_user_ids: list[str] = []
 
     async def save_memory(
         self,
@@ -790,6 +810,7 @@ class _FakeBackend:
         import types as _types
         import uuid
 
+        self.saved_user_ids.append(user_id)
         mid = str(uuid.uuid4())
         conn = _sql.connect(self._db_path)
         try:
@@ -955,6 +976,34 @@ class TestEvidencePersistence:
         assert len(rows) == 1
         assert rows[0][0] == "seed-id"
         assert rows[0][2]["evidence_count"] == 4
+
+    @pytest.mark.asyncio
+    async def test_same_pattern_persists_per_request_user_scope(self, tmp_path):
+        """A process-wide learner must not dedup one user's evidence against another's."""
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, user_id="default", min_evidence=2)
+        await learner.start()
+
+        def mk() -> ExtractedPattern:
+            return ExtractedPattern(
+                category=PatternCategory.PREFERENCE,
+                content="User preference: use httpx rather than requests.",
+                importance=0.7,
+            )
+
+        for _ in range(2):
+            await learner._accumulate(mk(), user_id="alice")
+        await _wait_for_saved(learner, 1, db)
+
+        for _ in range(2):
+            await learner._accumulate(mk(), user_id="bob")
+        await _wait_for_saved(learner, 2, db)
+
+        await learner.stop()
+
+        assert backend.saved_user_ids == ["alice", "bob"]
 
 
 # =============================================================================

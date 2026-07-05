@@ -16,6 +16,30 @@ import pytest
 
 from tests._skip_helpers import external_model_skip_reason
 
+_REAL_CODEX_CONFIG_PATHS = {
+    Path.home() / ".codex" / "config.toml",
+}
+if os.environ.get("CODEX_HOME"):
+    _REAL_CODEX_CONFIG_PATHS.add(Path(os.environ["CODEX_HOME"]).expanduser() / "config.toml")
+
+_REPO_DOTENV_HEADROOM_KEYS = {
+    "HEADROOM_BIND_HOST",
+    "HEADROOM_CODE_AWARE_ENABLED",
+    "HEADROOM_COMPRESS_USER_MESSAGES",
+    "HEADROOM_EFFORT_ROUTER",
+    "HEADROOM_LOG_MESSAGES",
+    "HEADROOM_MECHANICAL_EFFORT",
+    "HEADROOM_MEMORY_CONTEXT_TIMEOUT_SECONDS",
+    "HEADROOM_MEMORY_TOP_K",
+    "HEADROOM_MIN_EVIDENCE",
+    "HEADROOM_MIN_TOKENS",
+    "HEADROOM_MODE",
+    "HEADROOM_NO_SUBSCRIPTION_TRACKING",
+    "HEADROOM_OUTPUT_SHAPER",
+    "HEADROOM_TARGET_RATIO",
+    "HEADROOM_VERBOSITY_LEVEL",
+}
+
 # =============================================================================
 # Global test hooks
 # =============================================================================
@@ -63,12 +87,71 @@ def _reset_headroom_logger_propagation():
     """
     import logging as _logging
 
-    for _name in ("headroom", *list(_logging.root.manager.loggerDict)):
-        if _name == "headroom" or _name.startswith("headroom."):
-            logger = _logging.getLogger(_name)
+    def _restore_for_caplog() -> None:
+        _logging.disable(_logging.NOTSET)
+        logger_names = {
+            "headroom",
+            "headroom.proxy",
+            "headroom.proxy.forwarded_headers",
+            "headroom.transforms",
+            "headroom.transforms.kompress_compressor",
+        }
+
+        for name, logger in list(_logging.Logger.manager.loggerDict.items()):
+            if isinstance(logger, _logging.Logger) and (
+                name == "headroom" or name.startswith("headroom.")
+            ):
+                logger_names.add(name)
+
+        for logger_name in logger_names:
+            logger = _logging.getLogger(logger_name)
             logger.disabled = False
             logger.propagate = True
-    yield
+
+    _restore_for_caplog()
+    try:
+        yield
+    finally:
+        _restore_for_caplog()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_codex_home_and_guard_real_config(monkeypatch, tmp_path):
+    """Keep Codex config-writing tests out of the user's real config."""
+
+    def _snapshot(path: Path) -> tuple[bool, int | None, int | None]:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return (False, None, None)
+        return (True, stat.st_mtime_ns, stat.st_size)
+
+    before = {path: _snapshot(path) for path in _REAL_CODEX_CONFIG_PATHS}
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex-test-home"))
+    try:
+        yield
+    finally:
+        after = {path: _snapshot(path) for path in _REAL_CODEX_CONFIG_PATHS}
+        changed = [str(path) for path in _REAL_CODEX_CONFIG_PATHS if before[path] != after[path]]
+        assert not changed, f"tests modified real Codex config: {changed}"
+
+
+@pytest.fixture(autouse=True)
+def _clear_repo_dotenv_headroom_leaks():
+    """Keep live `.env` proxy knobs from making tests order-dependent."""
+
+    from headroom.proxy import runtime_env
+
+    def _clear() -> None:
+        for key in _REPO_DOTENV_HEADROOM_KEYS:
+            os.environ.pop(key, None)
+        runtime_env.clear_overrides()
+
+    _clear()
+    try:
+        yield
+    finally:
+        _clear()
 
 
 # =============================================================================

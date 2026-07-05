@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -220,41 +219,6 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
     assert persisted["history"][-1]["timestamp"] == "2026-03-27T12:34:00Z"
 
 
-def test_stateless_savings_tracker_writes_nothing(tmp_path):
-    """In stateless mode the tracker updates in-memory counters but never
-    touches the filesystem — no proxy_savings.json is created."""
-    path = tmp_path / "proxy_savings.json"
-    tracker = SavingsTracker(path=str(path), stateless=True)
-
-    # Both write paths that would normally persist a checkpoint:
-    assert tracker.record_compression_savings(model="gpt-4o", tokens_saved=4096) is True
-    tracker.record_request(
-        model="gpt-4o",
-        input_tokens=8192,
-        tokens_saved=4096,
-        timestamp="2026-03-27T09:00:00Z",
-    )
-
-    # Nothing written to disk...
-    assert not path.exists()
-    # ...but live in-memory counters still reflect the activity.
-    assert tracker.snapshot()["lifetime"]["tokens_saved"] >= 4096
-
-
-def test_non_stateless_savings_tracker_still_persists(tmp_path):
-    """Control: default (stateless=False) behavior is unchanged — it persists."""
-    path = tmp_path / "proxy_savings.json"
-    tracker = SavingsTracker(path=str(path))
-
-    tracker.record_request(
-        model="gpt-4o",
-        input_tokens=8192,
-        tokens_saved=4096,
-        timestamp="2026-03-27T09:00:00Z",
-    )
-    assert path.exists()
-
-
 def test_savings_tracker_save_does_not_flock_target_inode_before_replace(tmp_path, monkeypatch):
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(path=str(path))
@@ -293,7 +257,11 @@ def test_savings_tracker_save_does_not_flock_target_inode_before_replace(tmp_pat
 
 def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
     def fake_cost_per_token(*, model, prompt_tokens, completion_tokens):
-        if model in {"gpt-4o", "anthropic/claude-sonnet-4-6"}:
+        if model in {
+            "gpt-4o",
+            "anthropic/claude-sonnet-4-6",
+            "chatgpt/gpt-5.3-codex-spark",
+        }:
             return {
                 "model": model,
                 "prompt_tokens": prompt_tokens,
@@ -306,10 +274,18 @@ def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
         model_cost={
             "anthropic/claude-sonnet-4-6": {"input_cost_per_token": 0.002},
             "gpt-4o": {"input_cost_per_token": 0.001},
+            "gpt-5.3-codex": {"input_cost_per_token": 0.00175},
+            "chatgpt/gpt-5.3-codex-spark": {"input_cost_per_token": 0.0},
         },
     )
     monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", True)
     monkeypatch.setattr(savings_tracker_module, "litellm", fake_litellm)
+
+    import headroom.pricing.litellm_pricing as pricing_module
+
+    monkeypatch.setattr(pricing_module, "LITELLM_AVAILABLE", True)
+    monkeypatch.setattr(pricing_module, "litellm", fake_litellm)
+    pricing_module._resolved_model_cache.clear()
 
     assert savings_tracker_module._resolve_litellm_model("gpt-4o") == "gpt-4o"
     assert (
@@ -326,14 +302,21 @@ def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
         cache_write_tokens=5,
         uncached_input_tokens=85,
     ) == pytest.approx(0.2)
+    assert savings_tracker_module._resolve_litellm_model("gpt-5.3-codex-spark") == "gpt-5.3-codex"
+    assert savings_tracker_module._estimate_compression_savings_usd(
+        "gpt-5.3-codex-spark", 100
+    ) == pytest.approx(0.175)
+    assert (
+        savings_tracker_module._resolve_litellm_model("chatgpt/gpt-5.3-codex-spark")
+        == "gpt-5.3-codex"
+    )
+    assert savings_tracker_module._estimate_compression_savings_usd(
+        "chatgpt/gpt-5.3-codex-spark", 100
+    ) == pytest.approx(0.175)
 
     fake_litellm.model_cost = {}
-    assert savings_tracker_module._estimate_compression_savings_usd("gpt-4o", 100) == pytest.approx(
-        100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
-    )
-    assert savings_tracker_module._estimate_input_cost_usd("gpt-4o", 100) == pytest.approx(
-        100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
-    )
+    assert savings_tracker_module._estimate_compression_savings_usd("gpt-4o", 100) == 0.0
+    assert savings_tracker_module._estimate_input_cost_usd("gpt-4o", 100) == 0.0
 
     monkeypatch.setattr(
         fake_litellm,
@@ -341,178 +324,11 @@ def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     assert savings_tracker_module._resolve_litellm_model("mystery-model") == "mystery-model"
-    assert savings_tracker_module._estimate_compression_savings_usd(
-        "mystery-model", 100
-    ) == pytest.approx(100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
-    assert savings_tracker_module._estimate_input_cost_usd("mystery-model", 100) == pytest.approx(
-        100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
-    )
-    # Explicitly force the unavailable path for the whole tracker.
-    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", False)
-    assert savings_tracker_module._estimate_compression_savings_usd("gpt-4o", 100) == pytest.approx(
-        100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
-    )
-    assert savings_tracker_module._estimate_input_cost_usd("gpt-4o", 100) == pytest.approx(
-        100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
-    )
-
-
-def test_fallback_request_pricing_stays_nonzero_with_litellm_unavailable_and_preserves_historic_zeros(
-    tmp_path, monkeypatch
-):
-    # Legacy proxy_savings rows can legitimately store zero-dollar values.
-    savings_path = tmp_path / "proxy_savings.json"
-    savings_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 3,
-                "lifetime": {
-                    "requests": 1,
-                    "tokens_saved": 10,
-                    "compression_savings_usd": 0.0,
-                    "total_input_tokens": 120,
-                    "total_input_cost_usd": 0.0,
-                },
-                "display_session": {},
-                "history": [
-                    {
-                        "timestamp": "2026-03-27T09:00:00Z",
-                        "provider": "openai",
-                        "model": "gpt-4o",
-                        "total_tokens_saved": 10,
-                        "compression_savings_usd": 0.0,
-                        "total_input_tokens": 120,
-                        "total_input_cost_usd": 0.0,
-                    }
-                ],
-                "projects": {
-                    "fallback-demo": {
-                        "requests": 1,
-                        "tokens_saved": 10,
-                        "compression_savings_usd": 0.0,
-                        "total_input_tokens": 120,
-                        "total_input_cost_usd": 0.0,
-                        "last_activity_at": "2026-03-27T09:00:00Z",
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    tracker = SavingsTracker(path=str(savings_path))
-    initial_snapshot = tracker.snapshot()
-    assert initial_snapshot["lifetime"]["compression_savings_usd"] == 0.0
-    assert initial_snapshot["display_session"]["compression_savings_usd"] == 0.0
-    assert initial_snapshot["projects"]["fallback-demo"]["compression_savings_usd"] == 0.0
-    assert initial_snapshot["history"][-1]["compression_savings_usd"] == 0.0
+    assert savings_tracker_module._estimate_compression_savings_usd("mystery-model", 100) == 0.0
 
     monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", False)
-    monkeypatch.setattr(savings_tracker_module, "litellm", None)
-    assert tracker.record_request(
-        model="gpt-4o",
-        input_tokens=100,
-        tokens_saved=50,
-        project="fallback-demo",
-        timestamp="2026-03-27T09:10:00Z",
-    )
-    monkeypatch.setattr(
-        savings_tracker_module,
-        "_utc_now",
-        lambda: datetime(2026, 3, 27, 9, 10, 30, tzinfo=timezone.utc),
-    )
-
-    snapshot = tracker.snapshot()
-    expected_savings_fallback = 50 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
-    expected_input_fallback = 100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
-    assert snapshot["lifetime"]["compression_savings_usd"] == pytest.approx(
-        expected_savings_fallback
-    )
-    assert snapshot["lifetime"]["total_input_cost_usd"] == pytest.approx(expected_input_fallback)
-    assert snapshot["display_session"]["compression_savings_usd"] == pytest.approx(
-        expected_savings_fallback
-    )
-    assert snapshot["display_session"]["total_input_cost_usd"] == pytest.approx(
-        expected_input_fallback
-    )
-    assert snapshot["projects"]["fallback-demo"]["compression_savings_usd"] == pytest.approx(
-        expected_savings_fallback
-    )
-    assert snapshot["projects"]["fallback-demo"]["total_input_cost_usd"] == pytest.approx(
-        expected_input_fallback
-    )
-    assert snapshot["history"][-1]["compression_savings_usd"] == pytest.approx(
-        expected_savings_fallback
-    )
-
-    persisted = json.loads(savings_path.read_text(encoding="utf-8"))
-    assert persisted["history"][0]["compression_savings_usd"] == 0.0
-    assert persisted["history"][-1]["compression_savings_usd"] == pytest.approx(
-        expected_savings_fallback
-    )
-
-
-def test_input_cost_counts_cache_reads_when_uncached_input_is_zero(monkeypatch):
-    # Anthropic reports cache reads/writes separately from `input_tokens` (the
-    # uncached portion). A fully prefix-cached request has input_tokens == 0 but
-    # cache_read_tokens > 0 -- it still cost money and must not be priced at 0,
-    # otherwise the day shows compression savings with zero recorded spend.
-    def fake_cost_per_token(*, model, prompt_tokens, completion_tokens):
-        if model == "anthropic/claude-sonnet-4-6":
-            return {"model": model}
-        raise RuntimeError("unknown model")
-
-    fake_litellm = SimpleNamespace(
-        cost_per_token=fake_cost_per_token,
-        model_cost={
-            "anthropic/claude-sonnet-4-6": {
-                "input_cost_per_token": 0.003,
-                "cache_read_input_token_cost": 0.0003,
-                "cache_creation_input_token_cost": 0.00375,
-            },
-        },
-    )
-    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", True)
-    monkeypatch.setattr(savings_tracker_module, "litellm", fake_litellm)
-
-    cost = savings_tracker_module._estimate_input_cost_usd(
-        "claude-sonnet-4-6",
-        0,
-        cache_read_tokens=1000,
-    )
-    assert cost == pytest.approx(0.3)
-
-
-def test_fallback_input_cost_uses_breakdown_sum_not_input_tokens_when_litellm_unavailable(
-    monkeypatch,
-):
-    # Regression: when both `input_tokens` and a nonzero cache breakdown are
-    # present and LiteLLM is unavailable, the fallback must price only the
-    # breakdown sum — never input_tokens + breakdown_sum — to avoid
-    # double-counting the tokens that the breakdown already covers.
-    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", False)
-    monkeypatch.setattr(savings_tracker_module, "litellm", None)
-
-    input_tokens = 1000
-    cache_read = 200
-    cache_write = 100
-    uncached = 300
-    breakdown_sum = cache_read + cache_write + uncached  # 600
-
-    result = savings_tracker_module._estimate_input_cost_usd(
-        "gpt-4o",
-        input_tokens,
-        cache_read_tokens=cache_read,
-        cache_write_tokens=cache_write,
-        uncached_input_tokens=uncached,
-    )
-
-    fallback_rate = savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
-    expected = breakdown_sum * fallback_rate
-    double_counted = (input_tokens + breakdown_sum) * fallback_rate
-
-    assert result == pytest.approx(expected)
-    assert result != pytest.approx(double_counted)
+    assert savings_tracker_module._estimate_compression_savings_usd("gpt-4o", 100) == 0.0
+    assert savings_tracker_module._estimate_input_cost_usd("gpt-4o", 100) == 0.0
 
 
 def test_display_session_rolls_after_inactivity_and_counts_zero_savings_requests(
@@ -1007,12 +823,6 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         assert stats_data["persistent_savings"]["lifetime"]["tokens_saved"] == 40
         assert stats_data["persistent_savings"]["storage_path"] == str(savings_path)
 
-        metrics = client.get("/metrics")
-        assert metrics.status_code == 200
-        assert "headroom_tokens_saved_total 40" in metrics.text
-        assert "headroom_persistent_savings_tokens_saved_total 40" in metrics.text
-        assert "headroom_persistent_savings_requests_total 1" in metrics.text
-
         history = client.get("/stats-history")
         assert history.status_code == 200
         history_data = history.json()
@@ -1054,12 +864,6 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         assert history.json()["lifetime"]["tokens_saved"] == 40
         assert history.json()["display_session"]["requests"] == 1
 
-        metrics = client.get("/metrics")
-        assert metrics.status_code == 200
-        assert "headroom_tokens_saved_total 0" in metrics.text
-        assert "headroom_persistent_savings_tokens_saved_total 40" in metrics.text
-        assert "headroom_persistent_savings_requests_total 1" in metrics.text
-
         _record_request(client, model="gpt-4o", tokens_saved=15)
 
         updated = client.get("/stats-history").json()
@@ -1074,12 +878,6 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         assert updated["display_session"]["savings_percent"] == pytest.approx(18.64)
         assert updated["series"]["daily"][0]["total_input_tokens_delta"] == 240
         assert updated["series"]["daily"][0]["total_input_cost_usd_delta"] == pytest.approx(0.48)
-
-        metrics = client.get("/metrics")
-        assert metrics.status_code == 200
-        assert "headroom_tokens_saved_total 15" in metrics.text
-        assert "headroom_persistent_savings_tokens_saved_total 55" in metrics.text
-        assert "headroom_persistent_savings_requests_total 2" in metrics.text
 
         full = client.get("/stats-history?history_mode=full").json()
         assert full["history_summary"]["mode"] == "full"
@@ -1221,77 +1019,3 @@ def test_stats_history_includes_cli_filtering(tmp_path, monkeypatch):
     assert data["cli_filtering"]["tool"] == "rtk"
     assert data["cli_filtering"]["label"] == "RTK"
     assert data["cli_filtering"]["lifetime"]["tokens_saved"] == 999
-
-
-def test_coercion_helpers_reject_non_finite_values():
-    """Non-finite inputs fail open to the default -- never raise, never leak NaN/inf.
-
-    _coerce_int raised OverflowError on inf; _coerce_float returned NaN/inf
-    verbatim, poisoning arithmetic and emitting JSON the dashboard's JSON.parse
-    rejects.
-    """
-    ci = savings_tracker_module._coerce_int
-    cf = savings_tracker_module._coerce_float
-
-    # _coerce_int: every non-finite / overflowing input collapses to default.
-    assert ci(float("inf")) == 0
-    assert ci(float("-inf")) == 0
-    assert ci(float("nan")) == 0
-    assert ci(float("inf"), default=7) == 7
-
-    # _coerce_float: nan/inf never raise on float() and must be rejected;
-    # an int too large to convert raises OverflowError and must be caught.
-    assert cf(float("nan")) == 0.0
-    assert math.isfinite(cf(float("nan")))
-    assert cf(float("inf")) == 0.0
-    assert cf(float("-inf")) == 0.0
-    assert cf(10**400) == 0.0
-    assert cf(float("nan"), default=1.5) == 1.5
-
-    # Regression: finite values still coerce unchanged.
-    assert ci(5) == 5
-    assert cf(3.5) == pytest.approx(3.5)
-
-
-def test_savings_tracker_loads_non_finite_persisted_state_without_crashing(tmp_path):
-    """A proxy_savings.json holding NaN/Infinity must not crash construction.
-
-    json.loads accepts bare NaN/Infinity, so a prior bad write leaves them on
-    disk. Before the fix, _coerce_int(inf) in _sanitize_state raised
-    OverflowError out of __init__ and the proxy failed to start.
-    """
-    path = tmp_path / "proxy_savings.json"
-    # json.dumps emits bare NaN/Infinity literals (allow_nan default) -- exactly
-    # what a prior non-finite write would leave on disk.
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 3,
-                "lifetime": {
-                    "requests": 1,
-                    "tokens_saved": float("inf"),
-                    "compression_savings_usd": float("nan"),
-                    "total_input_tokens": float("inf"),
-                    "total_input_cost_usd": float("nan"),
-                },
-                "history": [
-                    {
-                        "timestamp": "2026-03-27T09:00:00Z",
-                        "total_tokens_saved": float("inf"),
-                        "compression_savings_usd": float("nan"),
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    tracker = SavingsTracker(path=str(path))
-    lifetime = tracker.snapshot()["lifetime"]
-
-    # Non-finite fields fail open to safe defaults, not crash or NaN.
-    for key, value in lifetime.items():
-        assert isinstance(value, int | float)
-        assert math.isfinite(value), f"{key} is non-finite: {value}"
-    assert lifetime["tokens_saved"] == 0
-    assert lifetime["total_input_tokens"] == 0

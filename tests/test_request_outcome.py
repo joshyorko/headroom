@@ -171,6 +171,13 @@ def test_classify_client_x_client_header_wins_over_user_agent() -> None:
     assert classify_client(h) == "my-custom-harness"
 
 
+def test_classify_client_uses_headroom_client_prefix_header() -> None:
+    from headroom.proxy.auth_mode import classify_client
+
+    h = {"User-Agent": "OpenAI/Python 2.0", "X-Headroom-Client": "Hermes"}
+    assert classify_client(h) == "hermes"
+
+
 def test_classify_client_returns_none_for_unknown_traffic() -> None:
     """``None`` is the loud "unidentified" signal — downstream consumers
     can group these as "unknown" rather than silently bucketing into

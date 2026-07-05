@@ -201,19 +201,72 @@ def test_init_codex_merges_feature_flag_into_existing_table(monkeypatch, tmp_pat
     init_cli, _ = _load_init_module(monkeypatch)
     monkeypatch.chdir(tmp_path)
     config_path = tmp_path / ".codex" / "config.toml"
+    user_config_path = tmp_path / "user-codex" / "config.toml"
+    monkeypatch.setattr(init_cli, "codex_config_path", lambda: user_config_path)
     config_path.parent.mkdir(parents=True)
     config_path.write_text("[features]\nshell_tool = true\n", encoding="utf-8")
 
-    init_cli._init_codex(global_scope=False, profile="init-local-demo", port=9000)
+    init_cli._init_codex(
+        global_scope=False,
+        profile="init-local-demo",
+        port=9000,
+        proxy_url="http://headroom.example.test",
+    )
 
     content = config_path.read_text(encoding="utf-8")
-    assert 'base_url = "http://127.0.0.1:9000/v1"' in content
     assert content.count("[features]") == 1
     assert "hooks = true" in content
+    assert "[model_providers.headroom]" not in content
+    assert "model_provider" not in content
+    assert "openai_base_url" not in content
     assert 'env_key = "OPENAI_API_KEY"' not in content
+    provider = tomllib.loads(user_config_path.read_text(encoding="utf-8"))
+    assert provider["model_provider"] == "headroom"
+    assert provider["model_providers"]["headroom"]["base_url"] == "http://headroom.example.test/v1"
     hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    assert "--profile init-local-demo" in hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-    assert "init hook ensure" in hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    session_commands = [
+        hook["command"] for entry in hooks["hooks"]["SessionStart"] for hook in entry["hooks"]
+    ]
+    assert not any("init hook ensure" in command for command in session_commands)
+    assert "PreToolUse" not in hooks["hooks"]
+    assert session_commands == [
+        command
+        for command in session_commands
+        if "mcp report-rtk" in command
+        and "--proxy-url http://headroom.example.test" in command
+        and "headroom-init-codex-rtk-report" in command
+    ]
+
+
+def test_init_codex_local_proxy_keeps_runtime_ensure_hook(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    user_config_path = tmp_path / "user-codex" / "config.toml"
+    monkeypatch.setattr(init_cli, "codex_config_path", lambda: user_config_path)
+
+    init_cli._init_codex(global_scope=False, profile="init-local-demo", port=9000)
+
+    hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    session_commands = [
+        hook["command"] for entry in hooks["hooks"]["SessionStart"] for hook in entry["hooks"]
+    ]
+    assert any(
+        "--profile init-local-demo" in command and "init hook ensure" in command
+        for command in session_commands
+    )
+    assert any(
+        "mcp report-rtk" in command
+        and "--proxy-url http://127.0.0.1:9000" in command
+        and "headroom-init-codex-rtk-report" in command
+        for command in session_commands
+    )
+    assert any(
+        "init hook ensure" in hook["command"]
+        for entry in hooks["hooks"]["PreToolUse"]
+        for hook in entry["hooks"]
+    )
 
 
 def test_init_codex_creates_hooks_feature_flag_on_first_init(
@@ -221,14 +274,67 @@ def test_init_codex_creates_hooks_feature_flag_on_first_init(
 ) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     monkeypatch.chdir(tmp_path)
+    user_config_path = tmp_path / "user-codex" / "config.toml"
+    monkeypatch.setattr(init_cli, "codex_config_path", lambda: user_config_path)
 
     init_cli._init_codex(global_scope=False, profile="init-local-demo", port=9000)
 
     content = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
     parsed = tomllib.loads(content)
-    assert parsed["model_provider"] == "headroom"
     assert parsed["features"]["hooks"] is True
+    assert "model_provider" not in parsed
     assert "codex_hooks" not in content
+    provider = tomllib.loads(user_config_path.read_text(encoding="utf-8"))
+    assert provider["model_provider"] == "headroom"
+    assert provider["model_providers"]["headroom"]["base_url"] == "http://127.0.0.1:9000/v1"
+
+
+def test_init_codex_full_setup_registers_tokensave_and_serena_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "user-codex"))
+
+    def fake_which(cmd: str) -> str | None:
+        if cmd == "uvx":
+            return "/usr/local/bin/uvx"
+        return None
+
+    monkeypatch.setattr("headroom.cli.wrap.shutil.which", fake_which)
+    monkeypatch.setattr(
+        "headroom.cli.wrap._ensure_tokensave_binary",
+        lambda verbose=False: Path("/usr/local/bin/tokensave"),
+    )
+    monkeypatch.setattr("headroom.cli.wrap._index_tokensave_project", lambda *args, **kwargs: None)
+
+    init_cli._init_codex(
+        global_scope=False,
+        profile="init-local-demo",
+        port=9000,
+        proxy_url="http://headroom.example.test",
+    )
+
+    provider = tomllib.loads((tmp_path / "user-codex" / "config.toml").read_text())
+    headroom_provider = provider["model_providers"]["headroom"]
+    assert provider["model_provider"] == "headroom"
+    assert provider["openai_base_url"] == "http://headroom.example.test/v1"
+    assert headroom_provider["name"] == "OpenAI via Headroom proxy"
+    assert headroom_provider["base_url"] == "http://headroom.example.test/v1"
+    assert headroom_provider["env_http_headers"] == {"X-Headroom-Project": "HEADROOM_PROJECT"}
+    assert provider["mcp_servers"]["headroom"]["args"][-2:] == ["mcp", "serve"]
+    assert provider["mcp_servers"]["headroom"]["env"]["HEADROOM_PROXY_URL"] == (
+        "http://headroom.example.test"
+    )
+    assert provider["mcp_servers"]["tokensave"]["command"] == "/usr/local/bin/tokensave"
+    assert provider["mcp_servers"]["tokensave"]["args"] == ["serve"]
+    assert provider["mcp_servers"]["serena"]["command"] == "uvx"
+    assert "--context" in provider["mcp_servers"]["serena"]["args"]
+    assert "codex" in provider["mcp_servers"]["serena"]["args"]
+
+    project_config = tomllib.loads((tmp_path / ".codex" / "config.toml").read_text())
+    assert project_config["features"]["hooks"] is True
+    assert (tmp_path / ".codex" / "hooks.json").exists()
 
 
 def test_init_claude_uses_custom_port(monkeypatch, tmp_path: Path) -> None:
@@ -257,9 +363,33 @@ def test_init_copilot_global_writes_hooks_and_env(monkeypatch, tmp_path: Path) -
     assert "--profile init-user" in payload["hooks"]["SessionStart"][0]["command"]
     assert captured_env == {
         "COPILOT_PROVIDER_TYPE": "openai",
-        "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:9005/v1",
+        "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:9005/c/copilot/v1",
         "COPILOT_PROVIDER_WIRE_API": "completions",
     }
+
+
+def test_init_copilot_honors_remote_proxy_url(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    captured_env: dict[str, str] = {}
+
+    monkeypatch.setattr(init_cli, "_copilot_config_path", lambda: tmp_path / "copilot-config.json")
+    monkeypatch.setattr(init_cli, "_apply_user_env", lambda values: captured_env.update(values))
+    monkeypatch.setattr(init_cli, "_install_copilot_marketplace", lambda: None)
+    monkeypatch.setattr(init_cli, "_install_headroom_mcp_for_targets", lambda **kwargs: None)
+    monkeypatch.setattr(init_cli, "_ensure_runtime_manifest", lambda **kwargs: "init-user")
+
+    init_cli._run_init_targets(
+        targets=["copilot"],
+        global_scope=True,
+        port=9005,
+        backend="openai",
+        anyllm_provider=None,
+        region=None,
+        memory=False,
+        proxy_url="http://10.10.10.89",
+    )
+
+    assert captured_env["COPILOT_PROVIDER_BASE_URL"] == "http://10.10.10.89/c/copilot/v1"
 
 
 def test_init_hook_ensure_prefers_local_profile(monkeypatch) -> None:
@@ -389,6 +519,31 @@ def test_json_file_handles_missing_empty_and_non_mapping(monkeypatch, tmp_path: 
     assert init_cli._json_file(array_payload) == {}
 
 
+def test_json_file_handles_jsonc_comments(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    comment_only = tmp_path / "comment-only.json"
+    jsonc_payload = tmp_path / "payload.json"
+    comment_only.write_text(
+        "// User settings belong in settings.json.\n// This file is managed automatically.\n",
+        encoding="utf-8",
+    )
+    jsonc_payload.write_text(
+        "{\n"
+        "  // keep URLs inside strings intact\n"
+        '  "url": "http://127.0.0.1:8787/v1",\n'
+        "  /* block comment */\n"
+        '  "hooks": {}\n'
+        "}\n",
+        encoding="utf-8",
+    )
+
+    assert init_cli._json_file(comment_only) == {}
+    assert init_cli._json_file(jsonc_payload) == {
+        "url": "http://127.0.0.1:8787/v1",
+        "hooks": {},
+    }
+
+
 def test_ensure_claude_hooks_rewrites_existing_entries(monkeypatch, tmp_path: Path) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     settings_path = tmp_path / "settings.json"
@@ -464,6 +619,23 @@ def test_ensure_copilot_hooks_replaces_existing_marker(monkeypatch, tmp_path: Pa
     assert commands == ["echo keep", "headroom init hook ensure --marker headroom-init-copilot"]
 
 
+def test_ensure_copilot_hooks_accepts_comment_only_config(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    config_path = tmp_path / "copilot.json"
+    config_path.write_text(
+        "// User settings belong in settings.json.\n// This file is managed automatically.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_copilot_hooks(config_path, "init-user")
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["hooks"]["SessionStart"][0]["command"] == (
+        "headroom init hook ensure --marker headroom-init-copilot"
+    )
+
+
 def test_replace_marker_block_replaces_existing_block(monkeypatch) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     content = "before\n# start\nold\n# end\nafter\n"
@@ -471,6 +643,15 @@ def test_replace_marker_block_replaces_existing_block(monkeypatch) -> None:
     replaced = init_cli._replace_marker_block(content, "# start", "# end", "# start\nnew\n# end")
 
     assert replaced == "before\n\nafter\n\n# start\nnew\n# end\n"
+
+
+def test_codex_project_provider_url_uses_project_prefix(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    assert (
+        init_cli._proxy_project_v1_url("http://headroom.example.test/v1", "my repo")
+        == "http://headroom.example.test/p/my%20repo/v1"
+    )
 
 
 def test_ensure_codex_provider_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
@@ -481,13 +662,38 @@ def test_ensure_codex_provider_replaces_existing_marker(monkeypatch, tmp_path: P
         encoding="utf-8",
     )
 
-    init_cli._ensure_codex_provider(path, 9100)
+    init_cli._ensure_codex_provider(path, "http://127.0.0.1:9100/v1")
 
     content = path.read_text(encoding="utf-8")
     assert content.count(init_cli._CODEX_PROVIDER_MARKER_START) == 1
     assert 'base_url = "http://127.0.0.1:9100/v1"' in content
     assert "old = true" not in content
     assert 'env_key = "OPENAI_API_KEY"' not in content
+
+
+def test_ensure_codex_provider_leaves_matching_existing_config_unchanged(
+    monkeypatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    existing = (
+        "# --- Headroom proxy (auto-injected by headroom wrap codex) ---\n"
+        'model_provider = "headroom"\n'
+        'openai_base_url = "http://10.10.10.89/v1"\n'
+        "# --- end Headroom ---\n\n"
+        "# --- Headroom proxy (auto-injected by headroom wrap codex) ---\n"
+        "[model_providers.headroom]\n"
+        'name = "OpenAI via Headroom proxy"\n'
+        'base_url = "http://10.10.10.89/v1"\n'
+        "supports_websockets = true\n"
+        'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }\n'
+        "# --- end Headroom ---\n"
+    )
+    path.write_text(existing, encoding="utf-8")
+
+    init_cli._ensure_codex_provider(path, "http://10.10.10.89/v1")
+
+    assert path.read_text(encoding="utf-8") == existing
 
 
 def test_ensure_codex_provider_keeps_root_keys_above_existing_table(
@@ -503,7 +709,7 @@ def test_ensure_codex_provider_keeps_root_keys_above_existing_table(
     path = tmp_path / "config.toml"
     path.write_text("[features]\nhooks = true\n", encoding="utf-8")
 
-    init_cli._ensure_codex_provider(path, 8787)
+    init_cli._ensure_codex_provider(path, "http://127.0.0.1:8787/v1")
 
     parsed = tomllib.loads(path.read_text(encoding="utf-8"))
     # model_provider belongs at the document root, not under [features].
@@ -526,7 +732,7 @@ def test_ensure_codex_provider_replaces_existing_model_provider(
     path = tmp_path / "config.toml"
     path.write_text('model_provider = "openai"\n[features]\nhooks = true\n', encoding="utf-8")
 
-    init_cli._ensure_codex_provider(path, 8787)
+    init_cli._ensure_codex_provider(path, "http://127.0.0.1:8787/v1")
 
     parsed = tomllib.loads(path.read_text(encoding="utf-8"))  # raises on a duplicate key
     assert parsed["model_provider"] == "headroom"
@@ -540,7 +746,7 @@ def test_ensure_codex_provider_emits_requires_openai_auth_for_chatgpt(
     path = tmp_path / "config.toml"
     (tmp_path / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
 
-    init_cli._ensure_codex_provider(path, 8787)
+    init_cli._ensure_codex_provider(path, "http://127.0.0.1:8787/v1")
 
     assert "requires_openai_auth = true" in path.read_text(encoding="utf-8")
 
@@ -552,7 +758,7 @@ def test_ensure_codex_provider_omits_requires_openai_auth_for_api_key(
     path = tmp_path / "config.toml"
     (tmp_path / "auth.json").write_text('{"auth_mode": "apikey"}', encoding="utf-8")
 
-    init_cli._ensure_codex_provider(path, 8787)
+    init_cli._ensure_codex_provider(path, "http://127.0.0.1:8787/v1")
 
     assert "requires_openai_auth" not in path.read_text(encoding="utf-8")
 
@@ -953,7 +1159,7 @@ def test_resolve_copilot_env_supports_anthropic(monkeypatch) -> None:
 
     assert init_cli._resolve_copilot_env(9010, "anthropic") == {
         "COPILOT_PROVIDER_TYPE": "anthropic",
-        "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:9010",
+        "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:9010/c/copilot",
     }
 
 
@@ -1239,7 +1445,7 @@ def test_init_codex_windows_warns_about_upstream_hook_limitation(monkeypatch) ->
     monkeypatch.setattr(init_cli, "_codex_hooks_path", lambda global_scope: Path("hooks.json"))
     monkeypatch.setattr(init_cli, "_ensure_codex_provider", lambda path, port: None)
     monkeypatch.setattr(init_cli, "_ensure_codex_feature_flag", lambda path: None)
-    monkeypatch.setattr(init_cli, "_ensure_codex_hooks", lambda path, profile: None)
+    monkeypatch.setattr(init_cli, "_ensure_codex_hooks", lambda path, profile, proxy_url: None)
     monkeypatch.setattr(init_cli.click, "echo", lambda message: messages.append(message))
 
     init_cli._init_codex(global_scope=True, profile="init-user", port=9000)
@@ -1265,6 +1471,7 @@ def test_init_openclaw_propagates_nonzero_exit(monkeypatch) -> None:
 def test_run_init_targets_dispatches_supported_targets(monkeypatch) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     calls: list[tuple[str, tuple[object, ...]]] = []
+    mcp_calls: list[tuple[list[str], str]] = []
     monkeypatch.setattr(init_cli, "_ensure_runtime_manifest", lambda **kwargs: "init-profile")
     monkeypatch.setattr(
         init_cli,
@@ -1284,7 +1491,15 @@ def test_run_init_targets_dispatches_supported_targets(monkeypatch) -> None:
         init_cli,
         "_init_codex",
         lambda **kwargs: calls.append(
-            ("codex", (kwargs["global_scope"], kwargs["profile"], kwargs["port"]))
+            (
+                "codex",
+                (
+                    kwargs["global_scope"],
+                    kwargs["profile"],
+                    kwargs["port"],
+                    kwargs["proxy_url"],
+                ),
+            )
         ),
     )
     monkeypatch.setattr(
@@ -1292,11 +1507,17 @@ def test_run_init_targets_dispatches_supported_targets(monkeypatch) -> None:
         "_init_openclaw",
         lambda **kwargs: calls.append(("openclaw", (kwargs["global_scope"], kwargs["port"]))),
     )
+    monkeypatch.setattr(
+        init_cli,
+        "_install_headroom_mcp_for_targets",
+        lambda **kwargs: mcp_calls.append((kwargs["targets"], kwargs["proxy_url"])),
+    )
 
     init_cli._run_init_targets(
         targets=["claude", "copilot", "codex", "openclaw"],
         global_scope=True,
         port=9000,
+        proxy_url="http://headroom.example.test",
         backend="openai",
         anyllm_provider="provider",
         region="us-east-1",
@@ -1306,8 +1527,47 @@ def test_run_init_targets_dispatches_supported_targets(monkeypatch) -> None:
     assert calls == [
         ("claude", (True, "init-profile", 9000)),
         ("copilot", (True, "init-profile", 9000)),
-        ("codex", (True, "init-profile", 9000)),
+        ("codex", (True, "init-profile", 9000, "http://headroom.example.test")),
         ("openclaw", (True, 9000)),
+    ]
+    assert mcp_calls == [(["claude", "copilot", "openclaw"], "http://headroom.example.test")]
+
+
+def test_run_init_targets_remote_codex_skips_local_runtime_manifest(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    calls: list[dict[str, object]] = []
+
+    def fail_runtime_manifest(**_: object) -> str:
+        raise AssertionError("remote Codex setup must not create a local runtime manifest")
+
+    monkeypatch.setattr(init_cli, "_ensure_runtime_manifest", fail_runtime_manifest)
+    monkeypatch.setattr(init_cli, "_runtime_profile", lambda global_scope: "init-local-demo")
+    monkeypatch.setattr(init_cli, "_init_codex", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(init_cli, "_install_headroom_mcp_for_targets", lambda **kwargs: None)
+
+    init_cli._run_init_targets(
+        targets=["codex"],
+        global_scope=False,
+        port=9000,
+        proxy_url="http://headroom.example.test",
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        memory=False,
+    )
+
+    assert calls == [
+        {
+            "global_scope": False,
+            "profile": "init-local-demo",
+            "port": 9000,
+            "proxy_url": "http://headroom.example.test",
+            "serena": False,
+            "no_serena": False,
+            "no_tokensave": False,
+            "code_graph": False,
+            "verbose": False,
+        }
     ]
 
 
@@ -1327,10 +1587,12 @@ def test_init_subcommand_uses_group_options(monkeypatch) -> None:
         "targets": ["claude"],
         "global_scope": True,
         "port": 9007,
+        "proxy_url": None,
         "backend": "openai",
         "anyllm_provider": None,
         "region": None,
         "memory": True,
+        "verbose": False,
     }
 
 
@@ -1381,7 +1643,7 @@ def test_init_codex_writes_openai_base_url(monkeypatch, tmp_path: Path) -> None:
     path = tmp_path / ".codex" / "config.toml"
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    init_cli._ensure_codex_provider(path, 8787)
+    init_cli._ensure_codex_provider(path, "http://127.0.0.1:8787/v1")
 
     content = path.read_text(encoding="utf-8")
     assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content, (
@@ -1454,7 +1716,7 @@ def test_init_codex_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -
     # Normal install-then-strip cycle.
     path = tmp_path / "config.toml"
     path.write_text('model = "gpt-4o"\n', encoding="utf-8")
-    init_cli._ensure_codex_provider(path, 8787)
+    init_cli._ensure_codex_provider(path, "http://127.0.0.1:8787/v1")
     assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in path.read_text(encoding="utf-8")
 
     stripped = init_cli._strip_codex_init_block(path.read_text(encoding="utf-8"))
@@ -1475,3 +1737,14 @@ def test_init_codex_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -
         f"_strip_codex_init_block must remove orphaned openai_base_url:\n{orphan_stripped}"
     )
     assert 'model = "gpt-4o"' in orphan_stripped
+
+
+def test_init_codex_strip_preserves_unrelated_openai_base_url(monkeypatch) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    stripped = init_cli._strip_codex_init_block(
+        'model_provider = "openai"\nopenai_base_url = "https://api.openai.com/v1"\n'
+    )
+
+    assert 'model_provider = "openai"' in stripped
+    assert 'openai_base_url = "https://api.openai.com/v1"' in stripped

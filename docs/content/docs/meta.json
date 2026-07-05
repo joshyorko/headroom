@@ -33,7 +33,6 @@
     "strands",
     "litellm",
     "claude-code-vertex",
-    "claude-code-azure-foundry",
     "opencode",
     "mcp",
     "---Configuration---",

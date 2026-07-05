@@ -18,10 +18,16 @@ def _reset(monkeypatch):
     helpers._context_tool_stats_cache.update(
         {"expires_at": 0.0, "has_value": False, "tool": None, "value": None}
     )
+    helpers._context_tool_reported_snapshot.update(
+        {"tool": None, "value": None, "reported_at": 0.0, "source": None}
+    )
+    helpers._context_tool_reported_project_snapshots.clear()
     helpers._context_tool_session_baseline.update(
         {
             "initialized": False,
             "tool": None,
+            "source": None,
+            "scope": None,
             "total_commands": 0,
             "input_tokens": 0,
             "output_tokens": 0,
@@ -68,3 +74,72 @@ def test_session_savings_is_delta_not_lifetime_average(monkeypatch):
     # Session % is derived from the delta (200 saved / 300 input delta), not the
     # lifetime-diluted average.
     assert second["session"]["savings_pct"] == round(200 / 300 * 100, 4)
+
+
+def test_reported_lifetime_is_not_session_when_baseline_missing(monkeypatch):
+    _reset(monkeypatch)
+
+    helpers.ingest_context_tool_stats(
+        {
+            "tool": "rtk",
+            "scope": "global",
+            "summary": {
+                "total_commands": 1150,
+                "total_input": 100_435_475,
+                "total_output": 1_952_057,
+                "total_saved": 98_484_160,
+            },
+        },
+        source="workstation",
+    )
+
+    stats = helpers._get_context_tool_stats()
+
+    assert stats is not None
+    assert stats["session_delta_available"] is False
+    assert stats["session_delta_unavailable_reason"] == "baseline_unavailable"
+    assert stats["session"]["tokens_saved"] == 0
+    assert stats["tokens_saved"] == 0
+    assert stats["lifetime"]["tokens_saved"] == 98_484_160
+    assert stats["baseline"]["tokens_saved"] == 98_484_160
+
+
+def test_reported_lifetime_subtracts_valid_session_baseline(monkeypatch):
+    _reset(monkeypatch)
+    helpers._context_tool_session_baseline.update(
+        {
+            "initialized": True,
+            "tool": "rtk",
+            "source": "reported",
+            "scope": "global",
+            "total_commands": 1000,
+            "input_tokens": 98_000_000,
+            "output_tokens": 0,
+            "tokens_saved": 98_000_000,
+            "total_time_ms": 0,
+            "captured_at": 1.0,
+        }
+    )
+
+    helpers.ingest_context_tool_stats(
+        {
+            "tool": "rtk",
+            "scope": "global",
+            "summary": {
+                "total_commands": 1010,
+                "total_input": 98_500_000,
+                "total_output": 0,
+                "total_saved": 98_500_000,
+            },
+        },
+        source="workstation",
+    )
+
+    stats = helpers._get_context_tool_stats()
+
+    assert stats is not None
+    assert stats["session_delta_available"] is True
+    assert stats["session"]["tokens_saved"] == 500_000
+    assert stats["tokens_saved"] == 500_000
+    assert stats["lifetime"]["tokens_saved"] == 98_500_000
+    assert stats["baseline"]["tokens_saved"] == 98_000_000

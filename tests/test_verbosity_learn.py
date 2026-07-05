@@ -53,6 +53,49 @@ def _tool_result(*, ts: str, content: str = "ok") -> dict:
     }
 
 
+def _codex_message(
+    role: str,
+    text: str,
+    *,
+    ts: str,
+    usage: dict | None = None,
+    model: str = "gpt-5.3-codex-spark",
+) -> dict:
+    part_type = "output_text" if role == "assistant" else "input_text"
+    payload = {
+        "type": "message",
+        "role": role,
+        "content": [{"type": part_type, "text": text}],
+        "model": model,
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    return {"type": "response_item", "timestamp": ts, "payload": payload}
+
+
+def _codex_tool_call(call_id: str = "call_1") -> dict:
+    return {
+        "type": "response_item",
+        "payload": {
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": call_id,
+            "arguments": json.dumps({"cmd": "rtk read src/app.py"}),
+        },
+    }
+
+
+def _codex_tool_output(text: str, call_id: str = "call_1") -> dict:
+    return {
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": text,
+        },
+    }
+
+
 LONG = " ".join(["word"] * 400)  # well above the long-output floor
 
 
@@ -158,6 +201,44 @@ class TestSignalExtraction:
         )
         sig, _ = extract_signals([p])
         assert sig.human_msgs == 1  # only the real ask, not the tool_result
+
+    def test_codex_response_items_seed_baseline(self, tmp_path):
+        p = _write_session(
+            tmp_path,
+            "codex",
+            [
+                _codex_message("user", "inspect this project", ts="2026-01-01T00:00:00Z"),
+                _codex_message(
+                    "assistant",
+                    LONG,
+                    ts="2026-01-01T00:00:01Z",
+                    usage={"input_tokens": 9000, "output_tokens": 333},
+                ),
+                _codex_tool_call(),
+                _codex_tool_output("file contents\n" * 50),
+                _codex_message(
+                    "assistant",
+                    "done now",
+                    ts="2026-01-01T00:00:03Z",
+                    usage=None,
+                ),
+            ],
+        )
+
+        sig, baseline = extract_signals([p])
+
+        assert sig.sessions == 1
+        assert sig.human_msgs == 1
+        assert sig.asst_responses == 2
+        assert baseline.total_samples == 2
+        mean, _, n = baseline.lookup("gpt|new_user_ask|m|tools")
+        assert n == 1
+        assert mean == 333.0
+        estimated_mean, _, estimated_n = baseline.lookup(
+            "gpt|mechanical_continuation|xs|tools"
+        )
+        assert estimated_n == 1
+        assert estimated_mean > 0
 
 
 class TestRecommendLevel:

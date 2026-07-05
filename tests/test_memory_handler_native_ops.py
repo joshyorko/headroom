@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from headroom.memory.storage_router import MemoryStorageMode, RequestContext
 from headroom.proxy import memory_handler as memory_handler_module
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -1297,6 +1298,19 @@ async def test_ensure_initialized_fast_paths_and_qdrant_variants(
     await qdrant_handler._init_backend_locked()
     assert qdrant_handler.initialized is True
     assert seen["initialized"] is True
+    assert qdrant_handler._router is not None
+    _, scope, effective_user = qdrant_handler._resolve_for_request(
+        "alice",
+        RequestContext(
+            headers={"x-headroom-project-id": "proj-a"},
+            system_prompt="",
+            base_user_id="alice",
+        ),
+    )
+    assert scope is not None
+    assert scope.mode is MemoryStorageMode.PROJECT
+    assert scope.project_key == "proj-a"
+    assert effective_user == "alice::proj-a"
     assert seen["config"] == {
         "qdrant_url": None,
         "qdrant_host": "localhost",

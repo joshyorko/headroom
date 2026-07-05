@@ -254,6 +254,102 @@ class TestCLIProxyEnvVars:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].min_tokens_to_crush == 120
 
+    def test_memory_stack_env_vars(self, runner):
+        """Qdrant/Neo4j memory backend env vars should be passed to ProxyConfig."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy", "--memory"],
+                env={
+                    "HEADROOM_MEMORY_BACKEND": "qdrant-neo4j",
+                    "HEADROOM_QDRANT_HOST": "qdrant",
+                    "HEADROOM_QDRANT_PORT": "6333",
+                    "HEADROOM_NEO4J_URI": "neo4j://neo4j:7687",
+                    "HEADROOM_NEO4J_USER": "neo4j",
+                    "HEADROOM_NEO4J_PASSWORD": "secret",
+                },
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        config = captured_config["config"]
+        assert config.memory_enabled is True
+        assert config.memory_backend == "qdrant-neo4j"
+        assert config.memory_qdrant_host == "qdrant"
+        assert config.memory_qdrant_port == 6333
+        assert config.memory_neo4j_uri == "neo4j://neo4j:7687"
+        assert config.memory_neo4j_user == "neo4j"
+        assert config.memory_neo4j_password == "secret"
+
+    def test_memory_enabled_env_var_enables_runtime_memory(self, runner):
+        """Installer-provided HEADROOM_MEMORY_ENABLED should enable proxy memory."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_MEMORY_ENABLED": "1"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].memory_enabled is True
+
+    def test_memory_stack_cli_flags_override_env_vars(self, runner):
+        """Explicit memory stack flags should win over env vars."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                [
+                    "proxy",
+                    "--memory",
+                    "--memory-backend",
+                    "qdrant-neo4j",
+                    "--memory-qdrant-host",
+                    "qdrant-cli",
+                    "--memory-qdrant-port",
+                    "6339",
+                    "--memory-neo4j-uri",
+                    "neo4j://neo4j-cli:7687",
+                    "--memory-neo4j-user",
+                    "neo4j-cli",
+                    "--memory-neo4j-password",
+                    "cli-secret",
+                ],
+                env={
+                    "HEADROOM_MEMORY_BACKEND": "local",
+                    "HEADROOM_QDRANT_HOST": "qdrant-env",
+                    "HEADROOM_QDRANT_PORT": "6333",
+                    "HEADROOM_NEO4J_URI": "neo4j://neo4j-env:7687",
+                    "HEADROOM_NEO4J_USER": "neo4j-env",
+                    "HEADROOM_NEO4J_PASSWORD": "env-secret",
+                },
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        config = captured_config["config"]
+        assert config.memory_backend == "qdrant-neo4j"
+        assert config.memory_qdrant_host == "qdrant-cli"
+        assert config.memory_qdrant_port == 6339
+        assert config.memory_neo4j_uri == "neo4j://neo4j-cli:7687"
+        assert config.memory_neo4j_user == "neo4j-cli"
+        assert config.memory_neo4j_password == "cli-secret"
+
     def test_headroom_budget_from_env(self, runner):
         """HEADROOM_BUDGET env var should be passed to ProxyConfig."""
         captured_config = {}

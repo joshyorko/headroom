@@ -134,7 +134,7 @@ def assign_arm(conversation_key: str, holdout_fraction: float) -> str:
         return "control"
     digest = hashlib.sha256(("arm:" + conversation_key).encode()).hexdigest()
     # Map the first 8 hex digits to [0, 1).
-    frac = int(digest[:8], 16) / 0xFFFFFFFF
+    frac = int(digest[:8], 16) / (2**32)
     return "control" if frac < holdout_fraction else "treatment"
 
 
@@ -161,16 +161,6 @@ class _Accum:
         if self.n < 2:
             return 0.0
         return max(0.0, (self.sumsq - self.sum * self.sum / self.n) / (self.n - 1))
-
-    def merge(self, other: _Accum) -> None:
-        """Fold another accumulator's observations into this one.
-
-        n / sum / sumsq are additive, so merging is element-wise addition and
-        is exactly equivalent to having ``add``-ed both observation streams.
-        """
-        self.n += other.n
-        self.sum += other.sum
-        self.sumsq += other.sumsq
 
     def to_dict(self) -> dict[str, float]:
         return {"n": self.n, "sum": self.sum, "sumsq": self.sumsq}
@@ -199,19 +189,6 @@ class BaselineModel:
     def observe(self, key: str, output_tokens: int) -> None:
         self.strata.setdefault(key, _Accum()).add(output_tokens)
         self.glob.add(output_tokens)
-
-    def merge(self, other: BaselineModel) -> None:
-        """Fold another baseline's observations into this one.
-
-        Per-stratum and global accumulators are additive, so merging is
-        element-wise and order-independent — the result is identical to having
-        observed both corpora against a single model. Used to aggregate a
-        cross-project baseline from per-project ``analyze`` results without
-        re-reading transcripts.
-        """
-        for key, acc in other.strata.items():
-            self.strata.setdefault(key, _Accum()).merge(acc)
-        self.glob.merge(other.glob)
 
     def lookup(self, key: str) -> tuple[float, float, int]:
         """Return ``(mean, var, n)`` for *key* with hierarchical back-off.
@@ -262,6 +239,10 @@ class SavingsEstimate:
     ci_high_pct: float
     n_requests: int
     kind: str  # "estimated" (synthetic control) or "measured" (A/B holdout)
+    estimate_reliable: bool
+    estimate_status: str
+    estimate_reasons: list[str]
+    estimate_quality: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -361,6 +342,13 @@ class SavingsLedger:
         hi = total_saved + 1.96 * se
         ci_low = (lo / total_baseline * 100.0) if total_baseline > 0 else 0.0
         ci_high = (hi / total_baseline * 100.0) if total_baseline > 0 else 0.0
+        estimate_reliable, estimate_status, estimate_reasons = SavingsLedger._estimate_status(
+            tokens_saved=total_saved,
+            pct=pct,
+            ci_low_pct=ci_low,
+            ci_high_pct=ci_high,
+            n_requests=n_requests,
+        )
         return SavingsEstimate(
             tokens_saved=total_saved,
             baseline_tokens=total_baseline,
@@ -369,7 +357,38 @@ class SavingsLedger:
             ci_high_pct=ci_high,
             n_requests=n_requests,
             kind=kind,
+            estimate_reliable=estimate_reliable,
+            estimate_status=estimate_status,
+            estimate_reasons=estimate_reasons,
+            estimate_quality=estimate_status,
         )
+
+    @staticmethod
+    def _estimate_status(
+        *,
+        tokens_saved: float,
+        pct: float,
+        ci_low_pct: float,
+        ci_high_pct: float,
+        n_requests: int,
+    ) -> tuple[bool, str, list[str]]:
+        reasons: list[str] = []
+        if n_requests < 30:
+            reasons.append("low_sample")
+        if ci_low_pct <= 0 <= ci_high_pct:
+            reasons.append("inconclusive")
+        if tokens_saved < 0:
+            reasons.append("negative")
+        if abs(pct) > 100:
+            reasons.append("unstable")
+        if not reasons:
+            return True, "stable", []
+        if "low_sample" in reasons:
+            return False, "warming", reasons
+        for status in ("inconclusive", "negative", "unstable"):
+            if status in reasons:
+                return False, status, reasons
+        return False, reasons[0], reasons
 
     def best_estimate(self) -> SavingsEstimate:
         """Prefer the measured A/B number; fall back to the baseline estimate."""
@@ -500,12 +519,6 @@ class SavingsRecorder:
             self._ledger.baseline = disk.baseline
 
     def _flush_locked(self) -> None:
-        from ..paths import process_is_stateless
-
-        if process_is_stateless():
-            # Stateless: keep the in-memory ledger but never write to disk.
-            self._since_flush = 0
-            return
         try:
             self._reload_baseline_locked()
             self._ledger.save(self._path)

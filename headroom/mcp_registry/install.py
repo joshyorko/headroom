@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from headroom.install.runtime import resolve_headroom_command
+from headroom.install.runtime import resolve_headroom_config_command
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
@@ -32,7 +32,7 @@ def build_headroom_spec(proxy_url: str = DEFAULT_PROXY_URL) -> ServerSpec:
     env: dict[str, str] = {}
     if proxy_url and proxy_url != DEFAULT_PROXY_URL:
         env["HEADROOM_PROXY_URL"] = proxy_url
-    command = resolve_headroom_command()
+    command = resolve_headroom_config_command()
     return ServerSpec(
         name="headroom",
         command=command[0],

@@ -6,14 +6,20 @@ import json
 import pytest
 
 pytest.importorskip("fastapi")
+from fastapi.responses import JSONResponse  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from headroom.proxy import helpers  # noqa: E402
 from headroom.proxy.outcome import RequestOutcome, emit_request_outcome  # noqa: E402
 from headroom.proxy.project_context import (  # noqa: E402
     classify_project,
+    classify_project_from_payload,
     get_current_project,
+    sanitize_client_name,
     set_current_project,
+    split_client_path,
     split_project_path,
+    with_client_prefix,
     with_project_prefix,
 )
 from headroom.proxy.savings_tracker import (  # noqa: E402
@@ -21,7 +27,34 @@ from headroom.proxy.savings_tracker import (  # noqa: E402
     SavingsTracker,
     sanitize_project_name,
 )
-from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_context_tool_reported_projects():
+    with helpers._context_tool_stats_cache_lock:
+        helpers._context_tool_reported_snapshot.update(
+            {"tool": None, "value": None, "reported_at": 0.0, "source": None}
+        )
+        helpers._context_tool_reported_project_snapshots.clear()
+        helpers._context_tool_stats_cache.update(
+            {"expires_at": 0.0, "has_value": False, "tool": None, "value": None}
+        )
+        helpers._context_tool_session_baseline.update(
+            {
+                "initialized": True,
+                "tool": "rtk",
+                "source": None,
+                "scope": None,
+                "total_commands": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "tokens_saved": 0,
+                "total_time_ms": 0,
+                "captured_at": 0.0,
+            }
+        )
+
 
 # ---------------------------------------------------------------------------
 # sanitize_project_name / classify_project
@@ -61,6 +94,27 @@ def test_classify_project_reads_header_case_insensitively():
     assert classify_project(object()) is None
 
 
+def test_classify_project_from_payload_reads_cwd_path():
+    assert (
+        classify_project_from_payload(
+            {"cwd": "/var/home/kdlocpanda/second_brain/Areas/devcontainers/room-of-requirement"}
+        )
+        == "room-of-requirement"
+    )
+
+
+def test_classify_project_from_payload_reads_nested_workspace_roots():
+    payload = {
+        "turn_context": {
+            "workspace_roots": [
+                "/var/home/kdlocpanda/second_brain/Areas/devcontainers/room-of-requirement"
+            ]
+        }
+    }
+
+    assert classify_project_from_payload(payload) == "room-of-requirement"
+
+
 def test_split_project_path_extracts_and_strips():
     assert split_project_path("/p/frontend/v1/messages") == ("frontend", "/v1/messages")
     assert split_project_path("/p/my%20repo/v1/chat/completions") == (
@@ -84,6 +138,61 @@ def test_with_project_prefix_round_trips_through_split():
     assert with_project_prefix("http://127.0.0.1:8787", "api") == "http://127.0.0.1:8787/p/api"
     assert with_project_prefix("http://127.0.0.1:8787/v1", "  ") == "http://127.0.0.1:8787/v1"
     assert with_project_prefix("http://127.0.0.1:8787/v1", None) == "http://127.0.0.1:8787/v1"
+
+
+def test_split_client_path_extracts_and_strips():
+    assert split_client_path("/c/hermes/v1/chat/completions") == (
+        "hermes",
+        "/v1/chat/completions",
+    )
+    assert split_client_path("/c/GitHub_Copilot/v1/messages") == (
+        "github-copilot",
+        "/v1/messages",
+    )
+    assert split_client_path("/v1/messages") == (None, "/v1/messages")
+    assert split_client_path("/c//v1/messages") == (None, "/c//v1/messages")
+    assert split_client_path("/c/%20%20/v1") == (None, "/c/%20%20/v1")
+
+
+def test_with_client_prefix_round_trips_through_split():
+    url = with_client_prefix("http://127.0.0.1:8787/v1", "GitHub Copilot")
+    assert url == "http://127.0.0.1:8787/c/github-copilot/v1"
+    path = url.removeprefix("http://127.0.0.1:8787")
+    assert split_client_path(path) == ("github-copilot", "/v1")
+
+    assert with_client_prefix("http://127.0.0.1:8787", "hermes") == (
+        "http://127.0.0.1:8787/c/hermes"
+    )
+    assert with_client_prefix("http://127.0.0.1:8787/v1", "  ") == ("http://127.0.0.1:8787/v1")
+    assert sanitize_client_name("Hermes Agent") == "hermes-agent"
+
+
+def test_client_and_project_path_prefixes_reach_openai_handler(monkeypatch):
+    async def fake_handle(self, request):  # type: ignore[no-untyped-def]
+        return JSONResponse(
+            {
+                "path": request.url.path,
+                "client": request.headers.get("x-client"),
+                "headroom_client": request.headers.get("x-headroom-client"),
+                "project": get_current_project(),
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_chat", fake_handle)
+
+    with TestClient(create_app(ProxyConfig(http2=False))) as client:
+        response = client.post(
+            "/c/hermes/p/headroom/v1/chat/completions",
+            json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "ok"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "path": "/v1/chat/completions",
+        "client": None,
+        "headroom_client": "hermes",
+        "project": "headroom",
+    }
 
 
 def test_project_contextvar_roundtrip():
@@ -258,6 +367,59 @@ def test_funnel_attributes_savings_from_context_and_stats_exposes_them(tmp_path,
         history = client.get("/stats-history").json()
         assert history["schema_version"] == 3
         assert history["projects"]["ctx-project"]["requests"] == 1
+
+
+def test_stats_merges_multiple_reported_rtk_projects_with_persistent_savings(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
+    config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
+    with helpers._context_tool_stats_cache_lock:
+        helpers._context_tool_reported_snapshot.update(
+            {"tool": None, "value": None, "reported_at": 0.0, "source": None}
+        )
+        helpers._context_tool_reported_project_snapshots.clear()
+        helpers._context_tool_stats_cache.update(
+            {"expires_at": 0.0, "has_value": False, "tool": None, "value": None}
+        )
+        helpers._context_tool_session_baseline.update(
+            {
+                "initialized": True,
+                "tool": "rtk",
+                "source": None,
+                "scope": None,
+                "total_commands": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "tokens_saved": 0,
+                "total_time_ms": 0,
+                "captured_at": 0.0,
+            }
+        )
+
+    with TestClient(create_app(config)) as client:
+        proxy = client.app.state.proxy
+        _emit_outcome(proxy, project_field="persistent-project")
+
+        for cwd, saved in (("/work/headroom", 111), ("/work/codex-desktop-linux", 222)):
+            response = client.post(
+                "/stats/context-tool",
+                json={
+                    "tool": "rtk",
+                    "scope": "project",
+                    "cwd": cwd,
+                    "summary": {
+                        "total_commands": 1,
+                        "total_input": saved * 2,
+                        "total_output": saved,
+                        "total_saved": saved,
+                    },
+                },
+            )
+            assert response.status_code == 200
+
+        per_project = client.get("/stats?cached=0").json()["savings"]["per_project"]
+        assert per_project["persistent-project"]["tokens_saved"] == 400
+        assert per_project["headroom"]["rtk_tokens_saved"] == 111
+        assert per_project["codex-desktop-linux"]["rtk_tokens_saved"] == 222
 
 
 # ---------------------------------------------------------------------------

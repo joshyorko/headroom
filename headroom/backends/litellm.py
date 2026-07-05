@@ -12,10 +12,8 @@ LiteLLM handles all the auth and format translation internally.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import logging
-import os
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -71,10 +69,8 @@ _bedrock_profiles_cache: dict[str, dict[str, str]] = {}  # region -> model_map
 
 # Region prefix used in cross-region Bedrock inference profile IDs.
 # EU regions use "eu.", AP regions use "apac.", US (and everything else) use "us.".
-# ap-southeast-2 (Sydney/Australia) uses "au." — distinct from the rest of APAC.
 _BEDROCK_REGION_PREFIXES: dict[str, str] = {
     "eu": "eu",
-    "ap-southeast-2": "au",
     "ap": "apac",
 }
 
@@ -139,9 +135,7 @@ def _build_bedrock_fallback_map(region: str) -> dict[str, str]:
     return {name: f"bedrock/{prefix}.{model_id}" for name, model_id in _CLAUDE_MODELS}
 
 
-def _fetch_bedrock_inference_profiles(
-    region: str | None, profile_name: str | None = None
-) -> dict[str, str]:
+def _fetch_bedrock_inference_profiles(region: str | None) -> dict[str, str]:
     """Fetch available Bedrock inference profiles from AWS API.
 
     Uses boto3 list_inference_profiles() to get all available profiles
@@ -153,21 +147,15 @@ def _fetch_bedrock_inference_profiles(
 
     Args:
         region: AWS region (e.g., "us-east-1", "eu-central-1")
-        profile_name: AWS named profile (e.g., "my-sso-profile"). When set,
-                      a boto3.Session is created with this profile name so
-                      the correct SSO or credential file is used. Falls back
-                      to ambient credentials (AWS_PROFILE env var, instance
-                      metadata, etc.) when not provided.
 
     Returns:
         Model map: anthropic_model_name -> bedrock inference profile ID
     """
     region = region or "us-east-1"
 
-    # Cache key includes profile_name so different profiles don't collide
-    cache_key = f"{region}:{profile_name or ''}"
-    if cache_key in _bedrock_profiles_cache:
-        return _bedrock_profiles_cache[cache_key]
+    # Check cache first
+    if region in _bedrock_profiles_cache:
+        return _bedrock_profiles_cache[region]
 
     model_map: dict[str, str] = {}
 
@@ -179,12 +167,11 @@ def _fetch_bedrock_inference_profiles(
             "Install boto3 for dynamic model discovery: pip install boto3"
         )
         model_map = _build_bedrock_fallback_map(region)
-        _bedrock_profiles_cache[cache_key] = model_map
+        _bedrock_profiles_cache[region] = model_map
         return model_map
 
     try:
-        session = boto3.Session(profile_name=profile_name) if profile_name else boto3.Session()
-        bedrock_client = session.client("bedrock", region_name=region)
+        bedrock_client = boto3.client("bedrock", region_name=region)
         response = bedrock_client.list_inference_profiles(typeEquals="SYSTEM_DEFINED")
 
         for profile in response.get("inferenceProfileSummaries", []):
@@ -222,7 +209,7 @@ def _fetch_bedrock_inference_profiles(
         model_map = _build_bedrock_fallback_map(region)
 
     # Cache the result
-    _bedrock_profiles_cache[cache_key] = model_map
+    _bedrock_profiles_cache[region] = model_map
     return model_map
 
 
@@ -233,23 +220,18 @@ def _normalize_bedrock_profile_id(profile_id: str) -> str | None:
         profile_id: e.g., "us.anthropic.claude-sonnet-4-20250514-v1:0"
                     or "anthropic.claude-sonnet-4-20250514-v1:0"
                     or "claude-sonnet-4-20250514"
-                    or "arn:aws:bedrock:...:application-inference-profile/..."
 
     Returns:
         Normalized name like "claude-sonnet-4-20250514", or None if not parseable
     """
     import re
 
-    # ARNs are opaque identifiers — cannot be normalized to a standard model name
-    if profile_id.startswith("arn:aws:"):
-        return None
-
     # Strip "bedrock/" prefix if present
     if profile_id.startswith("bedrock/"):
         profile_id = profile_id[8:]
 
-    # Strip region prefix (us., eu., apac., au.)
-    for prefix in ["us.", "eu.", "apac.", "au."]:
+    # Strip region prefix (us., eu., apac.)
+    for prefix in ["us.", "eu.", "apac."]:
         if profile_id.startswith(prefix):
             profile_id = profile_id[len(prefix) :]
             break
@@ -418,7 +400,6 @@ class LiteLLMBackend(Backend):
         self,
         provider: str = "bedrock",
         region: str | None = None,
-        profile_name: str | None = None,
         **kwargs: Any,
     ):
         """Initialize LiteLLM backend.
@@ -426,9 +407,6 @@ class LiteLLMBackend(Backend):
         Args:
             provider: LiteLLM provider prefix (bedrock, vertex_ai, openrouter, etc.)
             region: Cloud region (provider-specific)
-            profile_name: AWS named profile for credential resolution (bedrock only).
-                          When set, boto3 uses this profile (e.g. an SSO profile) instead
-                          of the ambient credentials. Ignored for non-bedrock providers.
             **kwargs: Additional provider-specific config
         """
         if not LITELLM_AVAILABLE:
@@ -438,7 +416,6 @@ class LiteLLMBackend(Backend):
 
         self.provider = provider
         self.region = region
-        self.profile_name = profile_name
         self.kwargs = kwargs
 
         # Get provider config from registry
@@ -446,20 +423,7 @@ class LiteLLMBackend(Backend):
 
         # For Bedrock, fetch model map dynamically from AWS API
         if provider == "bedrock":
-            # litellm takes the botocore-backed `_auth_with_aws_session_token`
-            # path as soon as temporary credentials (AWS_SESSION_TOKEN) are
-            # present. botocore is an optional dependency (the `bedrock`
-            # extra); when it is absent — as in the slim default Docker image —
-            # the failure only surfaces at request time as a misleading
-            # `authentication_error: No module named 'botocore'` (#1551). Fail
-            # fast at startup with an actionable message instead.
-            if os.environ.get("AWS_SESSION_TOKEN") and importlib.util.find_spec("botocore") is None:
-                raise ImportError(
-                    "Bedrock with temporary credentials (AWS_SESSION_TOKEN) requires "
-                    "botocore, which is not installed. Install the bedrock extra: "
-                    "pip install 'headroom-ai[bedrock]' (or pip install botocore)."
-                )
-            self._model_map = _fetch_bedrock_inference_profiles(region, profile_name=profile_name)
+            self._model_map = _fetch_bedrock_inference_profiles(region)
             litellm.set_verbose = False  # Reduce noise
         else:
             self._model_map = self._config.model_map
@@ -478,7 +442,6 @@ class LiteLLMBackend(Backend):
         - "anthropic.claude-sonnet-4-20250514-v1:0" (Bedrock without region)
         - "us.anthropic.claude-sonnet-4-20250514-v1:0" (Bedrock with region)
         - "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0" (LiteLLM format)
-        - "arn:aws:bedrock:...:application-inference-profile/..." (application inference profile)
         """
         # Check direct mapping first
         if anthropic_model in self._model_map:
@@ -486,11 +449,6 @@ class LiteLLMBackend(Backend):
 
         # For Bedrock, try to normalize various input formats
         if self.provider == "bedrock":
-            # Application inference profile ARNs must use the converse route —
-            # the invoke route rejects ARNs with HTTP 400.
-            if anthropic_model.startswith("arn:aws:"):
-                return f"bedrock/converse/{anthropic_model}"
-
             normalized = _normalize_bedrock_profile_id(anthropic_model)
             if normalized and normalized in self._model_map:
                 return self._model_map[normalized]
@@ -723,9 +681,6 @@ class LiteLLMBackend(Backend):
                 elif self.provider in ("vertex_ai", "vertex_ai_beta"):
                     kwargs["vertex_location"] = self.region
 
-            if self.provider == "bedrock" and self.profile_name:
-                kwargs["aws_profile_name"] = self.profile_name
-
             # Forward API key from request headers if present.
             # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
@@ -829,9 +784,6 @@ class LiteLLMBackend(Backend):
                     kwargs["aws_region_name"] = self.region
                 elif self.provider in ("vertex_ai", "vertex_ai_beta"):
                     kwargs["vertex_location"] = self.region
-
-            if self.provider == "bedrock" and self.profile_name:
-                kwargs["aws_profile_name"] = self.profile_name
 
             # Forward API key from request headers if present.
             # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
@@ -1057,9 +1009,6 @@ class LiteLLMBackend(Backend):
                 elif self.provider in ("vertex_ai", "vertex_ai_beta"):
                     kwargs["vertex_location"] = self.region
 
-            if self.provider == "bedrock" and self.profile_name:
-                kwargs["aws_profile_name"] = self.profile_name
-
             # Forward API key from request headers if present.
             # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
@@ -1234,9 +1183,6 @@ class LiteLLMBackend(Backend):
                     kwargs["aws_region_name"] = self.region
                 elif self.provider in ("vertex_ai", "vertex_ai_beta"):
                     kwargs["vertex_location"] = self.region
-
-            if self.provider == "bedrock" and self.profile_name:
-                kwargs["aws_profile_name"] = self.profile_name
 
             # Forward API key from request headers if present.
             # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).

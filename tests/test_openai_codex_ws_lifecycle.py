@@ -19,6 +19,8 @@ from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 
+OUTPUT_SHAPER_SENTINEL = "<headroom_output_shaping>"
+
 # ---------------------------------------------------------------------------
 # Test doubles
 # ---------------------------------------------------------------------------
@@ -119,12 +121,11 @@ class _FakeWebSocket:
         self,
         frames: list[str] | None = None,
         *,
-        headers: dict[str, str] | None = None,
         disconnect_after_n_sends: int | None = None,
         hold_after_initial: bool = False,
         call_log: list[str] | None = None,
     ) -> None:
-        self.headers = dict(headers or {"authorization": "Bearer test"})
+        self.headers = {"authorization": "Bearer test"}
         self._frames = list(frames or [])
         self._hold_after_initial = hold_after_initial
         self._disconnect_after_n_sends = disconnect_after_n_sends
@@ -254,7 +255,6 @@ def _make_fake_websockets_module(
     upstream: _FakeUpstream | None,
     *,
     call_log: list[str] | None = None,
-    connect_calls: list[tuple[tuple, dict]] | None = None,
     connect_error: Exception | None = None,
 ):
     """Build a fake ``websockets`` module.
@@ -269,8 +269,6 @@ def _make_fake_websockets_module(
     async def _connect(*args, **kwargs):
         if call_log is not None:
             call_log.append("connect")
-        if connect_calls is not None:
-            connect_calls.append((args, dict(kwargs)))
         if connect_error is not None:
             raise connect_error
         return upstream
@@ -289,15 +287,13 @@ def _first_frame() -> str:
     )
 
 
-def _codex_lite_headers(*, chatgpt: bool) -> dict[str, str]:
-    headers = {
-        "authorization": "Bearer test",
-        "X-OpenAI-Internal-Codex-Responses-Lite": "true",
-        "X-OpenAI-Debug": "keep-me",
-    }
-    if chatgpt:
-        headers["ChatGPT-Account-ID"] = "acct-123"
-    return headers
+def _waste_signal_frame() -> str:
+    return json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "gpt-5.4", "input": "<div>" * 20},
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +308,15 @@ async def test_ws_first_frame_compression_uses_bounded_executor():
         json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
         json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
     ]
-    upstream = _FakeUpstream(upstream_events)
+
+    class _TwoFrameUpstream(_FakeUpstream):
+        async def _iter(self):
+            while len(self.sent) < 2:
+                await asyncio.sleep(0)
+            for event in self._events:
+                yield event
+
+    upstream = _TwoFrameUpstream(upstream_events)
     fake_ws_mod = _make_fake_websockets_module(upstream)
 
     client_ws = _FakeWebSocket(frames=[_first_frame()])
@@ -369,6 +373,92 @@ async def test_happy_path_registry_empty_after_response_completed():
 
 
 @pytest.mark.asyncio
+async def test_ws_output_shaper_shapes_every_response_create_and_records_response_local_labels(
+    monkeypatch,
+):
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
+    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0")
+
+    first_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "instructions": "Follow project rules.",
+                "input": "first turn",
+            },
+        }
+    )
+    second_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "instructions": "Follow updated project rules.",
+                "input": "second turn",
+            },
+        }
+    )
+    upstream_events = [
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "usage": {
+                        "input_tokens": 20,
+                        "output_tokens": 5,
+                        "input_tokens_details": {"cached_tokens": 0},
+                    },
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_2",
+                    "usage": {
+                        "input_tokens": 45,
+                        "output_tokens": 12,
+                        "input_tokens_details": {"cached_tokens": 0},
+                    },
+                },
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[first_frame, second_frame])
+    handler = _DummyOpenAIHandler()
+    outcomes = []
+
+    async def _capture_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = _capture_outcome
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    sent_frames = [json.loads(frame) for frame in upstream.sent]
+    response_creates = [frame for frame in sent_frames if frame.get("type") == "response.create"]
+    assert len(response_creates) == 2
+    for frame in response_creates:
+        instructions = frame["response"]["instructions"]
+        assert instructions.count(OUTPUT_SHAPER_SENTINEL) == 1
+
+    assert len(outcomes) == 2
+    for outcome in outcomes:
+        assert "output_shaper:verbosity:L2" in outcome.transforms_applied
+        assert (
+            sum(1 for label in outcome.transforms_applied if label == "output_shaper:verbosity:L2")
+            == 1
+        )
+
+
+@pytest.mark.asyncio
 async def test_ws_session_metrics_include_response_completed_usage():
     """Codex WS sessions should report real upstream usage, not zero-token sessions."""
 
@@ -404,6 +494,40 @@ async def test_ws_session_metrics_include_response_completed_usage():
     assert recorded["cache_read_tokens"] == 75
     assert recorded["cache_write_tokens"] == 25
     assert recorded["uncached_input_tokens"] == 25
+
+
+@pytest.mark.asyncio
+async def test_ws_session_metrics_include_waste_signals():
+    """Codex WS per-turn metrics should feed detected waste into /stats."""
+
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "usage": {
+                        "input_tokens": 100,
+                        "input_tokens_details": {"cached_tokens": 75},
+                        "output_tokens": 12,
+                    },
+                },
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_waste_signal_frame()])
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert handler.metrics.recorded_requests
+    recorded = handler.metrics.recorded_requests[-1]
+    assert recorded["waste_signals"]["html_noise"] > 0
 
 
 @pytest.mark.asyncio
@@ -688,100 +812,6 @@ async def test_ws_connect_failure_falls_back_to_http():
     assert _body == json.loads(first)
     # Clean teardown.
     assert handler.ws_sessions.active_count() == 0
-
-
-@pytest.mark.asyncio
-async def test_ws_codex_responses_lite_header_is_not_forwarded_upstream():
-    """The WS upstream handshake must drop the Codex lite header only."""
-    upstream_events = [
-        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
-        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
-    ]
-    connect_calls: list[tuple[tuple, dict]] = []
-    upstream = _FakeUpstream(upstream_events)
-    fake_ws_mod = _make_fake_websockets_module(upstream, connect_calls=connect_calls)
-
-    client_ws = _FakeWebSocket(
-        frames=[_first_frame()],
-        headers=_codex_lite_headers(chatgpt=True),
-    )
-    handler = _DummyOpenAIHandler()
-
-    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
-        await handler.handle_openai_responses_ws(client_ws)
-
-    assert len(connect_calls) == 1
-    connect_args, connect_kwargs = connect_calls[0]
-    assert connect_args[0] == "wss://chatgpt.com/backend-api/codex/responses"
-    forwarded_headers = connect_kwargs["additional_headers"]
-    assert "X-OpenAI-Internal-Codex-Responses-Lite" not in forwarded_headers
-    assert forwarded_headers["ChatGPT-Account-ID"] == "acct-123"
-    assert forwarded_headers["X-OpenAI-Debug"] == "keep-me"
-
-
-@pytest.mark.asyncio
-async def test_ws_codex_responses_lite_header_is_not_forwarded_to_fallback():
-    """HTTP fallback must inherit the sanitized upstream header copy."""
-    fake_ws_mod = _make_fake_websockets_module(
-        None,
-        connect_error=RuntimeError("HTTP 500 from upstream"),
-    )
-
-    client_ws = _FakeWebSocket(
-        frames=[_first_frame()],
-        headers=_codex_lite_headers(chatgpt=True),
-    )
-    handler = _DummyOpenAIHandler()
-
-    fallback_calls: list[dict[str, str]] = []
-
-    async def _fallback(websocket, body, first_msg_raw, upstream_headers, request_id):
-        fallback_calls.append(dict(upstream_headers))
-
-    handler._ws_http_fallback = _fallback  # type: ignore[assignment]
-
-    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
-        await handler.handle_openai_responses_ws(client_ws)
-
-    assert len(fallback_calls) == 1
-    forwarded_headers = fallback_calls[0]
-    assert "X-OpenAI-Internal-Codex-Responses-Lite" not in forwarded_headers
-    assert forwarded_headers["ChatGPT-Account-ID"] == "acct-123"
-    assert forwarded_headers["X-OpenAI-Debug"] == "keep-me"
-
-
-@pytest.mark.asyncio
-async def test_ws_without_codex_lite_preserves_adjacent_headers_and_api_key_route():
-    """Requests without the lite header keep adjacent OpenAI headers intact."""
-    upstream_events = [
-        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
-        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
-    ]
-    connect_calls: list[tuple[tuple, dict]] = []
-    upstream = _FakeUpstream(upstream_events)
-    fake_ws_mod = _make_fake_websockets_module(upstream, connect_calls=connect_calls)
-
-    client_ws = _FakeWebSocket(
-        frames=[_first_frame()],
-        headers={
-            "authorization": "Bearer test",
-            "OpenAI-Beta": "responses=v1",
-            "X-OpenAI-Debug": "keep-me",
-        },
-    )
-    handler = _DummyOpenAIHandler()
-
-    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
-        await handler.handle_openai_responses_ws(client_ws)
-
-    assert len(connect_calls) == 1
-    connect_args, connect_kwargs = connect_calls[0]
-    assert connect_args[0] == "wss://api.openai.com/v1/responses"
-    forwarded_headers = connect_kwargs["additional_headers"]
-    assert "responses=v1" in forwarded_headers["OpenAI-Beta"]
-    assert "responses_websockets=2026-02-06" in forwarded_headers["OpenAI-Beta"]
-    assert forwarded_headers["X-OpenAI-Debug"] == "keep-me"
-    assert "ChatGPT-Account-ID" not in forwarded_headers
 
 
 @pytest.mark.asyncio

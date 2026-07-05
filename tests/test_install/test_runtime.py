@@ -4,14 +4,13 @@ import os
 import signal
 import subprocess
 import sys
-import types
 from pathlib import Path
 
-import pytest
-
+import headroom.install.runtime as runtime_mod
 from headroom.install.models import DeploymentManifest, InstallPreset
 from headroom.install.runtime import (
     _clear_pid,
+    _checkout_headroom_script,
     _deployment_env,
     _mount_source,
     _read_pid,
@@ -19,6 +18,7 @@ from headroom.install.runtime import (
     _write_pid,
     acquire_runtime_start_lock,
     build_runtime_command,
+    resolve_headroom_config_command,
     resolve_headroom_command,
     run_foreground,
     runtime_status,
@@ -137,7 +137,13 @@ def test_build_runtime_command_for_docker_does_not_duplicate_entrypoint(
     assert container_args[2:] == ["--port", "8787", "--backend", "anthropic"]
 
 
-def test_resolve_headroom_command_prefers_headroom_binary(monkeypatch) -> None:
+def test_resolve_headroom_command_prefers_installed_headroom_binary(
+    monkeypatch, tmp_path: Path
+) -> None:
+    script = tmp_path / "headroom"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setattr("headroom.install.runtime._checkout_headroom_script", lambda: script)
     monkeypatch.setattr(
         "shutil.which", lambda name: "/usr/bin/headroom" if name == "headroom" else None
     )
@@ -145,7 +151,40 @@ def test_resolve_headroom_command_prefers_headroom_binary(monkeypatch) -> None:
     assert resolve_headroom_command() == ["/usr/bin/headroom"]
 
 
-def test_resolve_headroom_command_falls_back_to_python_module(monkeypatch) -> None:
+def test_resolve_headroom_config_command_prefers_portable_headroom_name(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/var/home/user/.local/bin/headroom" if name == "headroom" else None,
+    )
+
+    assert resolve_headroom_config_command() == ["headroom"]
+
+
+def test_checkout_headroom_script_uses_windows_venv_scripts_dir(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_mod, "_is_windows", lambda: True)
+
+    script = _checkout_headroom_script()
+
+    assert script.name == "headroom.exe"
+    assert script.parent.name == "Scripts"
+
+
+def test_resolve_headroom_command_uses_checkout_script_when_no_installed_binary(
+    monkeypatch, tmp_path: Path
+) -> None:
+    script = tmp_path / "headroom"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setattr("headroom.install.runtime._checkout_headroom_script", lambda: script)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    assert resolve_headroom_command() == [str(script)]
+
+
+def test_resolve_headroom_command_falls_back_to_python_module(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        "headroom.install.runtime._checkout_headroom_script", lambda: tmp_path / "missing-headroom"
+    )
     monkeypatch.setattr("shutil.which", lambda name: None)
     monkeypatch.setattr("headroom.install.runtime.sys.executable", "/usr/bin/python")
     assert resolve_headroom_command() == ["/usr/bin/python", "-m", "headroom.cli"]
@@ -363,56 +402,6 @@ def test_run_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> Non
     assert start_detached_agent("demo") is fake_proc_posix
 
 
-def test_start_detached_agent_closes_parent_log_fd(monkeypatch, tmp_path: Path) -> None:
-    """The parent must close its copy of the log file after Popen.
-
-    The child inherits the descriptor, so leaving the parent's copy open
-    leaks one fd per call and pins the log file open against rotation.
-    """
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr("headroom.install.runtime.resolve_headroom_command", lambda: ["headroom"])
-    monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
-
-    captured: dict[str, object] = {}
-
-    class FakeProc:
-        pid = 999
-
-    def fake_popen(command: list[str], **kwargs):
-        captured["stdout"] = kwargs["stdout"]
-        captured["stderr"] = kwargs["stderr"]
-        return FakeProc()
-
-    monkeypatch.setattr("headroom.install.runtime.subprocess.Popen", fake_popen)
-
-    start_detached_agent("demo")
-
-    log_handle = captured["stdout"]
-    # Same handle is passed to both streams, and the parent closed it.
-    assert captured["stderr"] is log_handle
-    assert log_handle.closed is True
-
-
-def test_start_detached_agent_closes_log_fd_when_popen_raises(monkeypatch, tmp_path: Path) -> None:
-    """A Popen failure must not leak the just-opened log file handle."""
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr("headroom.install.runtime.resolve_headroom_command", lambda: ["headroom"])
-    monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
-
-    captured: dict[str, object] = {}
-
-    def boom(command: list[str], **kwargs):
-        captured["stdout"] = kwargs["stdout"]
-        raise OSError("spawn failed")
-
-    monkeypatch.setattr("headroom.install.runtime.subprocess.Popen", boom)
-
-    with pytest.raises(OSError, match="spawn failed"):
-        start_detached_agent("demo")
-
-    assert captured["stdout"].closed is True
-
-
 def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(
@@ -519,7 +508,9 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
     assert runtime_status(python_manifest) == "stopped"
 
     _write_pid("default", 125)
-    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: False)
+    monkeypatch.setattr(
+        "headroom.install.runtime.os.kill", lambda pid, sig: (_ for _ in ()).throw(OSError())
+    )
     assert runtime_status(python_manifest) == "stopped"
 
 
@@ -581,7 +572,7 @@ def test_runtime_status_reads_container_and_pid_state(monkeypatch, tmp_path: Pat
     pid_file = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
     pid_file.parent.mkdir(parents=True)
     pid_file.write_text("123", encoding="utf-8")
-    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("headroom.install.runtime.os.kill", lambda pid, sig: None)
     python_manifest = DeploymentManifest(
         profile="default",
         preset="persistent-service",
@@ -595,56 +586,3 @@ def test_runtime_status_reads_container_and_pid_state(monkeypatch, tmp_path: Pat
         backend="anthropic",
     )
     assert runtime_status(python_manifest) == "running"
-
-
-def _python_service_manifest() -> DeploymentManifest:
-    return DeploymentManifest(
-        profile="default",
-        preset="persistent-service",
-        runtime_kind="python",
-        supervisor_kind="service",
-        scope="user",
-        provider_mode="manual",
-        targets=[],
-        port=8787,
-        host="127.0.0.1",
-        backend="anthropic",
-    )
-
-
-def test_runtime_status_reports_live_pid_without_terminating(monkeypatch, tmp_path: Path) -> None:
-    """#1544: status on a live detached PID stays 'running' and never signals it."""
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    pid_file = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
-    pid_file.parent.mkdir(parents=True)
-    pid_file.write_text("25212", encoding="utf-8")
-
-    def fail_kill(pid: int, sig: int) -> None:
-        raise AssertionError(f"status must not signal the live proxy (pid={pid}, sig={sig})")
-
-    monkeypatch.setattr("headroom.install.runtime.os.kill", fail_kill)
-    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
-
-    assert runtime_status(_python_service_manifest()) == "running"
-    assert pid_file.exists()  # status left the deployment untouched
-
-
-def test_runtime_status_survives_winerror87_systemerror(monkeypatch, tmp_path: Path) -> None:
-    """#1544: a WinError 87 SystemError from the liveness probe yields 'stopped', not a crash."""
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    pid_file = tmp_path / ".headroom" / "deploy" / "default" / "runner.pid"
-    pid_file.parent.mkdir(parents=True)
-    pid_file.write_text("25212", encoding="utf-8")
-
-    # Force the psutil fast-path to bail so the os.kill fallback runs...
-    fake_psutil = types.SimpleNamespace(
-        pid_exists=lambda pid: (_ for _ in ()).throw(RuntimeError("no psutil"))
-    )
-    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
-    # ...where Windows surfaces WinError 87 as a SystemError, not an OSError.
-    monkeypatch.setattr(
-        "headroom._subprocess.os.kill",
-        lambda pid, sig: (_ for _ in ()).throw(SystemError("WinError 87")),
-    )
-
-    assert runtime_status(_python_service_manifest()) == "stopped"

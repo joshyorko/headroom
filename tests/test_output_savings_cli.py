@@ -36,6 +36,26 @@ def test_output_savings_reports_estimate(tmp_path, monkeypatch):
     assert "30.0%" in result.output
 
 
+def test_output_savings_labels_warming_estimate_without_claiming_savings(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+    from headroom.proxy.output_savings import SavingsLedger
+
+    ledger = SavingsLedger()
+    for _ in range(50):
+        ledger.baseline.observe("opus|new_user_ask|s|tools", 470)
+    for _ in range(6):
+        ledger.record("treatment", "opus|new_user_ask|s|tools", 1318)
+    ledger.save(tmp_path / "output_savings.json")
+
+    result = CliRunner().invoke(main, ["output-savings"])
+
+    assert result.exit_code == 0
+    assert "Status:    warming" in result.output
+    assert "Reasons:   low_sample, negative, unstable" in result.output
+    assert "Raw delta:" in result.output
+    assert "Saved:" not in result.output
+
+
 def test_recorder_round_trips_via_labels(tmp_path):
     path = tmp_path / "savings.json"
     rec = SavingsRecorder(path, flush_every=1)

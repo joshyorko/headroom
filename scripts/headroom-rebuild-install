@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/headroom-rebuild-install
+
+Build Headroom in the repo-local Dagger module, export the wheel bundle, install
+the fresh CLI into the host uv tool environment, and verify `headroom --version`.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -ne 0 ]]; then
+  usage >&2
+  exit 2
+fi
+
+if ! command -v dagger >/dev/null 2>&1; then
+  echo "dagger CLI is required to rebuild Headroom in the repo-local Dagger module." >&2
+  exit 127
+fi
+
+if ! command -v uv >/dev/null 2>&1; then
+  echo "uv is required on the host to install the Dagger-built Headroom wheel." >&2
+  exit 127
+fi
+
+rm -rf dist/headroom-dev
+dagger call dev-install-script export --path dist/headroom-dev
+dist/headroom-dev/install-headroom-from-wheel

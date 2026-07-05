@@ -35,10 +35,10 @@ from .main import main
 )
 @click.option(
     "--hours",
-    type=click.FloatRange(min=0),
+    type=float,
     default=24.0,
     show_default=True,
-    help="Hours of proxy logs to inspect with --check-perf (0 = all data).",
+    help="Hours of proxy logs to inspect with --check-perf.",
 )
 @click.option(
     "--accuracy-report",
@@ -76,10 +76,7 @@ def agent_savings(
 ) -> None:
     """Render or verify Codex/Claude/Cursor token-savings settings."""
 
-    try:
-        savings_profile = get_agent_savings_profile(profile)
-    except ValueError as exc:
-        raise click.BadParameter(str(exc), param_hint="--profile") from None
+    savings_profile = get_agent_savings_profile(profile)
     if write_smoke_fixture is not None:
         eval_path = _write_smoke_fixture(write_smoke_fixture)
         click.echo(f"Wrote agent-90 smoke fixture to {write_smoke_fixture}")

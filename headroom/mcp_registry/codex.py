@@ -17,8 +17,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from headroom import fsutil
-
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 
 if sys.version_info >= (3, 11):
@@ -134,7 +132,7 @@ class CodexRegistrar(MCPRegistrar):
         else:
             new_content = (before or after).rstrip("\n") + ("\n" if (before or after) else "")
         try:
-            fsutil.write_text(self._config_file, new_content)
+            self._config_file.write_text(new_content)
         except OSError:
             return False
         return True
@@ -147,16 +145,17 @@ class CodexRegistrar(MCPRegistrar):
         if not self._config_file.exists():
             return {}
         try:
-            # Read via fsutil (UTF-8 with locale fallback) so a config that a
-            # tool wrote in the system locale (e.g. GBK) still parses instead
-            # of failing tomllib's UTF-8 requirement. See #733.
-            data = tomllib.loads(fsutil.read_text(self._config_file))
+            with open(self._config_file, "rb") as f:
+                data = tomllib.load(f)
         except (tomllib.TOMLDecodeError, OSError):
             return {}
         return data if isinstance(data, dict) else {}
 
     def _read_text(self) -> str:
-        return fsutil.read_text(self._config_file, default="")
+        try:
+            return self._config_file.read_text()
+        except OSError:
+            return ""
 
     def _write_block(self, spec: ServerSpec) -> RegisterResult:
         block = _render_block(spec)
@@ -179,7 +178,7 @@ class CodexRegistrar(MCPRegistrar):
                 content = content.rstrip("\n") + "\n\n" + block + "\n"
             else:
                 content = block + "\n"
-            fsutil.write_text(self._config_file, content)
+            self._config_file.write_text(content)
         except OSError as exc:
             return RegisterResult(
                 RegisterStatus.FAILED, f"could not write {self._config_file}: {exc}"

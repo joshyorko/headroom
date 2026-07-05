@@ -25,6 +25,7 @@ def _set_test_home(monkeypatch, tmp_path: Path) -> None:
     home = str(tmp_path)
     monkeypatch.setenv("HOME", home)
     monkeypatch.setenv("USERPROFILE", home)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
 
 
 def test_wrap_claude_prepare_only_skips_host_binary_lookup() -> None:

@@ -83,22 +83,12 @@ def sanitize_anthropic_model_metadata(value: Any) -> Any:
 # Anthropic model context limits
 # All Claude 3+ models have 200K context
 ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
-    # Claude Fable 5 - 1M context
-    "claude-fable-5": 1000000,
-    # Claude Opus 4.8 - 1M context
-    "claude-opus-4-8": 1000000,
     # Claude 4.7 (Opus 4.7) - 1M context
     "claude-opus-4-7": 1000000,
     # Claude 4.6 (Opus 4.6) - 1M context
     "claude-opus-4-6": 1000000,
     # Claude 4.5 (Opus 4.5)
     "claude-opus-4-5-20251101": 200000,
-    # Claude Sonnet 5 - 1M context
-    "claude-sonnet-5": 1000000,
-    # Claude Sonnet 4.6 - 1M context window
-    "claude-sonnet-4-6": 1000000,
-    # Claude Sonnet 4.5
-    "claude-sonnet-4-5": 200000,
     # Claude 4 (Sonnet 4, Haiku 4)
     "claude-sonnet-4-20250514": 200000,
     "claude-haiku-4-5-20251001": 200000,
@@ -120,25 +110,17 @@ ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
 
 # Fallback pricing - LiteLLM is preferred source
 # NOTE: These are ESTIMATES. Always verify against actual Anthropic billing.
-# Last updated: 2026-07-04
+# Last updated: 2025-01-14
 ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
-    # Claude Fable 5 (anthropic.com/pricing): $10 in / $50 out, cache read $1.
-    "claude-fable-5": {"input": 10.00, "output": 50.00, "cached_input": 1.00},
-    # Claude Opus 4.8 — current Opus tier: $5 in / $25 out, cache read $0.50.
-    "claude-opus-4-8": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
-    # Claude 4.7 (current Opus tier)
-    "claude-opus-4-7": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
-    # Claude 4.6 (current Opus tier)
-    "claude-opus-4-6": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
-    # Claude 4.5 (current Opus tier — same rates as 4.6–4.8)
-    "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
-    # Claude Sonnet 5 / 4.6 / 4.5 (current Sonnet tier): $3 in / $15 out, cache read $0.30
-    "claude-sonnet-5": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
-    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
-    "claude-sonnet-4-5": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
+    # Claude 4.7 (Opus tier pricing)
+    "claude-opus-4-7": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
+    # Claude 4.6 (Opus tier pricing)
+    "claude-opus-4-6": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
+    # Claude 4.5 (Opus tier pricing)
+    "claude-opus-4-5-20251101": {"input": 15.00, "output": 75.00, "cached_input": 1.50},
     # Claude 4 (Sonnet/Haiku tier pricing)
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
-    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00, "cached_input": 0.10},
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00, "cached_input": 0.08},
     # Claude 3.5
     "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     "claude-3-5-sonnet-latest": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
@@ -154,7 +136,7 @@ ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
 # Default limits for pattern-based inference
 # Used when a model isn't in the explicit list but matches a known pattern
 _PATTERN_DEFAULTS = {
-    "opus": {"context": 200000, "pricing": {"input": 5.00, "output": 25.00, "cached_input": 0.50}},
+    "opus": {"context": 200000, "pricing": {"input": 15.00, "output": 75.00, "cached_input": 1.50}},
     "sonnet": {
         "context": 200000,
         "pricing": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
@@ -217,7 +199,7 @@ def _load_custom_model_config() -> dict[str, Any]:
         try:
             # Check if it's a file path
             if os.path.isfile(env_config):
-                with open(env_config, encoding="utf-8") as f:
+                with open(env_config) as f:
                     loaded = json.load(f)
             else:
                 # Try to parse as JSON string
@@ -243,7 +225,7 @@ def _load_custom_model_config() -> dict[str, Any]:
             config_file = legacy_models
     if config_file.exists():
         try:
-            with open(config_file, encoding="utf-8") as f:
+            with open(config_file) as f:
                 loaded = json.load(f)
 
             # Only load anthropic-specific config

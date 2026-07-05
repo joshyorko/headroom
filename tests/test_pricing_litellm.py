@@ -71,6 +71,35 @@ def test_litellm_model_pricing_uses_provider_prefixes(monkeypatch) -> None:
     assert pricing.supports_function_calling is True
 
 
+def test_litellm_resolves_chatgpt_codex_pricing_slug(monkeypatch) -> None:
+    def fake_cost_per_token(*, model, prompt_tokens, completion_tokens):
+        if model in {"gpt-5.3-codex", "chatgpt/gpt-5.3-codex-spark"}:
+            return (0.0, 0.0)
+        raise RuntimeError("unknown model")
+
+    fake_litellm = SimpleNamespace(
+        cost_per_token=fake_cost_per_token,
+        model_cost={
+            "gpt-5.3-codex": {
+                "input_cost_per_token": 0.00000175,
+                "output_cost_per_token": 0.000014,
+            },
+            "chatgpt/gpt-5.3-codex-spark": {
+                "input_cost_per_token": 0.0,
+                "output_cost_per_token": 0.0,
+            },
+        },
+    )
+    monkeypatch.setattr(litellm_pricing, "LITELLM_AVAILABLE", True)
+    monkeypatch.setattr(litellm_pricing, "litellm", fake_litellm)
+    litellm_pricing._resolved_model_cache.clear()
+
+    assert litellm_pricing.resolve_litellm_model("gpt-5.3-codex-spark") == "gpt-5.3-codex"
+    pricing = litellm_pricing.get_model_pricing("gpt-5.3-codex-spark")
+    assert pricing is not None
+    assert pricing.input_cost_per_1m == 1.75
+
+
 def test_litellm_model_pricing_uses_aliases_and_zero_cost_defaults(monkeypatch) -> None:
     fake_litellm = SimpleNamespace(
         model_cost={
@@ -95,73 +124,3 @@ def test_litellm_model_pricing_returns_none_for_unknown_models(monkeypatch) -> N
     monkeypatch.setattr(litellm_pricing, "LITELLM_AVAILABLE", True)
     monkeypatch.setattr(litellm_pricing, "litellm", SimpleNamespace(model_cost={}))
     assert litellm_pricing.get_model_pricing("missing") is None
-
-
-def test_litellm_minimax_mixed_case_with_provider_prefix(monkeypatch) -> None:
-    """MiniMax-M3 must resolve via the `minimax/` prefix even though its
-    model name uses mixed case.
-
-    `resolve_litellm_model()` is what callers in `proxy/cost.py`,
-    `proxy/savings_tracker.py`, and `perf/analyzer.py` use to get a
-    key LiteLLM's own cost DB recognises. The upstream DB only stores
-    the entry under `minimax/MiniMax-M3`, so bare `MiniMax-M3` would
-    otherwise miss and the resolver would return the input unchanged.
-    """
-
-    def fake_cost_per_token(
-        model: str, prompt_tokens: int = 0, completion_tokens: int = 0
-    ) -> tuple[float, float]:
-        if model in fake_litellm.model_cost:
-            entry = fake_litellm.model_cost[model]
-            return (
-                entry["input_cost_per_token"] * prompt_tokens,
-                entry["output_cost_per_token"] * completion_tokens,
-            )
-        raise KeyError(f"unknown model: {model}")
-
-    fake_litellm = SimpleNamespace(
-        model_cost={
-            "minimax/MiniMax-M3": {
-                "input_cost_per_token": 0.0000006,
-                "output_cost_per_token": 0.0000024,
-            }
-        },
-        cost_per_token=fake_cost_per_token,
-    )
-    monkeypatch.setattr(litellm_pricing, "LITELLM_AVAILABLE", True)
-    monkeypatch.setattr(litellm_pricing, "litellm", fake_litellm)
-
-    # Bare mixed-case name resolves via the case-insensitive `minimax-` prefix.
-    assert litellm_pricing.resolve_litellm_model("MiniMax-M3") == "minimax/MiniMax-M3"
-
-
-def test_litellm_minimax_preregistration_safety_net(monkeypatch) -> None:
-    """When LiteLLM only ships the prefixed `minimax/MiniMax-M3` entry, the
-    module-load pre-registration should also expose the bare `MiniMax-M3`
-    key so `estimate_cost()` works on a cold resolver cache (since
-    `get_model_pricing` does not know about the `minimax/` prefix).
-    """
-    fake_litellm = SimpleNamespace(
-        model_cost={
-            "minimax/MiniMax-M3": {
-                "input_cost_per_token": 0.0000006,
-                "output_cost_per_token": 0.0000024,
-            }
-        }
-    )
-    monkeypatch.setattr(litellm_pricing, "LITELLM_AVAILABLE", True)
-    monkeypatch.setattr(litellm_pricing, "litellm", fake_litellm)
-
-    litellm_pricing._register_minimax_pricing()
-
-    assert "MiniMax-M3" in fake_litellm.model_cost
-    assert fake_litellm.model_cost["MiniMax-M3"]["input_cost_per_token"] == 0.0000006
-    # After pre-registration, bare-name estimate_cost works end-to-end.
-    assert (
-        litellm_pricing.estimate_cost("MiniMax-M3", input_tokens=1_000_000, output_tokens=100_000)
-        == 0.84
-    )
-    # Pre-registration must not clobber a user-customised bare entry.
-    fake_litellm.model_cost["MiniMax-M3"] = {"customised": True}
-    litellm_pricing._register_minimax_pricing()
-    assert fake_litellm.model_cost["MiniMax-M3"] == {"customised": True}

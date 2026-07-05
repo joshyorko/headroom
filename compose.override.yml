@@ -1,0 +1,72 @@
+services:
+  headroom-proxy:
+    ports: !override
+      - "${HEADROOM_BIND_HOST:-127.0.0.1}:${HEADROOM_PORT:-8787}:8787"
+    command:
+      - --host
+      - ${HEADROOM_HOST:-0.0.0.0}
+      - --port
+      - "${HEADROOM_PORT:-8787}"
+      - --mode
+      - ${HEADROOM_MODE:-token}
+      - --target-ratio
+      - "${HEADROOM_TARGET_RATIO:-0.4}"
+      - --memory
+      - --memory-db-path
+      - ${HEADROOM_MEMORY_DB_PATH:-/home/nonroot/.headroom/memory.db}
+      - --memory-project-root
+      - ${HEADROOM_MEMORY_PROJECT_ROOT:-/home/nonroot}
+      - --memory-top-k
+      - "${HEADROOM_MEMORY_TOP_K:-5}"
+      - --memory-qdrant-host
+      - ${HEADROOM_QDRANT_HOST:-qdrant}
+      - --memory-qdrant-port
+      - "${HEADROOM_QDRANT_PORT:-6333}"
+      - --min-evidence
+      - "${HEADROOM_MIN_EVIDENCE:-10}"
+      - --anthropic-pre-upstream-memory-context-timeout-seconds
+      - "${HEADROOM_MEMORY_CONTEXT_TIMEOUT_SECONDS:-1.0}"
+      - --no-learn
+    restart: unless-stopped
+    environment:
+      HEADROOM_HOST: ${HEADROOM_HOST:-0.0.0.0}
+      HEADROOM_PORT: ${HEADROOM_PORT:-8787}
+      HEADROOM_MODE: ${HEADROOM_MODE:-token}
+      HEADROOM_AGENT_TYPE: codex
+      HEADROOM_TARGET_RATIO: ${HEADROOM_TARGET_RATIO:-0.4}
+      HEADROOM_DISABLE_KOMPRESS: ${HEADROOM_DISABLE_KOMPRESS:-1}
+      HEADROOM_DISABLE_KOMPRESS_FALLBACK: ${HEADROOM_DISABLE_KOMPRESS_FALLBACK:-1}
+      HEADROOM_COMPRESS_USER_MESSAGES: ${HEADROOM_COMPRESS_USER_MESSAGES:-0}
+      HEADROOM_CODE_AWARE_ENABLED: ${HEADROOM_CODE_AWARE_ENABLED:-0}
+      HEADROOM_MIN_TOKENS: ${HEADROOM_MIN_TOKENS:-5000}
+      HEADROOM_NO_SUBSCRIPTION_TRACKING: ${HEADROOM_NO_SUBSCRIPTION_TRACKING:-1}
+      HEADROOM_MEMORY_DB_PATH: ${HEADROOM_MEMORY_DB_PATH:-/home/nonroot/.headroom/memory.db}
+      HEADROOM_MEMORY_PROJECT_ROOT: ${HEADROOM_MEMORY_PROJECT_ROOT:-/home/nonroot}
+      HEADROOM_MEMORY_TOP_K: ${HEADROOM_MEMORY_TOP_K:-5}
+      HEADROOM_MIN_EVIDENCE: ${HEADROOM_MIN_EVIDENCE:-10}
+      HEADROOM_QDRANT_HOST: ${HEADROOM_QDRANT_HOST:-qdrant}
+      HEADROOM_QDRANT_PORT: ${HEADROOM_QDRANT_PORT:-6333}
+      HEADROOM_OUTPUT_SHAPER: ${HEADROOM_OUTPUT_SHAPER:-1}
+      HEADROOM_VERBOSITY_LEVEL: ${HEADROOM_VERBOSITY_LEVEL:-2}
+      HEADROOM_EFFORT_ROUTER: ${HEADROOM_EFFORT_ROUTER:-0}
+      HEADROOM_MECHANICAL_EFFORT: ${HEADROOM_MECHANICAL_EFFORT:-low}
+      HEADROOM_LOG_MESSAGES: ${HEADROOM_LOG_MESSAGES:-0}
+    volumes:
+      - headroom_state:/home/nonroot/.headroom
+    depends_on:
+      - qdrant
+      - neo4j
+  qdrant:
+    ports: !override
+      - "${HEADROOM_BIND_HOST:-127.0.0.1}:6333:6333"
+      - "${HEADROOM_BIND_HOST:-127.0.0.1}:6334:6334"
+    restart: unless-stopped
+
+  neo4j:
+    ports: !override
+      - "${HEADROOM_BIND_HOST:-127.0.0.1}:7474:7474"
+      - "${HEADROOM_BIND_HOST:-127.0.0.1}:7687:7687"
+    restart: unless-stopped
+
+volumes:
+  headroom_state:

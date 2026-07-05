@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v kamal >/dev/null 2>&1; then
+  exec kamal "$@"
+fi
+
+exec docker run --rm -it \
+  --network host \
+  -v "$PWD:/work" \
+  -v "$HOME/.ssh:/root/.ssh:ro" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -w /work \
+  ghcr.io/basecamp/kamal:latest "$@"

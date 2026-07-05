@@ -89,11 +89,10 @@ def test_handler_normalizes_marker_shapes_to_bare_hash(
     assert seen["payload"]["hash"] == expected
 
 
-def test_handler_ignores_legacy_query(
+def test_handler_passes_optional_query_through(
     plugin: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Retrieval is by hash only; a legacy ``query`` in the args is dropped,
-    # not forwarded to the proxy.
+    # Arrange
     seen: dict[str, Any] = {}
 
     def fake_post(url: str, json: dict[str, Any], timeout: int) -> _FakeResponse:  # noqa: A002
@@ -106,7 +105,7 @@ def test_handler_ignores_legacy_query(
     plugin._handle_headroom_retrieve({"hash": "abc123", "query": "error lines"})
 
     # Assert
-    assert seen["payload"] == {"hash": "abc123"}
+    assert seen["payload"] == {"hash": "abc123", "query": "error lines"}
 
 
 def test_handler_returns_original_content_on_200(

@@ -6,7 +6,6 @@ import json
 import shutil
 from pathlib import Path
 
-from headroom import fsutil
 from headroom.install.models import ConfigScope, DeploymentManifest, ManagedMutation, ToolTarget
 from headroom.install.paths import opencode_config_path
 
@@ -39,7 +38,7 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     )
 
     if config_file.exists():
-        content = fsutil.read_text(config_file)
+        content = config_file.read_text()
         data = _parse_json_loose(content)
     else:
         data = {}
@@ -81,7 +80,7 @@ def revert_provider_scope(mutation: ManagedMutation, manifest: DeploymentManifes
             pass
     if not path.exists():
         return
-    content = fsutil.read_text(path)
+    content = path.read_text()
     cleaned = strip_opencode_headroom_blocks(content)
     if cleaned:
         path.write_text(cleaned + "\n", encoding="utf-8")

@@ -70,6 +70,10 @@ class WSMemoryRelayState:
                     self.suppress_response = True
                     self.decided = True
                     self.event_buffer.clear()
+                elif item.get("type") == "reasoning":
+                    # Reasoning items can precede tool calls in Responses API streams.
+                    # Keep buffering until we know whether this is a hidden memory turn.
+                    pass
                 else:
                     # Non-memory item → flush buffer and pass through
                     self.decided = True
@@ -146,6 +150,14 @@ def _output_item_added_text(index: int = 0) -> str:
         "response.output_item.added",
         output_index=index,
         item={"type": "message", "role": "assistant"},
+    )
+
+
+def _output_item_added_reasoning(index: int = 0) -> str:
+    return _make_event(
+        "response.output_item.added",
+        output_index=index,
+        item={"type": "reasoning"},
     )
 
 
@@ -356,6 +368,35 @@ class TestWSMemoryRelayMemoryTool:
                 arguments='{"content": "user likes dark mode"}',
             ),
             _response_completed("resp_B"),
+        ]
+
+        all_relayed: list[str] = []
+        tool_executions: list[Any] = []
+
+        for ev in events:
+            result = relay.process_event(ev)
+            all_relayed.extend(result["relay"])
+            tool_executions.extend(result["execute_tools"])
+
+        assert len(all_relayed) == 0
+        assert len(tool_executions) == 1
+        assert tool_executions[0]["name"] == "memory_save"
+
+    def test_memory_save_after_reasoning_is_suppressed(self):
+        """Reasoning items before memory_save must not make the relay pass-through."""
+        relay = WSMemoryRelayState()
+
+        events = [
+            _response_created("resp_reasoning"),
+            _output_item_added_reasoning(index=0),
+            _output_item_added_function_call("memory_save", index=1, call_id="call_save"),
+            _output_item_done_function_call(
+                "memory_save",
+                index=1,
+                call_id="call_save",
+                arguments='{"content": "user likes focused tests"}',
+            ),
+            _response_completed("resp_reasoning"),
         ]
 
         all_relayed: list[str] = []

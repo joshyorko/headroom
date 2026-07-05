@@ -41,6 +41,24 @@ _MODEL_ALIASES: dict[str, str] = {
     "claude-3-5-sonnet-20240620": "claude-sonnet-4-20250514",
     # Claude 3 Sonnet retired
     "claude-3-sonnet-20240229": "claude-3-haiku-20240307",
+    # ChatGPT's Codex registry exposes this as a spark slug. LiteLLM carries a
+    # zero-priced chatgpt/* entry for subscription auth, so use the canonical
+    # Codex input rate for Headroom's estimated saved-dollar counters.
+    "gpt-5.3-codex-spark": "gpt-5.3-codex",
+    "chatgpt/gpt-5.3-codex-spark": "gpt-5.3-codex",
+}
+
+_MODEL_PREFIXES: dict[str, tuple[str, ...]] = {
+    "claude-": ("anthropic/",),
+    # Codex subscription models can be exposed as bare gpt-* slugs by the
+    # ChatGPT/Codex model registry even though LiteLLM prices them under
+    # provider-specific namespaces.
+    "gpt-": ("openai/", "chatgpt/", "github_copilot/"),
+    "o1-": ("openai/",),
+    "o3-": ("openai/",),
+    "o4-": ("openai/",),
+    "gemini-": ("google/",),
+    "deepseek-": ("deepseek/",),
 }
 
 _resolved_model_cache: dict[str, str] = {}
@@ -62,60 +80,50 @@ def _resolve_litellm_model_uncached(model: str) -> str:
     """Uncached resolution — called once per unique model name."""
     if not LITELLM_AVAILABLE:
         return model
-    # Try as-is first
+
+    cost_data = getattr(litellm, "model_cost", {}) or {}
+
+    # Try as-is and static aliases first. Using the in-process pricing registry
+    # avoids provider-specific cost_per_token hooks that can initiate auth flows.
+    alias = _MODEL_ALIASES.get(model)
+    if alias and alias in cost_data:
+        return alias
+
+    if model in cost_data:
+        return model
+
+    for pattern, prefixes in _MODEL_PREFIXES.items():
+        if model.startswith(pattern):
+            for prefix in prefixes:
+                prefixed = f"{prefix}{model}"
+                if prefixed in cost_data:
+                    return prefixed
+            break
+
+    # Try as-is through LiteLLM's resolver as a compatibility fallback.
     try:
         litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
         return model
     except Exception:
         pass
-    # Try with provider prefix
-    prefixes = {
-        "claude-": "anthropic/",
-        "gpt-": "openai/",
-        "o1-": "openai/",
-        "o3-": "openai/",
-        "o4-": "openai/",
-        "gemini-": "google/",
-        "minimax-": "minimax/",
-        "deepseek-": "deepseek/",
-    }
-    # Case-insensitive prefix match: MiniMax uses mixed-case model
-    # names like "MiniMax-M3" (capital M's); we shouldn't require the
-    # user to lower-case their config to match.
-    model_lower = model.lower()
-    for pattern, prefix in prefixes.items():
-        if model_lower.startswith(pattern):
-            prefixed = f"{prefix}{model}"
-            try:
-                litellm.cost_per_token(model=prefixed, prompt_tokens=1, completion_tokens=0)
-                return prefixed
-            except Exception:
-                break
+
+    # Try with provider prefixes. Skip provider namespaces whose pricing lookup
+    # can perform interactive auth; if they were priceable, model_cost handled
+    # them above.
+    interactive_prefixes = {"chatgpt/", "github_copilot/"}
+    for pattern, prefixes in _MODEL_PREFIXES.items():
+        if model.startswith(pattern):
+            for prefix in prefixes:
+                if prefix in interactive_prefixes:
+                    continue
+                prefixed = f"{prefix}{model}"
+                try:
+                    litellm.cost_per_token(model=prefixed, prompt_tokens=1, completion_tokens=0)
+                    return prefixed
+                except Exception:
+                    continue
+            break
     return model
-
-
-def _register_minimax_pricing() -> None:
-    """Pre-register MiniMax-M3 in litellm.model_cost from `minimax/MiniMax-M3`.
-
-    The proxy receives the bare model name `MiniMax-M3` from Claude Code.
-    LiteLLM's community pricing database only stores it under the
-    `minimax/MiniMax-M3` key. The resolver's `minimax-` prefix rule
-    handles the lookup; this pre-registration is a safety net so
-    `estimate_cost()` succeeds even if (a) the resolver cache is cold,
-    or (b) LiteLLM drops the prefixed entry in a future release.
-    Pricing mirrors the upstream DB (input $0.60/M, output $2.40/M,
-    cache read $0.12/M as of 2026-06). Re-check after LiteLLM updates.
-    """
-    if not LITELLM_AVAILABLE:
-        return
-    source_key = "minimax/MiniMax-M3"
-    if source_key not in litellm.model_cost:
-        return
-    if "MiniMax-M3" not in litellm.model_cost:
-        litellm.model_cost["MiniMax-M3"] = dict(litellm.model_cost[source_key])
-
-
-_register_minimax_pricing()
 
 
 @dataclass
@@ -160,21 +168,29 @@ def get_model_pricing(model: str) -> LiteLLMModelPricing | None:
         return None
     cost_data = litellm.model_cost
 
-    # Try exact match first
-    info = cost_data.get(model)
+    # Try retired/renamed/equivalent model aliases first. Some provider-specific
+    # subscription entries exist in LiteLLM with zero token price even though a
+    # canonical list-price entry is available.
+    alias = _MODEL_ALIASES.get(model)
+    alias_info = cost_data.get(alias) if alias else None
+
+    # Try exact match next.
+    info = alias_info or cost_data.get(model)
 
     # Try common provider prefixes if not found
     if info is None:
-        for prefix in ["openai/", "anthropic/", "google/", "mistral/", "deepseek/"]:
+        for prefix in [
+            "openai/",
+            "chatgpt/",
+            "github_copilot/",
+            "anthropic/",
+            "google/",
+            "mistral/",
+            "deepseek/",
+        ]:
             if f"{prefix}{model}" in cost_data:
                 info = cost_data[f"{prefix}{model}"]
                 break
-
-    # Try retired/renamed model aliases (LiteLLM removes old model keys over time)
-    if info is None:
-        alias = _MODEL_ALIASES.get(model)
-        if alias:
-            info = cost_data.get(alias)
 
     if info is None:
         return None

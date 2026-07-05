@@ -410,8 +410,8 @@ DEBUG:headroom.transforms.smart_crusher:Kept items: [0,1,2,42,77,97,98,99] (erro
 # Log to file
 headroom proxy --log-file headroom.jsonl
 
-# Enable request logging
-headroom proxy --log-messages
+# Increase verbosity
+headroom proxy --log-level debug
 ```
 
 ## Grafana Dashboard

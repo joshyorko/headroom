@@ -185,11 +185,9 @@ class MemoryHandler:
         self.config = config
         self.agent_type = agent_type
         self._backend: LocalBackend | Any = None
-        # Per-project routing for the local backend. Built in
-        # ``_init_backend_locked`` so a single, shared resolver / LRU is
-        # kept on the handler. Qdrant deployments use composite user-id
-        # partitioning instead (see ``_compose_effective_user_id``) — the
-        # router stays None in that case.
+        # Per-request scope resolution. Local deployments use the router to
+        # choose a physical backend; qdrant-neo4j deployments use the same
+        # resolver to compose logical ``user_id::project_key`` partitions.
         self._router: BackendRouter | None = None
         self._initialized = False
         # Async singleflight guard for backend init. Ensures concurrent first
@@ -430,6 +428,18 @@ class MemoryHandler:
                 )
                 self._backend = DirectMem0Adapter(mem0_config)
                 await self._backend.ensure_initialized()
+                storage_root = (
+                    Path(self.config.storage_root)
+                    if self.config.storage_root
+                    else (Path(self.config.db_path).resolve().parent / "memories")
+                )
+                global_db_path = Path(self.config.db_path).resolve()
+                router_cfg = BackendRouterConfig(
+                    mode=self.config.storage_mode,
+                    root_dir=storage_root,
+                    global_db_path=global_db_path,
+                )
+                self._router = BackendRouter(router_cfg)
                 qdrant_target = (
                     self.config.qdrant_url or f"{self.config.qdrant_host}:{self.config.qdrant_port}"
                 )

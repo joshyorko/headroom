@@ -145,8 +145,10 @@ def test_stats_per_request_metadata_is_loopback_only() -> None:
     assert "tokens" in payload  # aggregate counters still served
     assert "recent_requests" not in payload
     assert "request_logs" not in payload
+    assert payload["per_request_metadata_hidden"] is True
     assert "config" not in payload
 
     local = _client(loopback=True).get("/stats").json()
     assert "recent_requests" in local
+    assert local["per_request_metadata_hidden"] is False
     assert "config" in local

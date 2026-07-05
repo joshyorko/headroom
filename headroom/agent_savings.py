@@ -23,10 +23,7 @@ class AgentSavingsProfile:
 
     name: str
     target_savings: float
-    # None = don't pin a keep-ratio; let Kompress decide adaptively (and any
-    # ambient HEADROOM_TARGET_RATIO / proxy default still applies). Workload
-    # personas leave this unset so savings emerge from lossless + relevance.
-    target_ratio: float | None
+    target_ratio: float
     compress_user_messages: bool
     compress_system_messages: bool
     protect_recent: int
@@ -45,10 +42,11 @@ class AgentSavingsProfile:
     def proxy_env(self) -> dict[str, str]:
         """Return env vars for Headroom proxy/wrapper entry points."""
 
-        env = {
+        return {
             "HEADROOM_MODE": self.proxy_mode,
             "HEADROOM_SAVINGS_PROFILE": self.name,
             "HEADROOM_SAVINGS_TARGET": f"{self.target_savings:.2f}",
+            "HEADROOM_TARGET_RATIO": f"{self.target_ratio:.2f}",
             "HEADROOM_COMPRESS_USER_MESSAGES": ("1" if self.compress_user_messages else "0"),
             "HEADROOM_COMPRESS_SYSTEM_MESSAGES": ("1" if self.compress_system_messages else "0"),
             "HEADROOM_PROTECT_RECENT": str(self.protect_recent),
@@ -61,11 +59,6 @@ class AgentSavingsProfile:
             "HEADROOM_FORCE_KOMPRESS": "1" if self.force_kompress else "0",
             "HEADROOM_ACCURACY_GUARD": self.accuracy_guard,
         }
-        # Only pin a keep-ratio when the profile sets one; workload personas
-        # leave it unset so Kompress decides and the ambient default applies.
-        if self.target_ratio is not None:
-            env["HEADROOM_TARGET_RATIO"] = f"{self.target_ratio:.2f}"
-        return env
 
     def apply_proxy_env_defaults(self, env: dict[str, str]) -> dict[str, str]:
         """Seed proxy env defaults without overriding explicit user settings."""
@@ -100,46 +93,6 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         protect_recent=4,
         protect_analysis_context=True,
         min_tokens_to_compress=250,
-        max_items_after_crush=15,
-        smart_crusher_with_compaction=True,
-        force_kompress=False,
-        proxy_mode="token",
-        accuracy_guard="strict",
-    ),
-    # Workload personas: compress aggressively while holding the three
-    # invariants — no accuracy loss, no extra turns, no prefix-cache bust.
-    # They rely on the defaults that already deliver this (relevance split on,
-    # user/system messages protected, read-maturation off, lossless structural
-    # compaction) and only set the workload-specific + visibility knobs. The
-    # MCP-vs-airgapped axis is the separate HEADROOM_LOSSLESS toggle: markers
-    # when a retrieve tool exists, marker-free lossless-first when air-gapped.
-    # target_ratio is unset — savings emerge from lossless + relevance, and
-    # Kompress decides its own keep. min_tokens is low so compression is
-    # actually exercised/visible on modest outputs.
-    "coding": AgentSavingsProfile(
-        name="coding",
-        target_savings=0.50,  # nominal (display only); savings are emergent
-        target_ratio=None,
-        compress_user_messages=False,  # no prompt mutation / cache bust
-        compress_system_messages=False,  # system prompt is the hottest cache
-        protect_recent=2,  # keep the active code working set verbatim
-        protect_analysis_context=True,
-        min_tokens_to_compress=25,  # low → compression is visible
-        max_items_after_crush=15,
-        smart_crusher_with_compaction=True,
-        force_kompress=False,  # don't override diff/log lossless with lossy ML
-        proxy_mode="token",
-        accuracy_guard="strict",
-    ),
-    "general": AgentSavingsProfile(
-        name="general",
-        target_savings=0.60,  # nominal (display only); savings are emergent
-        target_ratio=None,
-        compress_user_messages=False,
-        compress_system_messages=False,
-        protect_recent=0,  # little code; nothing positional to protect
-        protect_analysis_context=True,
-        min_tokens_to_compress=25,
         max_items_after_crush=15,
         smart_crusher_with_compaction=True,
         force_kompress=False,
@@ -189,8 +142,7 @@ def apply_agent_savings_profile(
     config.compress_system_messages = resolved.compress_system_messages
     config.protect_recent = resolved.protect_recent
     config.protect_analysis_context = resolved.protect_analysis_context
-    if resolved.target_ratio is not None:
-        config.target_ratio = resolved.target_ratio
+    config.target_ratio = resolved.target_ratio
     config.min_tokens_to_compress = resolved.min_tokens_to_compress
     return config
 
@@ -212,6 +164,7 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
                 "compress_system_messages": profile.compress_system_messages,
                 "protect_recent": profile.protect_recent,
                 "protect_analysis_context": profile.protect_analysis_context,
+                "target_ratio": profile.target_ratio,
                 "min_tokens_to_compress": profile.min_tokens_to_compress,
                 "max_items_after_crush": profile.max_items_after_crush,
                 "smart_crusher_with_compaction": profile.smart_crusher_with_compaction,
@@ -219,10 +172,6 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
                 "read_protection_window": profile.protect_recent,
             }
         )
-        # Only pin a keep-ratio when the profile sets one (personas leave it
-        # unset → Kompress decides / ambient default applies).
-        if profile.target_ratio is not None:
-            kwargs["target_ratio"] = profile.target_ratio
 
     if getattr(config, "compress_user_messages", False):
         kwargs["compress_user_messages"] = True

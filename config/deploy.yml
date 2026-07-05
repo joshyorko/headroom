@@ -1,0 +1,158 @@
+<%
+require "dotenv"
+Dotenv.load(".env.kamal.local") if File.exist?(".env.kamal.local")
+
+kamal_host = ENV.fetch("KAMAL_HOST")
+kamal_public_host = ENV.fetch("KAMAL_PUBLIC_HOST", kamal_host)
+kamal_ssh_user = ENV.fetch("KAMAL_SSH_USER", "kdlocpanda")
+kamal_storage_path = ENV.fetch("KAMAL_STORAGE_PATH", "/var/lib/headroom")
+kamal_arch = ENV.fetch("KAMAL_ARCH", "amd64")
+kamal_proxy_http_port = ENV.fetch("KAMAL_PROXY_HTTP_PORT", "80")
+headroom_port = ENV.fetch("HEADROOM_PORT", "8787")
+headroom_target_ratio = ENV.fetch("HEADROOM_TARGET_RATIO", "0.4")
+headroom_memory_top_k = ENV.fetch("HEADROOM_MEMORY_TOP_K", "5")
+headroom_min_evidence = ENV.fetch("HEADROOM_MIN_EVIDENCE", "3")
+headroom_memory_context_timeout_seconds = ENV.fetch("HEADROOM_MEMORY_CONTEXT_TIMEOUT_SECONDS", "1.0")
+headroom_compression_max_workers = ENV.fetch("HEADROOM_COMPRESSION_MAX_WORKERS", "16")
+headroom_tool_output_compression_parallelism = ENV.fetch("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "8")
+headroom_verbosity_level = ENV.fetch("HEADROOM_VERBOSITY_LEVEL", "").strip
+%>
+service: headroom
+image: headroom
+
+servers:
+  web:
+    hosts:
+      - <%= kamal_host %>
+    cmd: >-
+      --host 0.0.0.0
+      --port <%= headroom_port %>
+      --mode token
+      --target-ratio <%= headroom_target_ratio %>
+      --memory
+      --memory-backend qdrant-neo4j
+      --memory-db-path /home/nonroot/.headroom/memory.db
+      --memory-project-root /home/nonroot
+      --memory-top-k <%= headroom_memory_top_k %>
+      --memory-qdrant-host qdrant
+      --memory-qdrant-port 6333
+      --memory-neo4j-uri neo4j://neo4j:7687
+      --memory-neo4j-user neo4j
+      --min-evidence <%= headroom_min_evidence %>
+      --anthropic-pre-upstream-memory-context-timeout-seconds <%= headroom_memory_context_timeout_seconds %>
+      --compression-max-workers <%= headroom_compression_max_workers %>
+      --learn
+
+ssh:
+  user: <%= kamal_ssh_user %>
+
+proxy:
+  host: <%= kamal_public_host %>
+  app_port: <%= headroom_port %>
+  ssl: false
+  forward_headers: true
+  healthcheck:
+    path: /readyz
+    interval: 3
+    timeout: 3
+  run:
+    http_port: <%= kamal_proxy_http_port %>
+    bind_ips:
+      - 0.0.0.0
+
+registry:
+  server: localhost:5555
+
+builder:
+  arch: <%= kamal_arch %>
+  context: .
+  dockerfile: Dockerfile
+  args:
+    HEADROOM_EXTRAS: proxy,code,memory-stack
+
+env:
+  secret:
+    - HEADROOM_NEO4J_PASSWORD
+    - GITHUB_TOKEN
+    - OPENAI_API_KEY
+    - OPENROUTER_API_KEY
+  clear:
+    HEADROOM_HOST: 0.0.0.0
+    HEADROOM_PORT: "<%= headroom_port %>"
+    HEADROOM_MODE: token
+    HEADROOM_AGENT_TYPE: codex
+    HEADROOM_WORKSPACE_DIR: /home/nonroot/.headroom
+    HEADROOM_CONFIG_DIR: /home/nonroot/.headroom/config
+    HEADROOM_TARGET_RATIO: "<%= headroom_target_ratio %>"
+    HEADROOM_DISABLE_KOMPRESS: "0"
+    HEADROOM_DISABLE_KOMPRESS_FALLBACK: "0"
+    HEADROOM_DISABLE_KOMPRESS_ANTHROPIC: "1"
+    HEADROOM_DISABLE_KOMPRESS_OPENAI: "0"
+    HEADROOM_KOMPRESS_MAX_TOKENS: "50000"
+    HEADROOM_TEXT_CRUSHER: "1"
+    HEADROOM_COMPRESSION_DEADLINE_MS: "12000"
+    HEADROOM_COMPRESS_USER_MESSAGES: "0"
+    HEADROOM_CODE_AWARE_ENABLED: "0"
+    HEADROOM_MIN_TOKENS: "5000"
+    HEADROOM_MEMORY_DB_PATH: /home/nonroot/.headroom/memory.db
+    HEADROOM_MEMORY_PROJECT_ROOT: /home/nonroot
+    HEADROOM_MEMORY_BACKEND: qdrant-neo4j
+    HEADROOM_MEMORY_TOP_K: "<%= headroom_memory_top_k %>"
+    HEADROOM_MIN_EVIDENCE: "<%= headroom_min_evidence %>"
+    HEADROOM_MEMORY_CONTEXT_TIMEOUT_SECONDS: "<%= headroom_memory_context_timeout_seconds %>"
+    HEADROOM_COMPRESSION_MAX_WORKERS: "<%= headroom_compression_max_workers %>"
+    HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM: "<%= headroom_tool_output_compression_parallelism %>"
+    HEADROOM_QDRANT_HOST: qdrant
+    HEADROOM_QDRANT_PORT: "6333"
+    HEADROOM_NEO4J_URI: neo4j://neo4j:7687
+    HEADROOM_NEO4J_USER: neo4j
+    HEADROOM_OUTPUT_SHAPER: "1"
+<% unless headroom_verbosity_level.empty? %>
+    HEADROOM_VERBOSITY_LEVEL: "<%= headroom_verbosity_level %>"
+<% end %>
+    HEADROOM_EFFORT_ROUTER: "0"
+    HEADROOM_MECHANICAL_EFFORT: low
+    HEADROOM_LOG_MESSAGES: "0"
+
+volumes:
+  - "<%= kamal_storage_path %>/state:/home/nonroot/.headroom"
+
+aliases:
+  shell: 'app exec --interactive --reuse "sh"'
+  logs: "app logs -f"
+  ready: 'app exec --reuse "python -c ''import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:<%= headroom_port %>/readyz\", timeout=5); print(\"ready\")''"'
+  qdrant-logs: "accessory logs qdrant -f"
+  neo4j-logs: "accessory logs neo4j -f"
+
+accessories:
+  qdrant:
+    service: qdrant
+    image: qdrant/qdrant:v1.17.1
+    host: <%= kamal_host %>
+    options:
+      publish:
+        - "127.0.0.1:6333:6333"
+        - "127.0.0.1:6334:6334"
+    env:
+      clear:
+        QDRANT__SERVICE__GRPC_PORT: "6334"
+    directories:
+      - <%= kamal_storage_path %>/qdrant:/qdrant/storage
+  neo4j:
+    service: neo4j
+    image: neo4j:5.26
+    host: <%= kamal_host %>
+    options:
+      publish:
+        - "127.0.0.1:7474:7474"
+        - "127.0.0.1:7687:7687"
+    env:
+      clear:
+        NEO4J_PLUGINS: '["apoc"]'
+        NEO4J_apoc_export_file_enabled: "true"
+        NEO4J_apoc_import_file_enabled: "true"
+        NEO4J_apoc_import_file_use__neo4j__config: "true"
+      secret:
+        - NEO4J_AUTH
+    directories:
+      - <%= kamal_storage_path %>/neo4j:/data

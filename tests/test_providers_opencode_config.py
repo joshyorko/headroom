@@ -164,10 +164,6 @@ def test_inject_provider_config_creates_file(
     assert config_file.exists()
     config = _parse_json_loose(config_file.read_text())
     assert config["provider"]["headroom"]["npm"] == "@ai-sdk/openai-compatible"
-    # Bare model ids: OpenCode resolves them as "headroom/<id>" (#1657).
-    models = config["provider"]["headroom"]["models"]
-    assert "claude-sonnet-4-6" in models
-    assert all(not model_id.startswith("headroom/") for model_id in models)
     assert "mcp" not in config
     assert "model" not in config  # headroom provider is a transparent pass-through
 
@@ -407,42 +403,14 @@ def test_inject_provider_config_no_crash_on_unwriteable_dir(
 # ---------------------------------------------------------------------------
 
 
-def test_build_opencode_config_content_without_mcp(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_build_opencode_config_content_without_mcp() -> None:
     from headroom.providers.opencode.runtime import build_opencode_config_content
-
-    plugin = tmp_path / "entry.opencode.js"
-    plugin.write_text("export default () => {}", encoding="utf-8")
-    monkeypatch.setenv("HEADROOM_OPENCODE_PLUGIN_PATH", str(plugin))
 
     config = build_opencode_config_content(port=8787, include_mcp=False)
+    assert "provider" in config
     assert "mcp" not in config
     assert "model" not in config
-    # Native providers are pointed at the proxy so traffic routes through Headroom.
-    providers = config["provider"]
-    assert providers["anthropic"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
-    assert providers["openai"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
-    # The headroom provider exposes explicit models so "headroom/<id>" resolves (#1657).
-    assert providers["headroom"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
-    models = providers["headroom"]["models"]
-    assert "claude-sonnet-4-6" in models
-    assert all(not model_id.startswith("headroom/") for model_id in models)
-    # The transport plugin is injected by absolute path (opencode loads it directly).
-    assert config["plugin"] == [str(plugin)]
-
-
-def test_build_opencode_config_content_skips_plugin_when_unbuilt(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    from headroom.providers.opencode.runtime import build_opencode_config_content
-
-    # An override pointing at a missing file resolves to None → no plugin entry,
-    # but native-provider routing still applies (the pip-only fallback).
-    monkeypatch.setenv("HEADROOM_OPENCODE_PLUGIN_PATH", str(tmp_path / "missing.js"))
-    config = build_opencode_config_content(port=8787)
-    assert "plugin" not in config
-    assert config["provider"]["anthropic"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
+    assert config["plugin"] == [["headroom-opencode", {"proxyUrl": "http://127.0.0.1:8787/v1"}]]
 
 
 def test_build_opencode_config_content_with_mcp_uses_local_stdio() -> None:
@@ -457,15 +425,12 @@ def test_build_opencode_config_content_with_mcp_uses_local_stdio() -> None:
     }
 
 
-def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch) -> None:
     from headroom.providers.opencode.runtime import build_launch_env
 
     monkeypatch.delenv("HEADROOM_PROJECT", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    plugin = tmp_path / "entry.opencode.js"
-    plugin.write_text("export default () => {}", encoding="utf-8")
-    monkeypatch.setenv("HEADROOM_OPENCODE_PLUGIN_PATH", str(plugin))
 
     env, display = build_launch_env(
         port=8787,
@@ -473,10 +438,7 @@ def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch, tmp_path
         include_mcp=False,
     )
     assert env["HEADROOM_PROJECT"] == "test-proj"
-    # Plugin loaded → its proxy target is exported for self-configuration.
-    assert env["HEADROOM_PROXY_URL"] == "http://127.0.0.1:8787"
-    assert str(plugin) in env["OPENCODE_CONFIG_CONTENT"]
-    assert f"plugin={HEADROOM_OPENCODE_PLUGIN}" in display
+    assert "headroom-opencode" in env["OPENCODE_CONFIG_CONTENT"]
     assert "OPENAI_BASE_URL" not in env
     assert "ANTHROPIC_BASE_URL" not in env
 

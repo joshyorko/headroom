@@ -34,9 +34,9 @@ flags) — no content regexes or keyword patterns.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from headroom.proxy import runtime_env
 
@@ -48,6 +48,17 @@ LEGACY_THINKING_FLOOR = 1024
 
 # Ordering for output_config.effort values. Unknown values are left alone.
 _EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
+
+OutputShaperDecision = Literal[
+    "considered",
+    "applied",
+    "skipped_disabled",
+    "skipped_level_zero",
+    "skipped_no_supported_request_shape",
+    "skipped_already_shaped",
+    "skipped_holdout_control",
+    "error_fail_open",
+]
 
 # Sentinel prefix marks the steering block so application is idempotent and
 # the block is recognizable in logs/diffs.
@@ -147,6 +158,8 @@ def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
     """
     if runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL"):
         return settings.verbosity_level, "env"
+    if settings.verbosity_level != 2:
+        return settings.verbosity_level, "settings"
 
     try:
         from ..paths import workspace_dir
@@ -188,11 +201,8 @@ class ShapeResult:
     """What the shaper did to a request body."""
 
     changed: bool = False
-    labels: list[str] | None = None
-
-    def __post_init__(self) -> None:
-        if self.labels is None:
-            self.labels = []
+    labels: list[str] = field(default_factory=list)
+    decision: OutputShaperDecision = "considered"
 
 
 def classify_turn(messages: list[dict[str, Any]]) -> TurnKind:
@@ -325,6 +335,261 @@ def route_effort(
     return labels
 
 
+_OPENAI_INSTRUCTION_ROLES = {"system", "developer"}
+_OPENAI_EFFORT_RANK = {"minimal": 0, "low": 1, "medium": 2, "high": 3}
+
+
+def _replace_steering_text(existing: str, text: str) -> tuple[str, bool]:
+    start = existing.find(_STEERING_SENTINEL)
+    if start < 0:
+        separator = "\n\n" if existing else ""
+        return f"{existing}{separator}{text}", True
+
+    end = existing.find(_STEERING_SUFFIX, start)
+    if end < 0:
+        end = start + len(_STEERING_SENTINEL)
+    else:
+        end += len(_STEERING_SUFFIX)
+    updated = f"{existing[:start]}{text}{existing[end:]}"
+    return updated, updated != existing
+
+
+def _shape_openai_content(content: Any, text: str) -> tuple[Any, bool]:
+    if isinstance(content, str):
+        return _replace_steering_text(content, text)
+
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_text = part.get("text")
+            if isinstance(part_text, str) and _STEERING_SENTINEL in part_text:
+                updated, changed = _replace_steering_text(part_text, text)
+                part["text"] = updated
+                return content, changed
+        content.append({"type": "text", "text": text})
+        return content, True
+
+    return content, False
+
+
+def _apply_openai_chat_verbosity(body: dict[str, Any], level: int) -> bool:
+    text = steering_text(level)
+    if text is None:
+        return False
+
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+
+    sentinel_index: int | None = None
+    insert_after = -1
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if _STEERING_SENTINEL in str(content):
+            sentinel_index = index
+            break
+        if message.get("role") in _OPENAI_INSTRUCTION_ROLES and (insert_after == index - 1):
+            insert_after = index
+
+    if sentinel_index is not None:
+        target = messages[sentinel_index]
+        updated, changed = _shape_openai_content(target.get("content"), text)
+        target["content"] = updated
+        return changed
+
+    if insert_after >= 0:
+        target = messages[insert_after]
+        updated, changed = _shape_openai_content(target.get("content", ""), text)
+        target["content"] = updated
+        return changed
+
+    messages.insert(0, {"role": "system", "content": text})
+    return True
+
+
+def _normalize_responses_content(content: Any) -> Any:
+    if not isinstance(content, list):
+        return content
+
+    normalized: list[Any] = []
+    for part in content:
+        if not isinstance(part, dict):
+            normalized.append(part)
+            continue
+        part_type = part.get("type")
+        if part_type in {"tool_result", "function_call_output", "computer_call_output"}:
+            normalized.append(
+                {
+                    "type": "tool_result",
+                    "content": part.get("content") or part.get("output") or "",
+                    "is_error": part.get("is_error") is True,
+                }
+            )
+        elif part_type in {"text", "input_text"}:
+            normalized.append({"type": "text", "text": part.get("text", "")})
+        else:
+            normalized.append(part)
+    return normalized
+
+
+def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
+    if isinstance(input_value, str):
+        return [{"role": "user", "content": input_value}]
+
+    if not isinstance(input_value, list):
+        return []
+
+    messages: list[dict[str, Any]] = []
+    tool_parts: list[dict[str, Any]] = []
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in {"tool_result", "function_call_output", "computer_call_output"}:
+            tool_parts.append(item)
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role in {"user", "assistant", "system", "developer"}:
+            messages.append({"role": role, "content": _normalize_responses_content(content)})
+    if tool_parts:
+        messages.append({"role": "user", "content": _normalize_responses_content(tool_parts)})
+    return messages
+
+
+def _apply_openai_responses_verbosity(
+    body: dict[str, Any], level: int
+) -> tuple[bool, OutputShaperDecision]:
+    text = steering_text(level)
+    if text is None:
+        return False, "skipped_level_zero"
+
+    instructions = body.get("instructions")
+    if instructions is None:
+        body["instructions"] = text
+        return True, "applied"
+    if isinstance(instructions, str):
+        updated, changed = _replace_steering_text(instructions, text)
+        body["instructions"] = updated
+        return changed, "applied" if changed else "skipped_already_shaped"
+    return False, "skipped_no_supported_request_shape"
+
+
+def _route_openai_effort(
+    body: dict[str, Any],
+    kind: TurnKind,
+    settings: OutputShaperSettings,
+    *,
+    allow_reasoning_effort: bool = True,
+) -> list[str]:
+    if kind is not TurnKind.MECHANICAL_CONTINUATION:
+        return []
+    if not settings.effort_router_enabled:
+        return []
+    target_effort = settings.mechanical_effort
+    if target_effort not in _OPENAI_EFFORT_RANK:
+        return []
+
+    labels: list[str] = []
+
+    if allow_reasoning_effort:
+        effort = body.get("reasoning_effort")
+        if (
+            isinstance(effort, str)
+            and effort in _OPENAI_EFFORT_RANK
+            and _OPENAI_EFFORT_RANK[effort] > _OPENAI_EFFORT_RANK[target_effort]
+        ):
+            body["reasoning_effort"] = target_effort
+            labels.append(f"output_shaper:openai_reasoning_effort:{effort}->{target_effort}")
+
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if (
+            isinstance(effort, str)
+            and effort in _OPENAI_EFFORT_RANK
+            and _OPENAI_EFFORT_RANK[effort] > _OPENAI_EFFORT_RANK[target_effort]
+        ):
+            reasoning["effort"] = target_effort
+            labels.append(f"output_shaper:openai_reasoning_effort:{effort}->{target_effort}")
+
+    return labels
+
+
+def shape_openai_chat_request(
+    body: dict[str, Any],
+    settings: OutputShaperSettings | None = None,
+) -> ShapeResult:
+    result = ShapeResult()
+    if settings is None:
+        settings = OutputShaperSettings.from_env()
+    if not settings.enabled:
+        result.decision = "skipped_disabled"
+        return result
+
+    level, _source = resolve_verbosity_level(settings)
+    level_zero = level <= 0
+    had_sentinel = _STEERING_SENTINEL in str(body.get("messages"))
+    if _apply_openai_chat_verbosity(body, level):
+        result.changed = True
+        result.labels.append(f"output_shaper:verbosity:L{level}")
+
+    kind = classify_turn(body.get("messages", []))
+    labels = _route_openai_effort(body, kind, settings)
+    if labels:
+        result.changed = True
+        result.labels.extend(labels)
+
+    if result.changed:
+        result.decision = "applied"
+    elif had_sentinel:
+        result.decision = "skipped_already_shaped"
+    elif level_zero:
+        result.decision = "skipped_level_zero"
+    else:
+        result.decision = "skipped_no_supported_request_shape"
+    return result
+
+
+def shape_openai_responses_request(
+    body: dict[str, Any],
+    settings: OutputShaperSettings | None = None,
+) -> ShapeResult:
+    result = ShapeResult()
+    if settings is None:
+        settings = OutputShaperSettings.from_env()
+    if not settings.enabled:
+        result.decision = "skipped_disabled"
+        return result
+
+    if "response" in body:
+        target = body.get("response")
+        if not isinstance(target, dict):
+            result.decision = "skipped_no_supported_request_shape"
+            return result
+    elif body.get("type") == "response.create":
+        target = body
+    else:
+        target = body
+
+    level, _source = resolve_verbosity_level(settings)
+    steering_changed, steering_decision = _apply_openai_responses_verbosity(target, level)
+    if steering_changed:
+        result.changed = True
+        result.labels.append(f"output_shaper:verbosity:L{level}")
+
+    kind = classify_turn(_responses_input_to_messages(target.get("input")))
+    labels = _route_openai_effort(target, kind, settings, allow_reasoning_effort=False)
+    if labels:
+        result.changed = True
+        result.labels.extend(labels)
+
+    result.decision = "applied" if result.changed else steering_decision
+    return result
+
+
 def shape_request(
     body: dict[str, Any],
     settings: OutputShaperSettings | None = None,
@@ -340,11 +605,14 @@ def shape_request(
         settings = OutputShaperSettings.from_env()
     result = ShapeResult()
     if not settings.enabled:
+        result.decision = "skipped_disabled"
         return result
 
     assert result.labels is not None  # __post_init__ guarantees this
 
     level = settings.verbosity_level if level_override is None else level_override
+    level_zero = level <= 0
+    had_sentinel = _STEERING_SENTINEL in str(body.get("system"))
     if level > 0 and apply_verbosity_steering(body, level):
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
@@ -357,4 +625,12 @@ def shape_request(
             result.labels.extend(labels)
         logger.debug("OutputShaper: turn=%s mutations=%s", kind.value, labels)
 
+    if result.changed:
+        result.decision = "applied"
+    elif had_sentinel:
+        result.decision = "skipped_already_shaped"
+    elif level_zero:
+        result.decision = "skipped_level_zero"
+    else:
+        result.decision = "skipped_no_supported_request_shape"
     return result

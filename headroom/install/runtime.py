@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
-from headroom._subprocess import pid_alive, run
+from headroom._subprocess import run
 
 from .health import probe_ready
 from .models import DeploymentManifest, InstallPreset, RuntimeKind
@@ -45,6 +45,7 @@ PASSTHROUGH_ENV_PREFIXES = (
     "OLLAMA_",
     "LITELLM_",
     "OTEL_",
+    "SUPABASE_",
     "QDRANT_",
     "NEO4J_",
     "LANGSMITH_",
@@ -65,13 +66,37 @@ def _deployment_env(manifest: DeploymentManifest) -> dict[str, str]:
     }
 
 
+def _checkout_headroom_script() -> Path:
+    executable = "headroom.exe" if _is_windows() else "headroom"
+    script_dir = "Scripts" if _is_windows() else "bin"
+    return Path(__file__).resolve().parents[2] / ".venv" / script_dir / executable
+
+
 def resolve_headroom_command() -> list[str]:
     """Resolve the most reliable command to invoke headroom."""
 
     headroom_bin = shutil.which("headroom")
     if headroom_bin:
         return [headroom_bin]
+
+    checkout_script = _checkout_headroom_script()
+    if checkout_script.is_file() and os.access(checkout_script, os.X_OK):
+        return [str(checkout_script)]
+
     return [sys.executable, "-m", "headroom.cli"]
+
+
+def resolve_headroom_config_command() -> list[str]:
+    """Resolve the command shape written into durable user config.
+
+    Config files should not capture checkout-local virtualenv paths or a
+    workstation-specific uv tool shim path when the intended contract is
+    simply "the installed headroom command is on PATH".
+    """
+
+    if shutil.which("headroom"):
+        return ["headroom"]
+    return resolve_headroom_command()
 
 
 def _runtime_env(manifest: DeploymentManifest) -> dict[str, str]:
@@ -275,15 +300,7 @@ def start_detached_agent(profile: str) -> subprocess.Popen[str]:
         )
     else:
         kwargs["start_new_session"] = True
-    try:
-        proc = subprocess.Popen(command, **kwargs)
-    finally:
-        # The child has inherited the log file descriptor, so the parent's
-        # copy is dead weight. Closing it (even when Popen raises) avoids
-        # leaking one fd per `headroom install start` and lets the log file
-        # be rotated. Wrapped in try/finally so a Popen failure can't leak.
-        log_file.close()
-    return proc
+    return subprocess.Popen(command, **kwargs)
 
 
 def start_persistent_docker(manifest: DeploymentManifest) -> None:
@@ -329,8 +346,7 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
         return
     try:
         os.kill(pid, signal.SIGTERM)
-    except (OSError, SystemError):
-        # SystemError covers the Windows WinError 87 surfacing described in #1544.
+    except OSError:
         pass
     _clear_pid(manifest.profile)
 
@@ -360,7 +376,8 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     pid = _read_pid(manifest.profile)
     if pid is None:
         return "stopped"
-    # Windows-safe liveness probe: a bare os.kill(pid, 0) here raised WinError 87
-    # as a SystemError against the detached agent, crashing status and taking the
-    # live proxy down with it (#1544).
-    return "running" if pid_alive(pid) else "stopped"
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return "stopped"
+    return "running"

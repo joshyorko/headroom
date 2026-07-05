@@ -22,7 +22,7 @@ headroom proxy --port 8788
 pip install "headroom-ai[proxy]"
 
 # Run with debug logging
-headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
+headroom proxy --log-level debug
 ```
 
 ### Connection refused when calling proxy
@@ -43,7 +43,7 @@ ps aux | grep headroom
 
 ```bash
 # Check proxy logs for the actual error
-headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
+headroom proxy --log-level debug
 
 # Verify API key is set
 echo $OPENAI_API_KEY   # or ANTHROPIC_API_KEY
@@ -182,16 +182,6 @@ ENABLE_TOOL_SEARCH=true ANTHROPIC_BASE_URL=http://localhost:8787 claude
 When deferral is off, the proxy log also prints a one-time hint naming the fix.
 
 See [issue #746](https://github.com/chopratejas/headroom/issues/746) for the full analysis.
-
-## Remote Control unavailable through custom ANTHROPIC_BASE_URL
-
-**Symptom**: When Claude Code runs with `ANTHROPIC_BASE_URL` set to a custom host (for example, Headroom), the Remote Control menu is absent.
-
-**Cause**: This is a Claude-side gate. Headroom only receives normal API traffic and can still compress it, but Claude evaluates Remote Control availability before proxy traffic reaches the server.
-
-**Fix**: Use Headroom for normal proxied API sessions, and launch Claude directly (without `ANTHROPIC_BASE_URL`) when you need Claude Remote Control.
-
-`ENABLE_TOOL_SEARCH` is unaffected and can stay enabled for context-window savings while routing through Headroom.
 
 ## Compression Too Aggressive
 

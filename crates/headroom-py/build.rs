@@ -23,6 +23,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=glibc_compat.c");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CXX");
 
     // The shim is glibc-specific. Skip on every other target: macOS
     // uses Darwin libc, Windows has MSVCRT, musl handles strtoll
@@ -41,6 +42,8 @@ fn main() {
         .flag_if_supported("-fPIC")
         .opt_level(2)
         .compile("headroom_glibc_compat");
+
+    emit_libstdcxx_search_path();
 
     // Force the linker to pull our shim's objects into _core.so even
     // if at archive-scan time no UND `__isoc23_*` reference exists
@@ -73,5 +76,31 @@ fn main() {
         "__libc_single_threaded",
     ] {
         println!("cargo:rustc-link-arg=-Wl,-u,{sym}");
+    }
+}
+
+fn emit_libstdcxx_search_path() {
+    let Some(cxx) = std::env::var_os("CXX") else {
+        return;
+    };
+
+    let Ok(output) = std::process::Command::new(cxx)
+        .arg("-print-file-name=libstdc++.so")
+        .output()
+    else {
+        return;
+    };
+
+    if !output.status.success() {
+        return;
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if path.is_empty() || path == "libstdc++.so" {
+        return;
+    }
+
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        println!("cargo:rustc-link-search=native={}", parent.display());
     }
 }

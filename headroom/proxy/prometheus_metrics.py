@@ -68,11 +68,7 @@ class PrometheusMetrics:
         savings_tracker: SavingsTracker | None = None,
         cost_tracker: CostTracker | None = None,
         otel_metrics: HeadroomOtelMetrics | None = None,
-        stateless: bool = False,
     ):
-        # Stateless mode: keep live in-memory metrics but never write the
-        # durable savings files (proxy_savings.json, savings_events.jsonl).
-        self._stateless = stateless
         self.requests_total = 0
         self.requests_by_provider: dict[str, int] = defaultdict(int)
         self.requests_by_model: dict[str, int] = defaultdict(int)
@@ -240,7 +236,7 @@ class PrometheusMetrics:
 
         # Cumulative savings history (timestamp → cumulative tokens saved)
         self.savings_history: list[tuple[str, int]] = []
-        self.savings_tracker = savings_tracker or SavingsTracker(stateless=stateless)
+        self.savings_tracker = savings_tracker or SavingsTracker()
         self.cost_tracker = cost_tracker
         tracker_lifetime = self.savings_tracker.snapshot()["lifetime"]
         self._savings_tracker_input_tokens_offset = max(
@@ -681,7 +677,7 @@ class PrometheusMetrics:
             # client is the harness classified from the User-Agent / X-Client
             # (claude-code, codex, cursor, ...); it falls back to "proxy" only
             # when the harness is unidentified.
-            if tokens_saved > 0 and not self._stateless:
+            if tokens_saved > 0:
                 savings_ledger.record_savings_event(
                     tokens_before=input_tokens,
                     tokens_after=max(input_tokens - tokens_saved, 0),
@@ -825,7 +821,6 @@ class PrometheusMetrics:
             stage_timing_count_snapshot = dict(self.stage_timing_count)
             stage_timing_max_snapshot = dict(self.stage_timing_max)
         async with self._lock:
-            lifetime_savings = self.savings_tracker.snapshot()["lifetime"]
             lines: list[str] = []
             _append_metric(
                 lines,
@@ -897,51 +892,15 @@ class PrometheusMetrics:
                 help_text="Tokens saved by optimization",
                 value=self.tokens_saved_total,
             )
-            _append_metric(
-                lines,
-                name="headroom_persistent_savings_requests_total",
-                metric_type="counter",
-                help_text="Durable lifetime requests recorded by the proxy savings tracker",
-                value=lifetime_savings["requests"],
-            )
-            _append_metric(
-                lines,
-                name="headroom_persistent_savings_tokens_saved_total",
-                metric_type="counter",
-                help_text="Durable lifetime input tokens saved by proxy compression",
-                value=lifetime_savings["tokens_saved"],
-            )
-            _append_metric(
-                lines,
-                name="headroom_persistent_savings_input_tokens_total",
-                metric_type="counter",
-                help_text="Durable lifetime input tokens recorded by the proxy savings tracker",
-                value=lifetime_savings["total_input_tokens"],
-            )
-            _append_metric(
-                lines,
-                name="headroom_persistent_savings_input_cost_usd_total",
-                metric_type="counter",
-                help_text="Durable lifetime input spend in USD estimated by the proxy savings tracker",
-                value=lifetime_savings["total_input_cost_usd"],
-            )
-            _append_metric(
-                lines,
-                name="headroom_persistent_savings_compression_savings_usd_total",
-                metric_type="counter",
-                help_text=(
-                    "Durable lifetime compression savings in USD estimated by the "
-                    "proxy savings tracker"
-                ),
-                value=lifetime_savings["compression_savings_usd"],
-            )
             # NOTE: per-strategy compression breakdown is tracked
             # internally on `self.compressions_by_strategy` and
             # `self.tokens_saved_by_strategy` (populated by
             # `record_compression`) but **deliberately not exported
-            # here** as individual Prometheus series. The state is
-            # still observable via /stats + tests + programmatic
-            # introspection.
+            # here**. The proxy's metric→Supabase pipeline treats
+            # each metric name as a column, and we cannot add new
+            # columns. The state is still observable for tests +
+            # programmatic introspection; if/when a non-column-
+            # adding export path exists, surface it there.
             _append_metric(
                 lines,
                 name="headroom_latency_ms_sum",

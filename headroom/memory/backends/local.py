@@ -13,7 +13,6 @@ single-process production deployments.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -117,19 +116,6 @@ class LocalBackend:
         self._initialized = False
         self._hierarchical_memory: HierarchicalMemory | None = None
         self._graph: InMemoryGraphStore | SQLiteGraphStore | None = None
-        # Async singleflight guard for lazy init. Per-project backends handed
-        # out by BackendRouter init lazily on first use; concurrent first
-        # callers must land on ONE init (double-checked pattern below) instead
-        # of racing N partial inits that leave ``_hierarchical_memory`` None
-        # and trip the ``assert`` guards downstream. Created lazily so the
-        # backend can be constructed before an event loop exists.
-        self._init_lock: asyncio.Lock | None = None
-
-    def _get_init_lock(self) -> asyncio.Lock:
-        """Lazily create the init lock bound to the running event loop."""
-        if self._init_lock is None:
-            self._init_lock = asyncio.Lock()
-        return self._init_lock
 
     async def _ensure_initialized(self) -> None:
         """Ensure the backend is initialized with all components.
@@ -137,92 +123,62 @@ class LocalBackend:
         Creates the HierarchicalMemory system and graph store on first use.
         Uses SQLiteGraphStore (bounded, persistent) when graph_persist=True,
         or InMemoryGraphStore (unbounded, volatile) when graph_persist=False.
-
-        Singleflight via ``self._init_lock`` with a double-checked flag:
-        concurrent first callers await the same cold-start (which can exceed
-        a second on the ``pytorch_mps`` embedder) rather than each kicking off
-        a parallel init. If a slow init is cancelled (e.g. an outer
-        ``asyncio.wait_for`` timeout), state is reset so a later call retries
-        cleanly and ``CancelledError`` is re-raised rather than leaving the
-        backend half-built.
         """
-        # Fast path: already initialized, no lock contention.
-        if self._initialized:
-            return
+        if not self._initialized:
+            from headroom.memory import HierarchicalMemory, MemoryConfig
+            from headroom.memory.config import EmbedderBackend
 
-        lock = self._get_init_lock()
-        async with lock:
-            # Double-check after acquiring the lock — another task may have
-            # finished the init while we were waiting.
-            if self._initialized:
-                return
-            try:
-                await self._init_locked()
-            except asyncio.CancelledError:
-                # Cancellation (e.g. wait_for timeout) can leave a partial
-                # backend. Reset so the next call re-inits from scratch and
-                # never sees a half-built ``_hierarchical_memory``.
-                self._hierarchical_memory = None
-                self._graph = None
-                self._initialized = False
-                raise
+            # Map string embedder_backend to enum
+            embedder_backend_map = {
+                "local": EmbedderBackend.LOCAL,
+                "onnx": EmbedderBackend.ONNX,
+                "openai": EmbedderBackend.OPENAI,
+                "ollama": EmbedderBackend.OLLAMA,
+            }
+            embedder_backend = embedder_backend_map.get(
+                self._config.embedder_backend, EmbedderBackend.LOCAL
+            )
 
-    async def _init_locked(self) -> None:
-        """Actual init body. Must be called with ``_init_lock`` held."""
-        from headroom.memory import HierarchicalMemory, MemoryConfig
-        from headroom.memory.config import EmbedderBackend
+            mem_config = MemoryConfig(
+                db_path=Path(self._config.db_path),
+                embedder_backend=embedder_backend,
+                embedder_model=self._config.embedder_model,
+                vector_dimension=self._config.vector_dimension,
+                openai_api_key=self._config.openai_api_key,
+                ollama_base_url=self._config.ollama_base_url,
+                cache_enabled=self._config.cache_enabled,
+                cache_max_size=self._config.cache_max_size,
+            )
 
-        # Map string embedder_backend to enum
-        embedder_backend_map = {
-            "local": EmbedderBackend.LOCAL,
-            "onnx": EmbedderBackend.ONNX,
-            "openai": EmbedderBackend.OPENAI,
-            "ollama": EmbedderBackend.OLLAMA,
-        }
-        embedder_backend = embedder_backend_map.get(
-            self._config.embedder_backend, EmbedderBackend.LOCAL
-        )
+            self._hierarchical_memory = await HierarchicalMemory.create(mem_config)
 
-        mem_config = MemoryConfig(
-            db_path=Path(self._config.db_path),
-            embedder_backend=embedder_backend,
-            embedder_model=self._config.embedder_model,
-            vector_dimension=self._config.vector_dimension,
-            openai_api_key=self._config.openai_api_key,
-            ollama_base_url=self._config.ollama_base_url,
-            cache_enabled=self._config.cache_enabled,
-            cache_max_size=self._config.cache_max_size,
-        )
+            # Choose graph store based on config
+            if self._config.graph_persist:
+                from headroom.memory.adapters.sqlite_graph import SQLiteGraphStore
 
-        self._hierarchical_memory = await HierarchicalMemory.create(mem_config)
+                # Derive graph db path from main db path if not specified
+                if self._config.graph_db_path:
+                    graph_db_path = self._config.graph_db_path
+                else:
+                    # "memory.db" -> "memory_graph.db"
+                    db_path = Path(self._config.db_path)
+                    graph_db_path = str(db_path.parent / f"{db_path.stem}_graph{db_path.suffix}")
 
-        # Choose graph store based on config
-        if self._config.graph_persist:
-            from headroom.memory.adapters.sqlite_graph import SQLiteGraphStore
-
-            # Derive graph db path from main db path if not specified
-            if self._config.graph_db_path:
-                graph_db_path = self._config.graph_db_path
+                self._graph = SQLiteGraphStore(
+                    db_path=graph_db_path,
+                    page_cache_size_kb=self._config.graph_cache_size_kb,
+                )
+                logger.info(
+                    f"LocalBackend: Using SQLiteGraphStore at {graph_db_path} "
+                    f"(cache: {self._config.graph_cache_size_kb}KB)"
+                )
             else:
-                # "memory.db" -> "memory_graph.db"
-                db_path = Path(self._config.db_path)
-                graph_db_path = str(db_path.parent / f"{db_path.stem}_graph{db_path.suffix}")
+                from headroom.memory.adapters.graph import InMemoryGraphStore
 
-            self._graph = SQLiteGraphStore(
-                db_path=graph_db_path,
-                page_cache_size_kb=self._config.graph_cache_size_kb,
-            )
-            logger.info(
-                f"LocalBackend: Using SQLiteGraphStore at {graph_db_path} "
-                f"(cache: {self._config.graph_cache_size_kb}KB)"
-            )
-        else:
-            from headroom.memory.adapters.graph import InMemoryGraphStore
+                self._graph = InMemoryGraphStore()
+                logger.info("LocalBackend: Using InMemoryGraphStore (unbounded)")
 
-            self._graph = InMemoryGraphStore()
-            logger.info("LocalBackend: Using InMemoryGraphStore (unbounded)")
-
-        self._initialized = True
+            self._initialized = True
 
     # =========================================================================
     # Core Memory Operations

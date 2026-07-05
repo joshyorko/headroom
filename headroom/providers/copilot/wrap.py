@@ -8,10 +8,11 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import urlsplit
 
 import click
 
-from headroom.proxy.project_context import with_project_prefix
+from headroom.proxy.project_context import with_client_prefix, with_project_prefix
 
 
 def resolve_provider_type(
@@ -52,6 +53,23 @@ def detect_running_proxy_backend(port: int) -> str | None:
         return None
     backend = config.get("backend")
     return backend if isinstance(backend, str) else None
+
+
+def normalize_proxy_root_url(proxy_url: str | None) -> str | None:
+    """Normalize an existing Headroom proxy root URL for Copilot wrapping."""
+    if proxy_url is None:
+        return None
+
+    root = proxy_url.strip().rstrip("/")
+    if root.endswith("/dashboard"):
+        root = root[: -len("/dashboard")].rstrip("/")
+    if not root:
+        raise click.ClickException("--proxy-url must not be empty.")
+
+    parsed = urlsplit(root)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise click.ClickException("--proxy-url must be an absolute http(s) URL.")
+    return root
 
 
 def validate_configuration(
@@ -163,12 +181,13 @@ def build_launch_env(
     wire_api: str | None,
     environ: Mapping[str, str] | None = None,
     project: str | None = None,
+    proxy_url: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """Build the Copilot BYOK environment for the selected provider type.
 
-    ``project`` (the wrap launch directory) is encoded as a ``/p/<name>``
-    base-URL prefix because the Copilot CLI cannot send custom headers; the
-    proxy strips it and attributes savings per project.
+    ``project`` (the wrap launch directory) and the Copilot client name are
+    encoded as base-URL prefixes because the Copilot CLI cannot send custom
+    headers; the proxy strips them and attributes traffic per client/project.
     """
     # Distinguish "caller passed nothing" (use os.environ) from "caller
     # explicitly passed an empty dict" (start fresh — the test/CLI is in
@@ -177,6 +196,7 @@ def build_launch_env(
     env = dict(environ if environ is not None else os.environ)
     env["COPILOT_PROVIDER_TYPE"] = provider_type
     env.pop("COPILOT_PROVIDER_WIRE_API", None)
+    proxy_root = normalize_proxy_root_url(proxy_url) or f"http://127.0.0.1:{port}"
 
     if not env.get("COPILOT_PROVIDER_API_KEY"):
         key = env.get(provider_key_source(provider_type), "")
@@ -184,7 +204,7 @@ def build_launch_env(
             env["COPILOT_PROVIDER_API_KEY"] = key
 
     if provider_type == "anthropic":
-        base_url = with_project_prefix(f"http://127.0.0.1:{port}", project)
+        base_url = with_client_prefix(with_project_prefix(proxy_root, project), "copilot")
         env["COPILOT_PROVIDER_BASE_URL"] = base_url
         return env, [
             "COPILOT_PROVIDER_TYPE=anthropic",
@@ -192,7 +212,7 @@ def build_launch_env(
         ]
 
     effective_wire_api = wire_api or "completions"
-    base_url = with_project_prefix(f"http://127.0.0.1:{port}/v1", project)
+    base_url = with_client_prefix(with_project_prefix(f"{proxy_root}/v1", project), "copilot")
     env["COPILOT_PROVIDER_BASE_URL"] = base_url
     env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
     return env, [

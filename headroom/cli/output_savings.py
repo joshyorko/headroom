@@ -48,8 +48,14 @@ def output_savings() -> None:
     label = "MEASURED (A/B holdout)" if est.kind == "measured" else "ESTIMATED (synthetic control)"
     click.echo(f"  Method:    {label}")
     click.echo(f"  Requests:  {est.n_requests:,} shaped")
+    click.echo(f"  Status:    {est.estimate_status}")
+    if est.estimate_reasons:
+        click.echo(f"  Reasons:   {', '.join(est.estimate_reasons)}")
     click.echo(f"  Baseline:  {est.baseline_tokens:,.0f} output tokens expected")
-    click.echo(f"  Saved:     {est.tokens_saved:,.0f} output tokens")
+    if est.estimate_reliable and est.tokens_saved > 0:
+        click.echo(f"  Saved:     {est.tokens_saved:,.0f} output tokens")
+    else:
+        click.echo(f"  Raw delta: {est.tokens_saved:,.0f} output tokens")
     click.echo(
         f"  Reduction: {est.pct:.1f}%   (95% CI {est.ci_low_pct:.1f}% … {est.ci_high_pct:.1f}%)"
     )

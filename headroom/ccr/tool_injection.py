@@ -55,6 +55,14 @@ def create_ccr_tool_definition(
                         "type": "string",
                         "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
                     },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Optional search query to filter results. "
+                            "If provided, only returns items matching the query. "
+                            "If omitted, returns all original items."
+                        ),
+                    },
                 },
                 "required": ["hash"],
             },
@@ -80,6 +88,14 @@ def create_ccr_tool_definition(
                         "type": "string",
                         "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
                     },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Optional search query to filter results. "
+                            "If provided, only returns items matching the query. "
+                            "If omitted, returns all original items."
+                        ),
+                    },
                 },
                 "required": ["hash"],
             },
@@ -99,6 +115,10 @@ def create_ccr_tool_definition(
                     "hash": {
                         "type": "string",
                         "description": "Hash key from the compression marker",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional search query to filter results",
                     },
                 },
                 "required": ["hash"],
@@ -135,7 +155,8 @@ Some tool outputs have been compressed to reduce context size. If you need
 the full uncompressed data, you can retrieve it using the `{CCR_TOOL_NAME}` tool.
 
 **How to retrieve:**
-- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get the full original content back
+- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get all original items
+- Call `{CCR_TOOL_NAME}(hash="<hash>", query="search terms")` to search within
 
 **Available hashes:** {hash_list}
 
@@ -444,15 +465,15 @@ class CCRToolInjector:
 def parse_tool_call(
     tool_call: dict[str, Any],
     provider: str = "anthropic",
-) -> str | None:
-    """Parse a CCR tool call to extract the content hash.
+) -> tuple[str | None, str | None]:
+    """Parse a CCR tool call to extract hash and query.
 
     Args:
         tool_call: The tool call object from the LLM response.
         provider: The provider type for format detection.
 
     Returns:
-        The hash key, or None if this is not a (valid) CCR tool call.
+        Tuple of (hash, query) or (None, None) if not a CCR tool call.
     """
     # Get tool name and input data based on provider format
     if provider == "anthropic":
@@ -478,19 +499,19 @@ def parse_tool_call(
         input_data = tool_call.get("input", tool_call.get("args", {}))
 
     if name != CCR_TOOL_NAME:
-        return None
+        return None, None
 
     hash_key = input_data.get("hash")
-    if hash_key is None:
-        return None
+    query = input_data.get("query")
 
     # Validate hash format. SmartCrusher emits 12-hex-char hashes while legacy
     # bracket markers / the compression_store use 24-hex-char hashes; accept
     # either real length and reject anything else as malformed.
-    if not isinstance(hash_key, str) or len(hash_key) not in (12, 24):
-        return None
-    # Validate hex characters only
-    if not all(c in "0123456789abcdef" for c in hash_key.lower()):
-        return None
+    if hash_key is not None:
+        if not isinstance(hash_key, str) or len(hash_key) not in (12, 24):
+            return None, None
+        # Validate hex characters only
+        if not all(c in "0123456789abcdef" for c in hash_key.lower()):
+            return None, None
 
-    return hash_key
+    return hash_key, query

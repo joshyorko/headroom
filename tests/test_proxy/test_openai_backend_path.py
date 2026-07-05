@@ -91,6 +91,12 @@ def _make_mock_backend(response_body: dict, status_code: int = 200) -> MagicMock
     return backend
 
 
+def _make_mock_backend_named(name: str, response_body: dict, status_code: int = 200) -> MagicMock:
+    backend = _make_mock_backend(response_body, status_code=status_code)
+    backend.name = name
+    return backend
+
+
 def _install_tracker_stub(client: TestClient) -> _RecordingTracker:
     """Force the session_tracker_store to hand out our recording tracker."""
     tracker = _RecordingTracker(provider="openai")
@@ -98,6 +104,59 @@ def _install_tracker_stub(client: TestClient) -> _RecordingTracker:
     proxy = client.app.state.proxy
     proxy.session_tracker_store.get_or_create = MagicMock(return_value=tracker)
     return tracker
+
+
+def test_openrouter_model_prefix_uses_openrouter_backend():
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        backend="anthropic",
+        http2=False,
+    )
+    response_body = {
+        "id": "chatcmpl-openrouter-1",
+        "object": "chat.completion",
+        "model": "openrouter/deepseek/deepseek-chat",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 9},
+    }
+    mock_backend = _make_mock_backend_named("litellm-openrouter", response_body)
+
+    with patch(
+        "headroom.providers.registry.create_proxy_backend", return_value=mock_backend
+    ) as create:
+        app = create_app(config)
+        with TestClient(app) as client:
+            _install_tracker_stub(client)
+            resp = client.post(
+                "/c/hermes/v1/chat/completions",
+                json={
+                    "model": "openrouter/deepseek/deepseek-chat",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                },
+                headers={
+                    "Authorization": "Bearer dummy-headroom-client-key",
+                    "x-api-key": "dummy-headroom-client-key",
+                },
+            )
+
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == "ok"
+    create.assert_called_once()
+    assert create.call_args.kwargs["backend"] == "openrouter"
+    sent_body = mock_backend.send_openai_message.await_args.args[0]
+    assert sent_body["model"] == "openrouter/deepseek/deepseek-chat"
+    sent_headers = mock_backend.send_openai_message.await_args.args[1]
+    assert "authorization" not in {key.lower() for key in sent_headers}
+    assert "x-api-key" not in {key.lower() for key in sent_headers}
 
 
 def test_backend_response_updates_prefix_tracker_with_bedrock_cache_fields():
@@ -143,6 +202,8 @@ def test_backend_response_updates_prefix_tracker_with_bedrock_cache_fields():
 
     assert resp.status_code == 200, resp.text
     assert mock_backend.send_openai_message.await_count == 1
+    sent_headers = mock_backend.send_openai_message.await_args.args[1]
+    assert sent_headers.get("authorization") == "Bearer test-key"
     assert len(tracker.calls) == 1, tracker.calls
     call = tracker.calls[0]
     # Prefer the Bedrock authoritative top-level read/write counts.
@@ -365,3 +426,48 @@ def test_backend_streaming_passes_prefix_tracker_through():
         "_stream_openai_via_backend must accept optimized_messages so the "
         "tracker can record the messages that were sent"
     )
+
+
+def test_output_shaper_applies_to_openai_chat_backend(monkeypatch):
+    from headroom.proxy.output_shaper import steering_text
+
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
+    config = _make_config()
+    response_body = {
+        "id": "chatcmpl-shaped-1",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+    }
+    mock_backend = _make_mock_backend(response_body)
+
+    app = create_app(config)
+    client = TestClient(app)
+    client.app.state.proxy.anthropic_backend = mock_backend
+    _install_tracker_stub(client)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "Follow project rules."},
+                {"role": "user", "content": "Hi"},
+            ],
+            "stream": False,
+        },
+        headers={"Authorization": "Bearer test"},
+    )
+
+    assert response.status_code == 200
+    sent_body = mock_backend.send_openai_message.await_args.args[0]
+    assert sent_body["messages"][0]["content"].startswith("Follow project rules.\n\n")
+    assert steering_text(3) in sent_body["messages"][0]["content"]
+    assert str(sent_body).count("<headroom_output_shaping>") == 1

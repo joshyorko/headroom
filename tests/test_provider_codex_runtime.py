@@ -170,9 +170,12 @@ class _CodexProxyStack:
 @pytest.fixture(scope="module")
 def codex_proxy_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_CodexProxyStack]:
     temp_home = tmp_path_factory.mktemp("codex-proxy-home")
-    previous_env = {name: os.environ.get(name) for name in ("HEADROOM_REQUIRE_RUST_CORE", "HOME")}
+    previous_env = {
+        name: os.environ.get(name) for name in ("HEADROOM_REQUIRE_RUST_CORE", "HOME", "CODEX_HOME")
+    }
     os.environ["HEADROOM_REQUIRE_RUST_CORE"] = "false"
     os.environ["HOME"] = str(temp_home)
+    os.environ["CODEX_HOME"] = str(temp_home / ".codex")
 
     upstream_port = _free_port()
     upstream = _MockOpenAIServer(("127.0.0.1", upstream_port))
@@ -318,7 +321,7 @@ def test_codex_install_env_routes_messages_through_headroom(
     )
 
 
-def test_init_codex_config_routes_messages_through_headroom(
+def test_init_codex_config_installs_local_hooks_and_project_provider(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     codex_proxy_stack: _CodexProxyStack,
@@ -331,19 +334,37 @@ def test_init_codex_config_routes_messages_through_headroom(
         port=codex_proxy_stack.proxy_port,
     )
 
-    config_path = tmp_path / ".codex" / "config.toml"
-    content = config_path.read_text(encoding="utf-8")
-    assert 'env_key = "OPENAI_API_KEY"' not in content
-    # Bug 3 (#406): requires_openai_auth must be absent from headroom provider blocks.
-    assert "requires_openai_auth" not in content, (
-        f"requires_openai_auth must not appear in init-generated Codex config:\n{content}"
-    )
+    hooks_config_path = tmp_path / ".codex" / "config.toml"
+    provider_config_path = Path(os.environ["CODEX_HOME"]) / "config.toml"
+    hooks_path = tmp_path / ".codex" / "hooks.json"
+
+    assert hooks_config_path.exists()
+    assert hooks_path.exists()
+
+    content = hooks_config_path.read_text(encoding="utf-8")
+    assert "hooks = true" in content
+    assert "model_provider" not in content
+    assert "openai_base_url" not in content
+
+    assert provider_config_path.exists()
+    provider_content = provider_config_path.read_text(encoding="utf-8")
+    assert 'model_provider = "headroom"' in provider_content
+    assert f"http://127.0.0.1:{codex_proxy_stack.proxy_port}/v1" in provider_content
+    assert 'env_key = "OPENAI_API_KEY"' not in provider_content
+    assert "requires_openai_auth" not in provider_content
+
+    hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+    session_commands = [
+        hook["command"] for entry in hooks["hooks"]["SessionStart"] for hook in entry["hooks"]
+    ]
+    assert any("init hook ensure" in command for command in session_commands)
+    assert any("mcp report-rtk" in command for command in session_commands)
 
     _assert_delivery(
         codex_proxy_stack,
-        base_url=_codex_base_url_from_config(config_path),
-        model="init-config-delivery-probe",
-        content="Verify init-generated Codex config sends traffic to Headroom.",
+        base_url=_codex_base_url_from_config(provider_config_path),
+        model="init-local-project-provider-probe",
+        content="Verify init-generated Codex project config sends traffic to Headroom.",
     )
 
 

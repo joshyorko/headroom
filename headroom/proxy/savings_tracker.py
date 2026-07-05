@@ -10,7 +10,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
-import math
 import os
 import tempfile
 import threading
@@ -35,7 +34,6 @@ PROJECT_NAME_MAX_LENGTH = 128
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
 DEFAULT_MAX_RESPONSE_HISTORY_POINTS = 500
 DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES = 60
-DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN = 3.0 / 1_000_000
 
 LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 litellm: Any | None = None
@@ -109,20 +107,15 @@ def _bucket_start(timestamp: datetime, bucket: str) -> datetime:
 def _coerce_int(value: Any, default: int = 0) -> int:
     try:
         return max(int(value), 0)
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError):
         return default
 
 
 def _coerce_float(value: Any, default: float = 0.0) -> float:
     try:
-        coerced = float(value)
-    except (TypeError, ValueError, OverflowError):
+        return max(float(value), 0.0)
+    except (TypeError, ValueError):
         return default
-    # Reject NaN/inf -- float() accepts them, but they poison arithmetic and
-    # serialize to JSON the dashboard's JSON.parse rejects.
-    if not math.isfinite(coerced):
-        return default
-    return max(coerced, 0.0)
 
 
 PROVIDER_UNKNOWN = "unknown"
@@ -163,6 +156,20 @@ def _resolve_litellm_model(model: str) -> str:
     if litellm is None:
         return model
 
+    cost_data = getattr(litellm, "model_cost", {}) or {}
+
+    try:
+        from headroom.pricing.litellm_pricing import resolve_litellm_model
+
+        resolved = resolve_litellm_model(model)
+        if resolved != model:
+            return resolved
+    except Exception:
+        pass
+
+    if model in cost_data:
+        return model
+
     try:
         litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
         return model
@@ -170,25 +177,32 @@ def _resolve_litellm_model(model: str) -> str:
         pass
 
     prefixes = {
-        "claude-": "anthropic/",
-        "gpt-": "openai/",
-        "o1-": "openai/",
-        "o3-": "openai/",
-        "o4-": "openai/",
-        "gemini-": "google/",
+        "claude-": ("anthropic/",),
+        "gpt-": ("openai/", "chatgpt/", "github_copilot/"),
+        "o1-": ("openai/",),
+        "o3-": ("openai/",),
+        "o4-": ("openai/",),
+        "gemini-": ("google/",),
     }
-    for pattern, prefix in prefixes.items():
+    interactive_prefixes = {"chatgpt/", "github_copilot/"}
+    for pattern, candidates in prefixes.items():
         if model.startswith(pattern):
-            candidate = f"{prefix}{model}"
-            try:
-                litellm.cost_per_token(
-                    model=candidate,
-                    prompt_tokens=1,
-                    completion_tokens=0,
-                )
-                return candidate
-            except Exception:
-                break
+            for prefix in candidates:
+                candidate = f"{prefix}{model}"
+                if candidate in cost_data:
+                    return candidate
+                if prefix in interactive_prefixes:
+                    continue
+                try:
+                    litellm.cost_per_token(
+                        model=candidate,
+                        prompt_tokens=1,
+                        completion_tokens=0,
+                    )
+                    return candidate
+                except Exception:
+                    continue
+            break
 
     return model
 
@@ -196,20 +210,18 @@ def _resolve_litellm_model(model: str) -> str:
 def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
     """Estimate compression savings in USD from saved input tokens."""
     litellm = _get_litellm_module()
-    if tokens_saved <= 0:
+    if tokens_saved <= 0 or litellm is None:
         return 0.0
-    if litellm is None:
-        return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
     try:
         resolved = _resolve_litellm_model(model)
         info = litellm.model_cost.get(resolved, {})
         input_cost_per_token = info.get("input_cost_per_token")
         if not input_cost_per_token:
-            raise RuntimeError("input cost unavailable")
+            return 0.0
         return float(tokens_saved) * float(input_cost_per_token)
     except Exception:
-        return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+        return 0.0
 
 
 def _estimate_input_cost_usd(
@@ -226,34 +238,22 @@ def _estimate_input_cost_usd(
     otherwise falls back to list-price input tokens.
     """
     total_input_tokens = _coerce_int(input_tokens)
+    litellm = _get_litellm_module()
+    if total_input_tokens <= 0 or litellm is None:
+        return 0.0
+
     cache_read = _coerce_int(cache_read_tokens)
     cache_write = _coerce_int(cache_write_tokens)
     uncached = _coerce_int(uncached_input_tokens)
-
-    # Prefer the breakdown when callers supply segmented token counts.
-    # Never add `input_tokens` on top of the breakdown to avoid double-counting.
-    use_breakdown = (cache_read + cache_write + uncached) > 0
-    chargeable_tokens = (
-        (cache_read + cache_write + uncached) if use_breakdown else total_input_tokens
-    )
-    if chargeable_tokens <= 0:
-        return 0.0
-
-    litellm = _get_litellm_module()
-    # Keep exact provider pricing authoritative when available.
-    # `litellm` can be present but lack an entry for the resolved model,
-    # in which case we fall back to a blended rate instead of zeroing usage.
-    if litellm is None:
-        return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
     try:
         resolved = _resolve_litellm_model(model)
         info = litellm.model_cost.get(resolved, {})
         input_cost_per_token = info.get("input_cost_per_token")
         if not input_cost_per_token:
-            raise RuntimeError("input cost unavailable")
+            return 0.0
 
-        if use_breakdown:
+        if cache_read + cache_write + uncached > 0:
             cache_read_cost = info.get(
                 "cache_read_input_token_cost",
                 input_cost_per_token,
@@ -270,7 +270,7 @@ def _estimate_input_cost_usd(
 
         return float(total_input_tokens) * float(input_cost_per_token)
     except Exception:
-        return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+        return 0.0
 
 
 def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
@@ -437,12 +437,7 @@ class SavingsTracker:
         max_history_age_days: int = DEFAULT_MAX_HISTORY_AGE_DAYS,
         max_response_history_points: int = DEFAULT_MAX_RESPONSE_HISTORY_POINTS,
         display_session_inactivity_minutes: int = (DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES),
-        stateless: bool = False,
     ) -> None:
-        # In stateless mode the tracker keeps live counters in memory but never
-        # writes proxy_savings.json (honors HeadroomConfig.stateless, which
-        # disables all filesystem writes for read-only / container deployments).
-        self._stateless = stateless
         self._path = Path(path or get_default_savings_storage_path())
         self._max_history_points = max_history_points
         self._max_history_age_days = max_history_age_days
@@ -1004,9 +999,6 @@ class SavingsTracker:
         return compacted
 
     def _save_locked(self) -> None:
-        if self._stateless:
-            # Stateless mode: live counters stay in memory; nothing is persisted.
-            return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             payload = {

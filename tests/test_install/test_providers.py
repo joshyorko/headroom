@@ -634,6 +634,7 @@ def test_inject_codex_provider_config_writes_openai_base_url(
     home = tmp_path
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
 
     wrap_mod._inject_codex_provider_config(8787)
 
@@ -684,6 +685,7 @@ def test_unwrap_removes_top_level_openai_base_url(
     home = tmp_path
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
 
     wrap_mod._inject_codex_provider_config(8787)
     config_file = home / ".codex" / "config.toml"

@@ -19,8 +19,6 @@ on:
       version:
         description: "Version to stamp into the image contents and exact image tag"
         required: false
-  release:
-    types: [published]
 
 env:
   REGISTRY: ghcr.io
@@ -59,12 +57,8 @@ jobs:
         id: version
         env:
           MANUAL_VERSION: ${{ inputs.version || github.event.inputs.version }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           version="${MANUAL_VERSION#v}"
-          if [ -z "$version" ] && [ -n "$RELEASE_TAG" ]; then
-            version="${RELEASE_TAG#v}"
-          fi
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
@@ -213,12 +207,8 @@ jobs:
         id: version
         env:
           MANUAL_VERSION: ${{ inputs.version || github.event.inputs.version }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           version="${MANUAL_VERSION#v}"
-          if [ -z "$version" ] && [ -n "$RELEASE_TAG" ]; then
-            version="${RELEASE_TAG#v}"
-          fi
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Compute short SHA
@@ -242,24 +232,21 @@ jobs:
           path: ${{ runner.temp }}/digests
           merge-multiple: true
 
-      # Same tag rules as the pre-fan-out workflow — preserve every
-      # tag flavor (semver, ref, sha-prefixed, version-suffixed,
-      # bare variant) so existing pull URLs keep working.
+      # Pushes to self-hosted publish the tags Kamal and local operators use:
+      # branch, dev, latest, and a short sha tag. Manual runs may also stamp
+      # an explicit version tag.
       - name: Extract metadata (variant)
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
           tags: |
-            type=ref,event=branch,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name != 'release' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
-            type=ref,event=pr,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name != 'release' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
+            type=ref,event=branch,enable=${{ inputs.enable_ref_tags != 'false' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
             type=raw,value=dev,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name == 'push' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref_name == 'self-hosted' && matrix.variant.name == '' }}
             type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != '' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
             type=raw,value=${{ steps.version.outputs.version }}-${{ steps.short-sha.outputs.sha }},enable=${{ steps.version.outputs.version != '' && matrix.variant.name == '' }}
             type=raw,value=${{ steps.version.outputs.version }}-${{ matrix.variant.name }}-${{ steps.short-sha.outputs.sha }},enable=${{ steps.version.outputs.version != '' && matrix.variant.name != '' }}
-            type=semver,pattern={{version}},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
-            type=semver,pattern={{major}}.{{minor}},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
-            type=semver,pattern={{major}},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
             type=sha,format=short,prefix=${{ matrix.variant.name != '' && format('{0}-', matrix.variant.name) || 'sha-' }}
             type=raw,value=${{ matrix.variant.name }},enable=${{ matrix.variant.name != '' }}
 
@@ -344,54 +331,3 @@ jobs:
             echo "cosign signing failed on attempt ${attempt}; retrying in ${sleep_for}s" >&2
             sleep "$sleep_for"
           done
-
-  promote-latest:
-    # Re-push the :latest tag after versioned release builds so GHCR's
-    # package version listing shows the root self-hosted image at the top.
-    needs: docker-manifest
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Normalize image name
-        id: image-name
-        run: |
-          image_name="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          printf 'image_name=%s\n' "$image_name" >> "$GITHUB_OUTPUT"
-
-      - name: Determine image version
-        id: version
-        env:
-          MANUAL_VERSION: ${{ inputs.version || github.event.inputs.version }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          version="${MANUAL_VERSION#v}"
-          if [ -z "$version" ] && [ -n "$RELEASE_TAG" ]; then
-            version="${RELEASE_TAG#v}"
-          fi
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Re-tag root image as :latest
-        if: steps.version.outputs.version != ''
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          # Add a unique annotation so the resulting image index manifest gets
-          # a new digest, which makes GHCR record a fresh package version with
-          # current timestamp (otherwise the existing root manifest is reused
-          # and stays where it was in the version listing).
-          promoted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          docker buildx imagetools create \
-            --annotation "index:io.headroom.promoted-at=${promoted_at}" \
-            --tag "${IMAGE}:latest" \
-            "${IMAGE}:${VERSION}"

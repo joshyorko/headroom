@@ -151,55 +151,6 @@ class TestAsyncioTimeoutShim:
 
 
 # ---------------------------------------------------------------------------
-# Release workflow --allow-same-version tests
-# ---------------------------------------------------------------------------
-
-
-class TestReleaseWorkflowAllowSameVersion:
-    """Validate that --allow-same-version is present on all npm version calls."""
-
-    def test_all_npm_version_calls_have_allow_same_version(self) -> None:
-        workflow_path = ROOT / ".github" / "workflows" / "release.yml"
-        content = workflow_path.read_text(encoding="utf-8")
-
-        # Find all lines with `npm version`
-        npm_version_lines = [
-            line.strip()
-            for line in content.splitlines()
-            if "npm version" in line and "npm_version" not in line.split("npm version")[0].rstrip()
-        ]
-
-        # Filter to actual npm version command invocations (not comments or env refs)
-        command_lines = [
-            line for line in npm_version_lines if not line.startswith("#") and "${{" in line
-        ]
-
-        assert len(command_lines) > 0, "Expected at least one npm version command in release.yml"
-
-        for line in command_lines:
-            assert "--allow-same-version" in line, (
-                f"npm version call missing --allow-same-version flag:\n  {line}\n"
-                "This flag prevents failures when re-running releases with the same version."
-            )
-
-    def test_all_npm_version_calls_have_no_git_tag_version(self) -> None:
-        """npm version in CI should not create git tags (handled by the release job)."""
-        workflow_path = ROOT / ".github" / "workflows" / "release.yml"
-        content = workflow_path.read_text(encoding="utf-8")
-
-        npm_version_lines = [
-            line.strip()
-            for line in content.splitlines()
-            if "npm version" in line and "${{" in line and not line.startswith("#")
-        ]
-
-        for line in npm_version_lines:
-            assert "--no-git-tag-version" in line, (
-                f"npm version call missing --no-git-tag-version flag:\n  {line}"
-            )
-
-
-# ---------------------------------------------------------------------------
 # SIGKILL fallback (Windows compatibility) tests
 # ---------------------------------------------------------------------------
 

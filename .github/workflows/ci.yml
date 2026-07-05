@@ -399,8 +399,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      # Smoke check that the SHIPPED build (release profile) + sdist are wired
-      # right; release.yml's matrix is what actually publishes to PyPI.
+      # Smoke check that the shipped build profile and sdist are still wired.
       - name: Install build tools
         run: |
           python -m pip install --upgrade pip

@@ -111,12 +111,6 @@ Two configs ship for VS Code / Codespaces:
 
 Inside, use: `uv run ruff check .`, `uv run pytest`, etc.
 
-## Optional automated review
-
-This repository includes `.github/copilot-instructions.md` so maintainers can opt into GitHub Copilot code review without adding workflow billing noise to every PR.
-
-Enable or disable automatic Copilot review in **Settings → Rules → Rulesets → Automatically request Copilot code review**. Keep it off unless maintainers explicitly want the extra review traffic.
-
 ## Coding standards
 
 - [Ruff](https://github.com/astral-sh/ruff) for lint + format, line length 100, PEP 8.

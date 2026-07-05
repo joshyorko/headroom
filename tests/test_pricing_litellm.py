@@ -100,6 +100,50 @@ def test_litellm_resolves_chatgpt_codex_pricing_slug(monkeypatch) -> None:
     assert pricing.input_cost_per_1m == 1.75
 
 
+def test_litellm_resolves_deepseek_compat_aliases_to_v4_flash(monkeypatch) -> None:
+    fake_litellm = SimpleNamespace(
+        model_cost={
+            "deepseek-chat": {
+                "input_cost_per_token": 0.00000028,
+                "output_cost_per_token": 0.00000042,
+                "max_input_tokens": 131_072,
+            },
+            "deepseek/deepseek-chat": {
+                "input_cost_per_token": 0.00000028,
+                "output_cost_per_token": 0.00000042,
+                "max_input_tokens": 131_072,
+            },
+            "deepseek/deepseek-reasoner": {
+                "input_cost_per_token": 0.00000028,
+                "output_cost_per_token": 0.00000042,
+                "max_input_tokens": 131_072,
+            },
+            "deepseek/deepseek-v4-flash": {
+                "input_cost_per_token": 0.00000014,
+                "output_cost_per_token": 0.00000028,
+                "max_input_tokens": 1_000_000,
+                "max_output_tokens": 384_000,
+            },
+        }
+    )
+    monkeypatch.setattr(litellm_pricing, "LITELLM_AVAILABLE", True)
+    monkeypatch.setattr(litellm_pricing, "litellm", fake_litellm)
+    litellm_pricing._resolved_model_cache.clear()
+
+    for model in (
+        "deepseek-chat",
+        "deepseek-reasoner",
+        "deepseek/deepseek-chat",
+        "deepseek/deepseek-reasoner",
+    ):
+        assert litellm_pricing.resolve_litellm_model(model) == "deepseek/deepseek-v4-flash"
+        pricing = litellm_pricing.get_model_pricing(model)
+        assert pricing is not None
+        assert pricing.input_cost_per_1m == 0.14
+        assert pricing.output_cost_per_1m == 0.28
+        assert pricing.max_input_tokens == 1_000_000
+
+
 def test_litellm_model_pricing_uses_aliases_and_zero_cost_defaults(monkeypatch) -> None:
     fake_litellm = SimpleNamespace(
         model_cost={

@@ -41,6 +41,12 @@ _MODEL_ALIASES: dict[str, str] = {
     "claude-3-5-sonnet-20240620": "claude-sonnet-4-20250514",
     # Claude 3 Sonnet retired
     "claude-3-sonnet-20240229": "claude-3-haiku-20240307",
+    # DeepSeek keeps these compatibility names for V4 Flash modes. LiteLLM's
+    # legacy rows still carry pre-V4 prices/context, so force the current row.
+    "deepseek-chat": "deepseek/deepseek-v4-flash",
+    "deepseek-reasoner": "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-chat": "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-reasoner": "deepseek/deepseek-v4-flash",
     # ChatGPT's Codex registry exposes this as a spark slug. LiteLLM carries a
     # zero-priced chatgpt/* entry for subscription auth, so use the canonical
     # Codex input rate for Headroom's estimated saved-dollar counters.
@@ -88,6 +94,12 @@ def _resolve_litellm_model_uncached(model: str) -> str:
     alias = _MODEL_ALIASES.get(model)
     if alias and alias in cost_data:
         return alias
+
+    if model.startswith("deepseek-"):
+        for prefix in _MODEL_PREFIXES["deepseek-"]:
+            prefixed = f"{prefix}{model}"
+            if prefixed in cost_data:
+                return prefixed
 
     if model in cost_data:
         return model

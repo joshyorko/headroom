@@ -2,7 +2,7 @@ name: Docker
 
 on:
   push:
-    branches: [main]
+    branches: [self-hosted]
   workflow_call:
     inputs:
       version:

@@ -16,9 +16,12 @@ headroom_memory_context_timeout_seconds = ENV.fetch("HEADROOM_MEMORY_CONTEXT_TIM
 headroom_compression_max_workers = ENV.fetch("HEADROOM_COMPRESSION_MAX_WORKERS", "16")
 headroom_tool_output_compression_parallelism = ENV.fetch("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "8")
 headroom_verbosity_level = ENV.fetch("HEADROOM_VERBOSITY_LEVEL", "").strip
+kamal_image = ENV.fetch("KAMAL_IMAGE", "joshyorko/headroom")
+kamal_registry_server = ENV.fetch("KAMAL_REGISTRY_SERVER", "ghcr.io")
+kamal_registry_username = ENV.fetch("KAMAL_REGISTRY_USERNAME", "joshyorko")
 %>
 service: headroom
-image: headroom
+image: <%= kamal_image %>
 
 servers:
   web:
@@ -61,7 +64,10 @@ proxy:
       - 0.0.0.0
 
 registry:
-  server: localhost:5555
+  server: <%= kamal_registry_server %>
+  username: <%= kamal_registry_username %>
+  password:
+    - KAMAL_REGISTRY_PASSWORD
 
 builder:
   arch: <%= kamal_arch %>

@@ -167,6 +167,13 @@ if [[ -z "$wheel" ]]; then
 fi
 
 uv tool install --force --python {python_version} "$wheel[{extras}]"
+uv tool update-shell || true
+tool_bin="$(uv tool dir --bin 2>/dev/null || true)"
+if [[ -n "$tool_bin" ]]; then
+  export PATH="$tool_bin:$PATH"
+else
+  export PATH="$HOME/.local/bin:$PATH"
+fi
 headroom --version
 """
         dist = self.build_wheel(source, python_version, profile)

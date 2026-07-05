@@ -110,7 +110,8 @@ dist/headroom-dev/install-headroom-from-wheel
 
 That lower-level path is what `scripts/headroom-rebuild-install` wraps. The
 install script uses `uv tool install --force --python 3.11` against the freshly
-built wheel, then runs `headroom --version`.
+built wheel, refreshes uv shell setup, exports uv's tool bin directory for the
+current process, then runs `headroom --version`.
 
 Hand off to the existing Kamal deploy flow when you are ready to mutate the
 remote VM:

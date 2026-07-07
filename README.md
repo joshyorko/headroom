@@ -105,6 +105,25 @@ The `headroom` CLI ships **only** via the PyPI package. The npm `headroom-ai` is
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in `[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
 
+### Codex / global install
+
+If Codex or another MCP client cannot inherit a shell `PATH` reliably, install Headroom as a persistent uv tool and point the client at the absolute binary path:
+
+```bash
+uv tool install "headroom-ai[all]"
+command -v headroom
+```
+
+Then use the returned path in MCP config:
+
+```toml
+[mcp_servers.headroom]
+command = "/absolute/path/from/command-v/headroom"
+args = ["mcp", "serve"]
+```
+
+`command = "headroom"` only works when the client starts with a `PATH` that already includes the uv tool directory.
+
 ## Proof
 
 **Savings on real agent workloads:**

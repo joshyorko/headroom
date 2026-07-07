@@ -171,6 +171,16 @@ class ProxyConfig:
     disable_kompress_anthropic: bool | None = None
     disable_kompress_openai: bool | None = None
 
+    # Force ALL compressible content through Kompress (kompress-v2-base),
+    # bypassing per-type compressor selection (SmartCrusher/CodeAware/log/
+    # diff/html/tabular/search). Tool ground truth stays protected.
+    # CLI: --force-kompress-all; env: HEADROOM_FORCE_KOMPRESS_ALL=1.
+    force_kompress_all: bool = False
+
+    # No-CCR mode: compress without retrieval markers.
+    # CLI: --lossless; env: HEADROOM_LOSSLESS=1.
+    lossless: bool = False
+
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
 
@@ -342,6 +352,13 @@ class ProxyConfig:
 
     # Stateless mode — disable all filesystem writes for read-only / container deployments
     stateless: bool = False
+
+    # Optional inbound auth. Non-loopback data-plane requests must present this
+    # token when set. Env: HEADROOM_PROXY_TOKEN.
+    proxy_token: str | None = None
+
+    # Air-gap master switch. Env: HEADROOM_OFFLINE=1.
+    offline: bool = False
 
     # Unit 4: Bounded pre-upstream concurrency for Anthropic replay storms.
     #

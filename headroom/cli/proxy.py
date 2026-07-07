@@ -651,6 +651,16 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--memory-backend",
+    type=click.Choice(["local", "qdrant-neo4j"], case_sensitive=False),
+    default=None,
+    envvar="HEADROOM_MEMORY_BACKEND",
+    help=(
+        "Persistent memory backend. local uses SQLite only; qdrant-neo4j uses "
+        "external Qdrant and Neo4j services. Env: HEADROOM_MEMORY_BACKEND."
+    ),
+)
+@click.option(
     "--no-memory-tools",
     is_flag=True,
     envvar="HEADROOM_NO_MEMORY_TOOLS",
@@ -708,6 +718,27 @@ def dashboard(port: int, no_open: bool) -> None:
     "--memory-qdrant-api-key",
     default=None,
     help=("API key for hosted Qdrant (e.g. Qdrant Cloud). Also reads HEADROOM_QDRANT_API_KEY."),
+)
+@click.option(
+    "--memory-neo4j-uri",
+    default=None,
+    envvar="HEADROOM_NEO4J_URI",
+    help=(
+        "Neo4j URI for the qdrant-neo4j backend "
+        "(default: neo4j://localhost:7687). Env: HEADROOM_NEO4J_URI."
+    ),
+)
+@click.option(
+    "--memory-neo4j-user",
+    default=None,
+    envvar="HEADROOM_NEO4J_USER",
+    help="Neo4j username for the qdrant-neo4j backend. Env: HEADROOM_NEO4J_USER.",
+)
+@click.option(
+    "--memory-neo4j-password",
+    default=None,
+    envvar="HEADROOM_NEO4J_PASSWORD",
+    help="Neo4j password for the qdrant-neo4j backend. Env: HEADROOM_NEO4J_PASSWORD.",
 )
 # Traffic Learning (live pattern extraction from proxy traffic)
 @click.option(
@@ -892,6 +923,7 @@ def proxy(
     memory_db_path: str,
     memory_storage: str,
     memory_project_root: str,
+    memory_backend: str | None,
     no_memory_tools: bool,
     no_memory_context: bool,
     memory_top_k: int,
@@ -899,6 +931,9 @@ def proxy(
     memory_qdrant_host: str | None,
     memory_qdrant_port: int | None,
     memory_qdrant_api_key: str | None,
+    memory_neo4j_uri: str | None,
+    memory_neo4j_user: str | None,
+    memory_neo4j_password: str | None,
     learn: bool,
     no_learn: bool,
     min_evidence: int | None,
@@ -1066,6 +1101,12 @@ def proxy(
         qdrant_overrides["memory_qdrant_port"] = memory_qdrant_port
     if memory_qdrant_api_key is not None:
         qdrant_overrides["memory_qdrant_api_key"] = memory_qdrant_api_key
+    if memory_neo4j_uri is not None:
+        qdrant_overrides["memory_neo4j_uri"] = memory_neo4j_uri
+    if memory_neo4j_user is not None:
+        qdrant_overrides["memory_neo4j_user"] = memory_neo4j_user
+    if memory_neo4j_password is not None:
+        qdrant_overrides["memory_neo4j_password"] = memory_neo4j_password
 
     config = ProxyConfig(
         host=host,
@@ -1167,7 +1208,13 @@ def proxy(
         # Memory System (Multi-Provider with auto-detection)
         # --learn implies --memory (need backend for storing patterns)
         # Stateless mode disables memory (requires SQLite on disk)
-        memory_enabled=False if is_stateless else (memory or (learn and not no_learn)),
+        memory_enabled=False
+        if is_stateless
+        else (memory or _get_env_bool("HEADROOM_MEMORY_ENABLED", False) or (learn and not no_learn)),
+        memory_backend=cast(
+            Literal["local", "qdrant-neo4j"],
+            (memory_backend or "local").lower(),
+        ),
         memory_db_path=memory_db_path,
         memory_storage_mode=cast(Literal["project", "user", "global"], memory_storage.lower()),
         memory_project_root_override=memory_project_root,

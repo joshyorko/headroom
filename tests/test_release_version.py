@@ -184,3 +184,12 @@ def test_release_version_script_runs_directly_without_importing_headroom_package
         "bump=manual",
         "previous_tag=",
     ]
+
+
+def test_get_canonical_version_strips_local_suffix(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "headroom-ai"\nversion = "0.27.0+sh.v1"\n',
+        encoding="utf-8",
+    )
+
+    assert get_canonical_version(tmp_path) == "0.27.0"

@@ -75,6 +75,15 @@ def test_version_prefers_source_tree_release_history() -> None:
     package_version.assert_not_called()
 
 
+def test_source_tree_version_uses_local_project_version(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "headroom-ai"\nversion = "0.27.0+sh.v1"\n',
+        encoding="utf-8",
+    )
+
+    assert version_module._source_tree_version(tmp_path) == "0.27.0+sh.v1"
+
+
 def test_proxy_package_import_does_not_eagerly_load_server() -> None:
     script = textwrap.dedent(
         """

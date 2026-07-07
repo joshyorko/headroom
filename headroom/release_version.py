@@ -236,7 +236,7 @@ def get_canonical_version(root: Path) -> str:
 
     with open(root / "pyproject.toml", "rb") as file:
         project = tomllib.load(file)["project"]
-    return str(project["version"])
+    return str(project["version"]).partition("+")[0]
 
 
 def list_release_tags(root: Path) -> list[str]:

@@ -1458,7 +1458,7 @@ wheels = [
 
 [[package]]
 name = "headroom-ai"
-version = "0.27.0"
+version = "0.27.0+sh.v1"
 source = { editable = "." }
 dependencies = [
     { name = "ast-grep-cli" },

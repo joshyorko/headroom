@@ -93,6 +93,35 @@ def test_config_dir_tilde_expansion(fake_home: Path, clean_env: pytest.MonkeyPat
 
 
 # ---------------------------------------------------------------------------
+# Process-wide stateless mode
+# ---------------------------------------------------------------------------
+
+
+def test_process_stateless_defaults_false(clean_env: pytest.MonkeyPatch) -> None:
+    paths.set_process_stateless(False)
+    clean_env.delenv("HEADROOM_STATELESS", raising=False)
+
+    assert paths.process_is_stateless() is False
+
+
+def test_process_stateless_follows_env(clean_env: pytest.MonkeyPatch) -> None:
+    paths.set_process_stateless(False)
+    clean_env.setenv("HEADROOM_STATELESS", "1")
+
+    assert paths.process_is_stateless() is True
+
+
+def test_process_stateless_setter_wins(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.delenv("HEADROOM_STATELESS", raising=False)
+    paths.set_process_stateless(True)
+
+    try:
+        assert paths.process_is_stateless() is True
+    finally:
+        paths.set_process_stateless(False)
+
+
+# ---------------------------------------------------------------------------
 # Ensure-* side effects
 # ---------------------------------------------------------------------------
 

@@ -95,6 +95,28 @@ def _env(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
+# ---------------------------------------------------------------------------
+# Process-wide stateless flag
+# ---------------------------------------------------------------------------
+
+_PROCESS_STATELESS: bool = False
+
+
+def set_process_stateless(value: bool) -> None:
+    """Record process-wide stateless mode for module-level persisters."""
+
+    global _PROCESS_STATELESS
+    _PROCESS_STATELESS = bool(value)
+
+
+def process_is_stateless() -> bool:
+    """Return true when this process must not write workspace state."""
+
+    if _PROCESS_STATELESS:
+        return True
+    return _env("HEADROOM_STATELESS").lower() in ("1", "true", "yes", "on")
+
+
 def _resolve(explicit: str | os.PathLike[str] | None, env_var: str, derived: Path) -> Path:
     """Apply the standard precedence: explicit > env > derived.
 

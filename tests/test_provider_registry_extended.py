@@ -113,7 +113,7 @@ def test_create_proxy_backend_uses_injected_backend_types() -> None:
         anyllm_provider="ignored",
         bedrock_region="us-east-1",
         logger=logger,
-        litellm_backend_cls=lambda provider, region: {
+        litellm_backend_cls=lambda provider, region, profile_name=None: {
             "kind": "litellm",
             "provider": provider,
             "region": region,
@@ -122,6 +122,29 @@ def test_create_proxy_backend_uses_injected_backend_types() -> None:
 
     assert anyllm == {"kind": "anyllm", "provider": "groq", "api_base": None}
     assert litellm == {"kind": "litellm", "provider": "bedrock", "region": "us-east-1"}
+
+
+def test_create_proxy_backend_passes_bedrock_profile_to_litellm() -> None:
+    logger = logging.getLogger("test")
+
+    litellm = create_proxy_backend(
+        backend="bedrock",
+        anyllm_provider="ignored",
+        bedrock_region="us-east-1",
+        bedrock_profile="headroom-prod",
+        logger=logger,
+        litellm_backend_cls=lambda provider, region, profile_name=None: {
+            "provider": provider,
+            "region": region,
+            "profile_name": profile_name,
+        },
+    )
+
+    assert litellm == {
+        "provider": "bedrock",
+        "region": "us-east-1",
+        "profile_name": "headroom-prod",
+    }
 
 
 def test_create_proxy_backend_passes_openai_api_url_to_anyllm() -> None:

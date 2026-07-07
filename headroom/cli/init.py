@@ -1072,20 +1072,25 @@ def _configure_codex_durable_setup(
             force=True,
         )
 
-    from headroom.cli import wrap as wrap_cli
-    from headroom.mcp_registry import CodexRegistrar
+    if code_graph or serena or no_serena or no_tokensave:
+        from headroom.cli import wrap as wrap_cli
+        from headroom.mcp_registry import CodexRegistrar
 
-    wrap_cli._setup_coding_compressor(
-        CodexRegistrar(),
-        serena_context="codex",
-        serena=serena,
-        no_serena=no_serena,
-        no_tokensave=no_tokensave,
-        verbose=verbose,
-        force=True,
-    )
-    if code_graph:
-        wrap_cli._setup_code_graph(verbose=verbose)
+        registrar = CodexRegistrar()
+        if no_tokensave:
+            wrap_cli._disable_tokensave_mcp(registrar, verbose=verbose)
+        elif code_graph:
+            wrap_cli._setup_tokensave_mcp(registrar, verbose=verbose, force=True)
+
+        if no_serena:
+            wrap_cli._disable_serena_mcp(registrar, verbose=verbose)
+        elif serena:
+            wrap_cli._setup_serena_mcp(
+                registrar,
+                context="codex",
+                verbose=verbose,
+                force=True,
+            )
 
     return normalized_proxy_url
 
@@ -1358,18 +1363,18 @@ def init_copilot(ctx: click.Context) -> None:
 @click.option(
     "--no-tokensave",
     is_flag=True,
-    help="Skip the tokensave code-graph MCP server (primary coding-task compressor).",
+    help="Remove a Headroom-installed tokensave MCP entry instead of leaving it untouched.",
 )
 @click.option(
     "--serena",
     is_flag=True,
-    help="Explicitly install Serena MCP (default unless --no-serena is passed).",
+    help="Explicitly install Serena MCP for Codex.",
 )
-@click.option("--no-serena", is_flag=True, help="Skip the Serena MCP server.")
+@click.option("--no-serena", is_flag=True, help="Remove a Headroom-installed Serena MCP entry.")
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Force a tokensave code-graph index now.",
+    help="Explicitly install and index the tokensave code-graph MCP server.",
 )
 @click.pass_context
 def init_codex(

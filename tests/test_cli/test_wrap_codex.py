@@ -1125,6 +1125,7 @@ def test_wrap_codex_memory_prepare_only_uses_local_db_without_persisting_it(
                                 "--memory",
                                 "--prepare-only",
                                 "--no-mcp",
+                                "--no-tokensave",
                                 "--no-serena",
                             ],
                         )
@@ -1139,7 +1140,7 @@ def test_wrap_codex_memory_prepare_only_uses_local_db_without_persisting_it(
     assert "--db" not in content
 
 
-def test_wrap_codex_prepare_only_registers_serena_when_uvx_exists(
+def test_wrap_codex_prepare_only_registers_serena_when_tokensave_unavailable(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _set_test_home(monkeypatch, tmp_path)
@@ -1152,8 +1153,9 @@ def test_wrap_codex_prepare_only_registers_serena_when_uvx_exists(
         return None
 
     with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
-        with patch("headroom.cli.wrap.shutil.which", side_effect=fake_which):
-            result = runner.invoke(main, ["wrap", "codex", "--prepare-only"])
+        with patch("headroom.cli.wrap._ensure_tokensave_binary", return_value=None):
+            with patch("headroom.cli.wrap.shutil.which", side_effect=fake_which):
+                result = runner.invoke(main, ["wrap", "codex", "--prepare-only"])
 
     assert result.exit_code == 0, result.output
     content = config_file.read_text(encoding="utf-8")
@@ -1232,7 +1234,7 @@ def test_init_and_wrap_prepare_only_are_idempotent_full_setup(
     assert provider["env_http_headers"] == {"X-Headroom-Project": "HEADROOM_PROJECT"}
     assert parsed["mcp_servers"]["headroom"]["env"]["HEADROOM_PROXY_URL"] == "http://10.10.10.89"
     assert parsed["mcp_servers"]["tokensave"]["command"] == "/usr/local/bin/tokensave"
-    assert parsed["mcp_servers"]["serena"]["command"] == "uvx"
+    assert "serena" not in parsed["mcp_servers"]
     assert (project_dir / ".codex" / "hooks.json").exists()
 
 
@@ -1327,6 +1329,7 @@ def test_wrap_codex_memory_prepare_only_unwrap_removes_memory_mcp_without_prior_
                                 "--memory",
                                 "--prepare-only",
                                 "--no-mcp",
+                                "--no-tokensave",
                                 "--no-serena",
                             ],
                         )
@@ -1382,7 +1385,14 @@ def test_wrap_codex_memory_launch_failure_unwrap_cleans_memory_only_config(
                         ):
                             wrap_result = runner.invoke(
                                 main,
-                                ["wrap", "codex", "--memory", "--no-mcp", "--no-serena"],
+                                [
+                                    "wrap",
+                                    "codex",
+                                    "--memory",
+                                    "--no-mcp",
+                                    "--no-tokensave",
+                                    "--no-serena",
+                                ],
                             )
 
     assert wrap_result.exit_code == 1

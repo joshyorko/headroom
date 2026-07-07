@@ -6,17 +6,10 @@ needing API key access.
 """
 
 import json
-import os
-import shutil
-import subprocess
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
 import click
-
-from headroom._subprocess import run
 
 from .main import main
 
@@ -38,7 +31,7 @@ def load_mcp_config() -> dict[str, Any]:
     """Load existing MCP config or return empty structure."""
     if MCP_CONFIG_PATH.exists():
         try:
-            with open(MCP_CONFIG_PATH) as f:
+            with open(MCP_CONFIG_PATH, encoding="utf-8") as f:
                 result: dict[str, Any] = json.load(f)
                 return result
         except (json.JSONDecodeError, OSError):
@@ -49,7 +42,7 @@ def load_mcp_config() -> dict[str, Any]:
 def save_mcp_config(config: dict) -> None:
     """Save MCP config, creating directory if needed."""
     CLAUDE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(MCP_CONFIG_PATH, "w") as f:
+    with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
         f.write("\n")  # Trailing newline
 
@@ -166,70 +159,31 @@ def mcp_install(proxy_url: str, agents: tuple[str, ...], force: bool) -> None:
 
 @mcp.command("uninstall")
 def mcp_uninstall() -> None:
-    """Remove Headroom MCP server from Claude Code config.
+    """Remove Headroom MCP server from detected agent configs.
 
     \b
-    Removes headroom from both the claude CLI registry (Claude Code CLI >=2.x)
-    and ~/.claude/mcp.json if present. Other MCP servers are preserved.
+    Removes headroom from every agent registrar known to Headroom. Other MCP
+    servers are preserved.
     """
+    from headroom.mcp_registry import get_all_registrars
+
     removed = False
 
-    # Remove from claude CLI registry (Claude Code CLI >=2.x)
-    claude_cli = shutil.which("claude")
-    if claude_cli:
-        check = subprocess.run(
-            [claude_cli, "mcp", "get", "headroom"],
-            capture_output=True,
-        )
-        if check.returncode == 0:
-            rm = run(
-                [claude_cli, "mcp", "remove", "headroom", "-s", "user"],
-                capture_output=True,
-                text=True,
-            )
-            if rm.returncode == 0:
-                click.echo("✓ Headroom MCP server removed (via claude mcp remove)")
-                removed = True
-            else:
-                click.echo(
-                    f"Warning: 'claude mcp remove' failed ({rm.stderr.strip()}).",
-                    err=True,
-                )
-
-    # Also remove codebase-memory-mcp if registered (installed by --code-graph)
-    if claude_cli:
-        cbm_check = subprocess.run(
-            [claude_cli, "mcp", "get", "codebase-memory-mcp"],
-            capture_output=True,
-        )
-        if cbm_check.returncode == 0:
-            cbm_rm = run(
-                [claude_cli, "mcp", "remove", "codebase-memory-mcp", "-s", "user"],
-                capture_output=True,
-                text=True,
-            )
-            if cbm_rm.returncode == 0:
-                click.echo("✓ codebase-memory-mcp MCP server removed")
-                removed = True
-
-    # Also remove from mcp.json fallback config if present
-    if MCP_CONFIG_PATH.exists():
-        config = load_mcp_config()
-        changed = False
+    for registrar in get_all_registrars():
+        if not registrar.detect():
+            continue
+        removed_names: list[str] = []
         for server_name in ("headroom", "codebase-memory-mcp"):
-            if server_name in config.get("mcpServers", {}):
-                del config["mcpServers"][server_name]
-                changed = True
-        if changed:
-            save_mcp_config(config)
-            click.echo(f"✓ MCP servers removed from {MCP_CONFIG_PATH}")
+            if registrar.unregister_server(server_name):
+                removed_names.append(server_name)
+        if removed_names:
+            click.echo(
+                f"✓ {registrar.display_name}: removed {', '.join(removed_names)} MCP server(s)"
+            )
             removed = True
 
     if not removed:
-        if MCP_CONFIG_PATH.exists():
-            click.echo("Headroom MCP is not configured. Nothing to uninstall.")
-        else:
-            click.echo("No MCP config found. Nothing to uninstall.")
+        click.echo("Headroom MCP is not configured. Nothing to uninstall.")
 
 
 @mcp.command("status")
@@ -252,32 +206,30 @@ def mcp_status() -> None:
         click.echo("MCP SDK:        ✗ Not installed")
         click.echo("                pip install 'headroom-ai[mcp]'")
 
-    # Check config
-    if MCP_CONFIG_PATH.exists():
-        config = load_mcp_config()
-        if "headroom" in config.get("mcpServers", {}):
-            server_config = config["mcpServers"]["headroom"]
-            click.echo("Claude Config:  ✓ Configured")
-            click.echo(f"                {MCP_CONFIG_PATH}")
+    from headroom.mcp_registry import get_all_registrars
 
-            # Show proxy URL
-            env = server_config.get("env", {})
-            proxy_url = env.get("HEADROOM_PROXY_URL", DEFAULT_PROXY_URL)
-            click.echo(f"Proxy URL:      {proxy_url}")
-        else:
-            click.echo("Claude Config:  ✗ Not configured")
-            click.echo("                Run: headroom mcp install")
-    else:
-        click.echo("Claude Config:  ✗ No config file")
+    proxy_url = DEFAULT_PROXY_URL
+    any_configured = False
+    click.echo("Agent Config:")
+    for registrar in get_all_registrars():
+        if not registrar.detect():
+            click.echo(f"  {registrar.display_name}: ✗ Not detected")
+            continue
+        spec = registrar.get_server("headroom")
+        if spec is None:
+            click.echo(f"  {registrar.display_name}: ✗ Not configured")
+            continue
+        any_configured = True
+        proxy_url = spec.env.get("HEADROOM_PROXY_URL", proxy_url)
+        click.echo(f"  {registrar.display_name}: ✓ Configured")
+
+    if not any_configured:
         click.echo("                Run: headroom mcp install")
+    click.echo(f"Proxy URL:      {proxy_url}")
 
     # Check proxy connectivity
     try:
         import httpx
-
-        config = load_mcp_config()
-        env = config.get("mcpServers", {}).get("headroom", {}).get("env", {})
-        proxy_url = env.get("HEADROOM_PROXY_URL", DEFAULT_PROXY_URL)
 
         try:
             response = httpx.get(f"{proxy_url}/health", timeout=2.0)
@@ -290,100 +242,12 @@ def mcp_status() -> None:
             click.echo("                Run: headroom proxy")
         except httpx.TimeoutException:
             click.echo("Proxy Status:   ✗ Timeout")
+        except httpx.HTTPError as e:
+            # Catch the rest (InvalidURL, UnsupportedProtocol, ProtocolError, …)
+            # so a malformed configured HEADROOM_PROXY_URL can't crash `status`.
+            click.echo(f"Proxy Status:   ✗ Unreachable ({proxy_url}: {e})")
     except ImportError:
         click.echo("Proxy Status:   ? (httpx not installed)")
-
-
-@mcp.command("report-rtk")
-@click.option(
-    "--proxy-url",
-    default=None,
-    envvar="HEADROOM_PROXY_URL",
-    help=f"Headroom proxy URL (default: {DEFAULT_PROXY_URL})",
-)
-@click.option(
-    "--scope",
-    type=click.Choice(["project", "global"]),
-    default="project",
-    show_default=True,
-    help="RTK gain scope to report. Project scope uses the current directory.",
-)
-@click.option("--timeout", default=5.0, show_default=True, help="Request timeout in seconds.")
-def mcp_report_rtk(proxy_url: str | None, scope: str, timeout: float) -> None:
-    """Report local RTK aggregate counters to a remote Headroom proxy."""
-
-    from headroom.rtk import get_rtk_path
-
-    rtk_path = get_rtk_path()
-    if not rtk_path:
-        click.echo("Error: rtk is not installed or not on PATH.", err=True)
-        raise SystemExit(1)
-
-    command = [str(rtk_path), "gain"]
-    if scope == "project":
-        command.append("--project")
-    command.extend(["--format", "json"])
-
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        click.echo("Error: timed out reading rtk gain stats.", err=True)
-        raise SystemExit(1) from None
-
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        click.echo(f"Error: rtk gain failed: {stderr}", err=True)
-        raise SystemExit(1)
-
-    try:
-        gain_payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        click.echo(f"Error: rtk gain returned invalid JSON: {exc}", err=True)
-        raise SystemExit(1) from exc
-
-    target_base = (proxy_url or DEFAULT_PROXY_URL).rstrip("/")
-    report = {
-        "tool": "rtk",
-        "scope": scope,
-        "installed": True,
-        "summary": gain_payload.get("summary", gain_payload),
-        "cwd": os.getcwd(),
-    }
-    request = urllib.request.Request(
-        f"{target_base}/stats/context-tool",
-        data=json.dumps(report).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-    except urllib.error.URLError as exc:
-        click.echo(
-            f"Error: failed to report RTK stats to {target_base}/stats/context-tool: {exc}",
-            err=True,
-        )
-        raise SystemExit(1) from exc
-
-    try:
-        response_payload = json.loads(raw)
-    except json.JSONDecodeError:
-        response_payload = {}
-
-    context_tool = response_payload.get("context_tool", {})
-    tokens_saved = int(context_tool.get("tokens_saved", 0) or 0)
-    commands = int(context_tool.get("total_commands", 0) or 0)
-    click.echo(
-        f"Reported RTK stats to {target_base} ({scope}): "
-        f"{tokens_saved:,} tokens saved across {commands:,} commands."
-    )
 
 
 @mcp.command("serve")

@@ -13,11 +13,19 @@ def proxy_base_url(port: int) -> str:
     return f"http://127.0.0.1:{port}/v1"
 
 
+def _proxy_v1_url(proxy_url: str) -> str:
+    url = proxy_url.rstrip("/")
+    return url if url.endswith("/v1") else f"{url}/v1"
+
+
 def build_launch_env(
-    port: int, environ: Mapping[str, str] | None = None
+    port: int,
+    environ: Mapping[str, str] | None = None,
+    *,
+    proxy_url: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
-    """Build environment variables for Codex through the local proxy."""
+    """Build environment variables for Codex through the selected proxy."""
     env = dict(environ or os.environ)
-    base_url = proxy_base_url(port)
+    base_url = _proxy_v1_url(proxy_url) if proxy_url else proxy_base_url(port)
     env["OPENAI_BASE_URL"] = base_url
     return env, [f"OPENAI_BASE_URL={base_url}"]

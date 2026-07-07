@@ -791,6 +791,17 @@ def test_stats_stable_positive_output_estimate_renders_display_savings(
     assert output["display_reduction_percent"] == 24.0
 
 
+def test_dashboard_session_metrics_do_not_repeat_proxy_tokens_without_new_context() -> None:
+    html = get_dashboard_html()
+
+    assert "proxy tokens removed" not in html
+    assert '<span class="text-sm text-gray-400">Headroom Overhead</span>' not in html
+    assert '<span class="text-sm text-gray-400">TTFB (upstream)</span>' not in html
+    assert "Overhead Range" in html
+    assert "TTFB Range" in html
+    assert "Proxy Removed" in html
+
+
 def test_proxy_throughput_in_stats_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify that the /stats endpoint includes a 'throughput' key in the response.
 

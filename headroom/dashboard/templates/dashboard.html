@@ -445,7 +445,6 @@
                     <div>
                         <div class="text-xs text-gray-500 mb-1">Compression</div>
                         <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="'$' + formatCurrency(stats.cost?.compression_savings_usd || 0)"></div>
-                        <div class="text-xs text-gray-500" x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens removed'"></div>
                     </div>
                     <template x-if="(stats.cost?.cache_savings_usd || 0) > 0">
                         <div>
@@ -1100,16 +1099,8 @@
                 <div class="text-sm font-medium mb-4 text-gray-300">Performance</div>
                 <div class="space-y-3">
                     <div class="flex justify-between items-center">
-                        <span class="text-sm text-gray-400">Headroom Overhead</span>
-                        <span class="font-mono text-sm" x-text="(stats.overhead?.average_ms || 0).toFixed(0) + 'ms avg'"></span>
-                    </div>
-                    <div class="flex justify-between items-center">
                         <span class="text-sm text-gray-400">Overhead Range</span>
                         <span class="font-mono text-sm" x-text="(stats.overhead?.min_ms || 0).toFixed(0) + ' - ' + (stats.overhead?.max_ms || 0).toFixed(0) + 'ms'"></span>
-                    </div>
-                    <div class="flex justify-between items-center">
-                        <span class="text-sm text-gray-400">TTFB (upstream)</span>
-                        <span class="font-mono text-sm" x-text="((stats.ttfb?.average_ms || 0) / 1000).toFixed(2) + 's avg'"></span>
                     </div>
                     <div class="flex justify-between items-center">
                         <span class="text-sm text-gray-400">TTFB Range</span>

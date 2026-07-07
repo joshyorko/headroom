@@ -593,7 +593,6 @@ def append_text_to_latest_user_input_item(
 _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
-_VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
 _RTK_GAIN_SCOPE_ENV = "HEADROOM_RTK_GAIN_SCOPE"
 _RTK_GAIN_SCOPE_GLOBAL = "global"
 _RTK_GAIN_SCOPE_PROJECT = "project"
@@ -608,18 +607,9 @@ _context_tool_stats_cache: dict[str, Any] = {
     "tool": None,
     "value": None,
 }
-_context_tool_reported_snapshot: dict[str, Any] = {
-    "tool": None,
-    "value": None,
-    "reported_at": 0.0,
-    "source": None,
-}
-_context_tool_reported_project_snapshots: dict[str, dict[str, dict[str, Any]]] = {}
 _context_tool_session_baseline: dict[str, Any] = {
     "initialized": False,
     "tool": None,
-    "source": None,
-    "scope": None,
     "total_commands": 0,
     "input_tokens": 0,
     "output_tokens": 0,
@@ -791,6 +781,18 @@ try:
 except ValueError:
     COMPRESSION_TIMEOUT_SECONDS = 30.0
 
+# Eager startup preload timeout in seconds. The preload (compressor/parser models,
+# cache-only, allow_download=False) runs off the event loop during startup; this
+# bound only fires on a true hang or an uncatchable native stall so the proxy still
+# binds its port instead of never opening (GH #790). Override via
+# HEADROOM_EAGER_PRELOAD_TIMEOUT_SECONDS. Falls back to 120 on an unparseable value.
+try:
+    EAGER_PRELOAD_TIMEOUT_SECONDS = float(
+        os.environ.get("HEADROOM_EAGER_PRELOAD_TIMEOUT_SECONDS", "120")
+    )
+except ValueError:
+    EAGER_PRELOAD_TIMEOUT_SECONDS = 120.0
+
 # Maximum compression cache sessions (prevents unbounded memory growth)
 MAX_COMPRESSION_CACHE_SESSIONS = 500
 
@@ -948,6 +950,58 @@ def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
         except (TypeError, ValueError):
             return None
     return min(max(seconds, 0.0) * 1000.0, float(max_ms))
+
+
+# Transient upstream statuses worth retrying with backoff: 429 (rate limit) and
+# 529 (Anthropic ``overloaded_error``). Both mean "the server is temporarily
+# limiting/overloaded — try again shortly", unlike other 4xx which signal a
+# problem with the request itself. Single source of truth so the streaming and
+# non-streaming forwarders agree on what is retriable.
+RETRYABLE_OVERLOAD_STATUSES: frozenset[int] = frozenset({429, 529})
+
+
+async def request_with_transient_retry(
+    client: httpx.AsyncClient,
+    *,
+    request_id: str | None = None,
+    max_retries: int = 1,
+    **request_kwargs: Any,
+) -> httpx.Response:
+    """Issue a buffered httpx request, retrying once on a transient close.
+
+    ``httpx.RemoteProtocolError`` ("peer closed connection without sending
+    complete message body (incomplete chunked read)") is raised when an
+    upstream closes a pooled keep-alive connection that httpx then reuses for
+    the next request. A direct ``curl`` never hits this because it opens a
+    fresh connection per call; Headroom reuses pooled connections, so the
+    first request issued on a stale connection fails even though the upstream
+    is healthy (it answers a fresh connection with 200). Retrying opens a new
+    connection and succeeds, mirroring curl's behaviour. See GH #1112.
+
+    Only ``httpx.RemoteProtocolError`` is retried — the specific stale
+    keep-alive symptom; every other exception (``ConnectError``, timeouts,
+    HTTP status errors) propagates immediately so existing handling is
+    unchanged. Use this for buffered (non-streaming) requests only: a streamed
+    response cannot be safely replayed once bytes have reached the client.
+    """
+    import httpx
+
+    attempt = 0
+    while True:
+        try:
+            return await client.request(**request_kwargs)
+        except httpx.RemoteProtocolError as exc:
+            if attempt >= max_retries:
+                raise
+            attempt += 1
+            logger.warning(
+                "Upstream closed connection mid-response (%s); retrying on a "
+                "fresh connection (attempt %d/%d)%s",
+                exc,
+                attempt,
+                max_retries,
+                f" [{request_id}]" if request_id else "",
+            )
 
 
 # Image compression availability (do not retain a global compressor instance)
@@ -1202,99 +1256,6 @@ def _context_tool_zero_payload(
     )
 
 
-def _context_tool_project_name_from_cwd(cwd: Any) -> str | None:
-    if not isinstance(cwd, str) or not cwd.strip():
-        return None
-    clean = cwd.rstrip("/\\")
-    if not clean:
-        return None
-    project = clean.replace("\\", "/").rsplit("/", 1)[-1].strip()
-    return project or None
-
-
-def ingest_context_tool_stats(
-    payload: dict[str, Any],
-    *,
-    source: str = "reported",
-) -> dict[str, Any]:
-    """Store a client-reported context-tool stats snapshot for remote dashboards.
-
-    The proxy normally samples RTK/lean-ctx counters from the host serving
-    ``/stats``. In self-hosted remote deployments, Codex and RTK often run on a
-    workstation while the dashboard runs on a VM, so the VM cannot read local
-    RTK state. This helper accepts aggregate counters reported by the local
-    CLI. It intentionally stores counts only, never command output.
-    """
-
-    if not isinstance(payload, dict):
-        raise ValueError("context-tool stats payload must be an object")
-
-    tool = str(payload.get("tool") or _selected_context_tool()).strip().lower()
-    if tool not in _VALID_CONTEXT_TOOLS:
-        raise ValueError(f"unsupported context tool: {tool}")
-
-    raw_scope = str(payload.get("scope") or _context_tool_default_scope(tool)).strip().lower()
-    if tool == _CONTEXT_TOOL_RTK and raw_scope not in _RTK_GAIN_SCOPES:
-        raise ValueError(f"unsupported RTK stats scope: {raw_scope}")
-
-    summary = payload.get("summary")
-    if not isinstance(summary, dict):
-        summary = payload
-
-    normalized = _context_tool_summary_payload(
-        tool=tool,
-        installed=bool(payload.get("installed", True)),
-        scope=raw_scope,
-        summary=summary,
-    )
-    normalized["reported"] = True
-    normalized["reported_at"] = time.time()
-    normalized["reported_source"] = source
-    cwd = payload.get("cwd")
-    if isinstance(cwd, str) and cwd.strip():
-        normalized["cwd"] = cwd
-    project = _context_tool_project_name_from_cwd(cwd)
-    if raw_scope == "project" and project:
-        normalized["project"] = project
-
-    with _context_tool_stats_cache_lock:
-        _context_tool_reported_snapshot.update(
-            {
-                "tool": tool,
-                "value": normalized,
-                "reported_at": normalized["reported_at"],
-                "source": source,
-            }
-        )
-        if raw_scope == "project" and project:
-            tool_projects = _context_tool_reported_project_snapshots.setdefault(tool, {})
-            tool_projects[project] = dict(normalized)
-        _context_tool_stats_cache.update(
-            {
-                "expires_at": 0.0,
-                "has_value": False,
-                "tool": None,
-                "value": None,
-            }
-        )
-
-    return normalized
-
-
-def _get_context_tool_reported_project_stats(tool: str | None = None) -> dict[str, dict[str, Any]]:
-    """Return client-reported project snapshots keyed by project name.
-
-    This is intentionally separate from ``_context_tool_reported_snapshot``,
-    which remains the latest report for backward-compatible dashboard summary
-    fields.
-    """
-
-    selected_tool = (tool or _selected_context_tool()).strip().lower()
-    with _context_tool_stats_cache_lock:
-        snapshots = _context_tool_reported_project_snapshots.get(selected_tool, {})
-        return {project: dict(value) for project, value in snapshots.items()}
-
-
 def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
     """Read rtk's lifetime stats using the configured gain scope."""
 
@@ -1405,14 +1366,11 @@ async def initialize_context_tool_session_baseline() -> None:
 
     tool = _selected_context_tool()
     payload = await asyncio.to_thread(_read_context_tool_lifetime_stats, tool)
-    payload_scope = str((payload or {}).get("scope") or _context_tool_default_scope(tool))
     with _context_tool_stats_cache_lock:
         _context_tool_session_baseline.update(
             {
                 "initialized": True,
                 "tool": tool,
-                "source": "local",
-                "scope": payload_scope,
                 "total_commands": int((payload or {}).get("total_commands", 0) or 0),
                 "input_tokens": int((payload or {}).get("input_tokens", 0) or 0),
                 "output_tokens": int((payload or {}).get("output_tokens", 0) or 0),
@@ -1456,32 +1414,16 @@ def _get_context_tool_stats() -> dict[str, Any] | None:
         ):
             return cached_value
 
+    payload = _read_context_tool_lifetime_stats(tool)
     with _context_tool_stats_cache_lock:
-        reported_snapshot = (
-            dict(_context_tool_reported_snapshot["value"])
-            if _context_tool_reported_snapshot.get("tool") == tool
-            and isinstance(_context_tool_reported_snapshot.get("value"), dict)
-            else None
-        )
-
-    payload = reported_snapshot or _read_context_tool_lifetime_stats(tool)
-    payload_source = (
-        "reported" if isinstance(payload, dict) and payload.get("reported") else "local"
-    )
-    payload_scope = str((payload or {}).get("scope") or _context_tool_default_scope(tool))
-    with _context_tool_stats_cache_lock:
-        baseline_freshly_initialized = False
         if (
             not _context_tool_session_baseline["initialized"]
             or _context_tool_session_baseline.get("tool") != tool
         ):
-            baseline_freshly_initialized = True
             _context_tool_session_baseline.update(
                 {
                     "initialized": True,
                     "tool": tool,
-                    "source": payload_source,
-                    "scope": payload_scope,
                     "total_commands": int((payload or {}).get("total_commands", 0) or 0),
                     "input_tokens": int((payload or {}).get("input_tokens", 0) or 0),
                     "output_tokens": int((payload or {}).get("output_tokens", 0) or 0),
@@ -1502,56 +1444,21 @@ def _get_context_tool_stats() -> dict[str, Any] | None:
             baseline_output_tokens = int(_context_tool_session_baseline["output_tokens"])
             baseline_tokens_saved = int(_context_tool_session_baseline["tokens_saved"])
             baseline_total_time_ms = int(_context_tool_session_baseline["total_time_ms"])
-            baseline_source = _context_tool_session_baseline.get("source")
-            baseline_scope = _context_tool_session_baseline.get("scope")
-            baseline_unavailable = payload_source == "reported" and (
-                baseline_freshly_initialized
-                or baseline_source != payload_source
-                or baseline_scope != payload_scope
+            counter_reset_detected = (
+                lifetime_total_commands < baseline_total_commands
+                or lifetime_input_tokens < baseline_input_tokens
+                or lifetime_output_tokens < baseline_output_tokens
+                or lifetime_tokens_saved < baseline_tokens_saved
+                or lifetime_total_time_ms < baseline_total_time_ms
             )
-            counter_reset_detected = False
-            session_delta_available = True
-            session_delta_unavailable_reason = None
-            if baseline_unavailable:
-                baseline_total_commands = lifetime_total_commands
-                baseline_input_tokens = lifetime_input_tokens
-                baseline_output_tokens = lifetime_output_tokens
-                baseline_tokens_saved = lifetime_tokens_saved
-                baseline_total_time_ms = lifetime_total_time_ms
-                session_delta_available = False
-                session_delta_unavailable_reason = "baseline_unavailable"
-                _context_tool_session_baseline.update(
-                    {
-                        "source": payload_source,
-                        "scope": payload_scope,
-                        "total_commands": baseline_total_commands,
-                        "input_tokens": baseline_input_tokens,
-                        "output_tokens": baseline_output_tokens,
-                        "tokens_saved": baseline_tokens_saved,
-                        "total_time_ms": baseline_total_time_ms,
-                        "captured_at": time.time(),
-                    }
-                )
-            else:
-                counter_reset_detected = (
-                    lifetime_total_commands < baseline_total_commands
-                    or lifetime_input_tokens < baseline_input_tokens
-                    or lifetime_output_tokens < baseline_output_tokens
-                    or lifetime_tokens_saved < baseline_tokens_saved
-                    or lifetime_total_time_ms < baseline_total_time_ms
-                )
             if counter_reset_detected:
                 baseline_total_commands = lifetime_total_commands
                 baseline_input_tokens = lifetime_input_tokens
                 baseline_output_tokens = lifetime_output_tokens
                 baseline_tokens_saved = lifetime_tokens_saved
                 baseline_total_time_ms = lifetime_total_time_ms
-                session_delta_available = False
-                session_delta_unavailable_reason = "counter_reset"
                 _context_tool_session_baseline.update(
                     {
-                        "source": payload_source,
-                        "scope": payload_scope,
                         "total_commands": baseline_total_commands,
                         "input_tokens": baseline_input_tokens,
                         "output_tokens": baseline_output_tokens,
@@ -1604,8 +1511,6 @@ def _get_context_tool_stats() -> dict[str, Any] | None:
                 "session_baseline_output_tokens": baseline_output_tokens,
                 "session_baseline_tokens_saved": baseline_tokens_saved,
                 "session_baseline_total_time_ms": baseline_total_time_ms,
-                "session_baseline_source": _context_tool_session_baseline.get("source"),
-                "session_baseline_scope": _context_tool_session_baseline.get("scope"),
                 "session_baseline_captured_at": _context_tool_session_baseline.get(
                     "captured_at", 0.0
                 ),
@@ -1638,8 +1543,6 @@ def _get_context_tool_stats() -> dict[str, Any] | None:
                 "sample_ttl_seconds": CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS,
                 "refresh_interval_seconds": CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS,
                 "counter_reset_detected": counter_reset_detected,
-                "session_delta_available": session_delta_available,
-                "session_delta_unavailable_reason": session_delta_unavailable_reason,
             }
 
         _context_tool_stats_cache.update(
@@ -2705,6 +2608,43 @@ def _reset_session_ccr_tracker_for_test() -> None:
     global _session_ccr_tracker
     with _session_ccr_tracker_lock:
         _session_ccr_tracker = None
+
+
+def has_new_ccr_markers(
+    *,
+    current_detected_hashes: list[str],
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+    provider: Literal["anthropic", "openai", "google"],
+) -> bool:
+    """Whether the about-to-forward content carries CCR markers NOT already forwarded.
+
+    ``overlay_cached_prefix`` (#1850) replays the previously-forwarded (compressed)
+    prefix byte-identical to keep the prompt cache warm — which reintroduces the
+    ``hash=…`` markers that prefix already carried. Those markers are *historical*:
+    the agent saw them last turn and the retrieve-tool state was already settled
+    for them. Only markers that are genuinely NEW this turn justify overriding the
+    tool-injection deferral (#1006); counting the replayed ones would re-inject the
+    tool on every frozen turn and bust the *tools* cache segment (undoing the very
+    cache-safety the overlay provides).
+
+    Returns True iff ``current_detected_hashes`` contains a hash that is not present
+    in ``previous_forwarded_messages``.
+    """
+    current = set(current_detected_hashes)
+    if not current:
+        return False
+    if not previous_forwarded_messages:
+        # No prior forward → every marker is new (genuine first CCR turn).
+        return True
+    from headroom.ccr.tool_injection import CCRToolInjector
+
+    prev = CCRToolInjector(
+        provider=provider,
+        inject_tool=False,
+        inject_system_instructions=False,
+    )
+    prev.scan_for_markers(previous_forwarded_messages)
+    return bool(current - set(prev.detected_hashes))
 
 
 def should_inject_ccr_tool(

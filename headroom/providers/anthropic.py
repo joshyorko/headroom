@@ -59,9 +59,7 @@ _DANGLING_ANSI_STYLE_SUFFIX_RE = re.compile(r"(?:\[[0-9;]*m\])+$")
 def sanitize_anthropic_model_id(model: str) -> str:
     """Return an Anthropic model id without terminal styling artifacts."""
     cleaned = _ANSI_ESCAPE_RE.sub("", str(model)).strip()
-    if cleaned.startswith("claude-"):
-        cleaned = _DANGLING_ANSI_STYLE_SUFFIX_RE.sub("", cleaned)
-    return cleaned
+    return _DANGLING_ANSI_STYLE_SUFFIX_RE.sub("", cleaned)
 
 
 def sanitize_anthropic_model_metadata(value: Any) -> Any:

@@ -26,8 +26,14 @@ from headroom.install.health import probe_json
 from headroom.install.paths import claude_settings_path, codex_config_path
 from headroom.install.state import list_manifests
 from headroom.paths import savings_path
+from headroom.providers.claude import (
+    REMOTE_CONTROL_BASE_URL_ENV,
+    is_custom_anthropic_base_url,
+    remote_control_gate_message,
+)
 
 from .main import get_version, main
+from .wrap import _read_wrap_marker, _wrap_marker_is_stale
 
 PASS = "pass"
 WARN = "warn"
@@ -146,6 +152,69 @@ def check_claude_routing(settings_path: Path, port: int) -> CheckResult:
             hint="wrap it: headroom wrap claude",
         )
     return _classify_routing_url(name, base_url, port, source=str(settings_path))
+
+
+def check_claude_remote_control_gate(
+    settings_path: Path, environ: Mapping[str, str]
+) -> CheckResult | None:
+    """Warn once when Claude custom-base routing hides Remote Control."""
+    name = "claude remote control"
+    settings_base_url = ""
+    if settings_path.exists():
+        try:
+            payload = json.loads(settings_path.read_text(encoding="utf-8"))
+            env_block = payload.get("env")
+            if isinstance(env_block, dict):
+                settings_base_url = str(env_block.get("ANTHROPIC_BASE_URL", "") or "")
+        except (OSError, ValueError):
+            settings_base_url = ""
+    if is_custom_anthropic_base_url(settings_base_url):
+        remote_message = remote_control_gate_message(f"{REMOTE_CONTROL_BASE_URL_ENV} from settings")
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary=remote_message,
+            hint=remote_message,
+        )
+
+    env_base_url = environ.get("ANTHROPIC_BASE_URL", "")
+    if is_custom_anthropic_base_url(env_base_url):
+        remote_message = remote_control_gate_message(f"{REMOTE_CONTROL_BASE_URL_ENV} in shell")
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary=remote_message,
+            hint=remote_message,
+        )
+    return None
+
+
+def check_wrap_marker_staleness(settings_path: Path) -> CheckResult:
+    """Flag a project-local ANTHROPIC_BASE_URL left by a crashed wrap session.
+
+    A crashed ``headroom wrap claude`` (SIGKILL, OOM, reboot) can leave
+    ``.claude/settings.local.json`` pointing at a dead proxy port, hanging
+    every subsequent bare ``claude`` invocation in the project (issue #1768).
+    This checks the project-local settings file — separate from the global
+    ``~/.claude/settings.json`` :func:`check_claude_routing` inspects.
+    """
+    name = "wrap_marker"
+    marker = _read_wrap_marker(settings_path)
+    if marker is None:
+        return CheckResult(name=name, status=SKIP, summary="no wrap marker found")
+    if not _wrap_marker_is_stale(marker):
+        return CheckResult(
+            name=name, status=PASS, summary=f"live wrap session (pid {marker.get('pid')})"
+        )
+    return CheckResult(
+        name=name,
+        status=WARN,
+        summary=(
+            f"stale ANTHROPIC_BASE_URL from crashed wrap session "
+            f"(pid {marker.get('pid')}, port {marker.get('port')}) — "
+            "run `headroom unwrap claude` to clean it up"
+        ),
+    )
 
 
 def check_codex_routing(config_path: Path, port: int) -> CheckResult:
@@ -356,7 +425,7 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
     "--port",
     "-p",
     default=8787,
-    type=int,
+    type=click.IntRange(1, 65535),
     envvar="HEADROOM_PORT",
     help="Proxy port to check (default: 8787, env: HEADROOM_PORT)",
 )
@@ -379,11 +448,15 @@ def doctor(port: int, emit_json: bool) -> None:
         check_proxy_liveness(livez, base_url),
         check_version_drift(livez, installed),
         check_claude_routing(claude_settings_path(), port),
+        check_wrap_marker_staleness(Path.cwd() / ".claude" / "settings.local.json"),
         check_codex_routing(codex_config_path(), port),
         check_shell_env(os.environ, port),
         check_savings(stats, savings_path()),
         check_budget(stats),
     ]
+    remote_control_gate_check = check_claude_remote_control_gate(claude_settings_path(), os.environ)
+    if remote_control_gate_check is not None:
+        checks.append(remote_control_gate_check)
     deployments = check_deployments(list_manifests())
     if deployments is not None:
         checks.append(deployments)

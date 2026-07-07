@@ -412,7 +412,7 @@ def test_existing_retrieve_tool_keeps_reversible_ccr_path_when_prefix_is_frozen(
         assert [tool["name"] for tool in forwarded["tools"]] == ["headroom_retrieve"]
 
 
-def test_cache_mode_skip_forwards_original_prefix_when_tool_injection_is_deferred(
+def test_cache_mode_skip_replays_cached_compressed_prefix_when_tool_injection_is_deferred(
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -498,11 +498,15 @@ def test_cache_mode_skip_forwards_original_prefix_when_tool_injection_is_deferre
         assert response.status_code == 200
         assert captured.get("compression_calls", []) == []
         forwarded = captured["body"]
-        assert forwarded["messages"] == original_messages
+        # Tool injection is deferred (no CCR tool this turn), but the frozen
+        # prefix was cached COMPRESSED last turn. Replay it byte-identical so the
+        # prompt cache still hits instead of busting on original bytes (#1850);
+        # the mutable tail stays original. Tool absent AND cache intact.
+        assert forwarded["messages"] == previous_forwarded_messages + original_messages[1:]
         assert "tools" not in forwarded
 
 
-def test_cache_mode_exact_prefix_replay_forwards_original_messages_when_tool_injection_is_deferred(
+def test_cache_mode_exact_prefix_replay_forwards_cached_compressed_prefix_when_tool_injection_is_deferred(
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -585,7 +589,10 @@ def test_cache_mode_exact_prefix_replay_forwards_original_messages_when_tool_inj
         assert response.status_code == 200
         assert captured.get("compression_calls", []) == []
         forwarded = captured["body"]
-        assert forwarded["messages"] == original_messages
+        # Deferred injection (no CCR tool), single frozen message cached
+        # COMPRESSED last turn: replay it so the cache holds instead of busting
+        # on original bytes (#1850). Tool absent AND cache intact.
+        assert forwarded["messages"] == previous_forwarded_messages
         assert "tools" not in forwarded
 
 

@@ -779,11 +779,12 @@ def _api_url_from_exchange_payload(payload: dict[str, Any], *, oauth_token: str)
 
     api_url = _api_url_from_payload(payload)
     if api_url:
-        host = urlparse(api_url).netloc.lower()
-        if host in {"api.githubcopilot.com", "api.individual.githubcopilot.com"}:
-            return configured
-        if host.endswith(".githubcopilot.com"):
-            return api_url
+        if is_copilot_api_url(api_url):
+            return _subscription_api_url_from_user_info_payload({"endpoints": {"api": api_url}})
+        logger.warning(
+            "Ignoring non-Copilot API URL from token exchange payload: %s",
+            api_url,
+        )
 
     return _subscription_api_url_from_user_info(oauth_token)
 
@@ -1100,21 +1101,6 @@ def _token_kind(token: str) -> str:
         if t.startswith(prefix):
             return prefix + "***"
     return "unknown" if t else "empty"
-
-
-def headers_have_copilot_api_bearer(headers: Any) -> bool:
-    """Return True when inbound headers carry a reusable Copilot API bearer token."""
-    try:
-        items = headers.items()
-    except AttributeError:
-        return False
-
-    for key, value in items:
-        if str(key).lower() != "authorization":
-            continue
-        scheme, _, raw_token = str(value).partition(" ")
-        return scheme.lower() == "bearer" and _is_copilot_api_token(raw_token)
-    return False
 
 
 async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:

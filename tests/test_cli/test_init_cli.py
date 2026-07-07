@@ -289,7 +289,7 @@ def test_init_codex_creates_hooks_feature_flag_on_first_init(
     assert provider["model_providers"]["headroom"]["base_url"] == "http://127.0.0.1:9000/v1"
 
 
-def test_init_codex_full_setup_registers_tokensave_and_serena_by_default(
+def test_init_codex_full_setup_skips_code_intelligence_by_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
@@ -326,15 +326,48 @@ def test_init_codex_full_setup_registers_tokensave_and_serena_by_default(
     assert provider["mcp_servers"]["headroom"]["env"]["HEADROOM_PROXY_URL"] == (
         "http://headroom.example.test"
     )
+    assert "tokensave" not in provider["mcp_servers"]
+    assert "serena" not in provider["mcp_servers"]
+
+    project_config = tomllib.loads((tmp_path / ".codex" / "config.toml").read_text())
+    assert project_config["features"]["hooks"] is True
+    assert (tmp_path / ".codex" / "hooks.json").exists()
+
+
+def test_init_codex_full_setup_registers_code_intelligence_when_explicit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "user-codex"))
+
+    def fake_which(cmd: str) -> str | None:
+        if cmd == "uvx":
+            return "/usr/local/bin/uvx"
+        return None
+
+    monkeypatch.setattr("headroom.cli.wrap.shutil.which", fake_which)
+    monkeypatch.setattr(
+        "headroom.cli.wrap._ensure_tokensave_binary",
+        lambda verbose=False: Path("/usr/local/bin/tokensave"),
+    )
+    monkeypatch.setattr("headroom.cli.wrap._index_tokensave_project", lambda *args, **kwargs: None)
+
+    init_cli._init_codex(
+        global_scope=False,
+        profile="init-local-demo",
+        port=9000,
+        proxy_url="http://headroom.example.test",
+        code_graph=True,
+        serena=True,
+    )
+
+    provider = tomllib.loads((tmp_path / "user-codex" / "config.toml").read_text())
     assert provider["mcp_servers"]["tokensave"]["command"] == "/usr/local/bin/tokensave"
     assert provider["mcp_servers"]["tokensave"]["args"] == ["serve"]
     assert provider["mcp_servers"]["serena"]["command"] == "uvx"
     assert "--context" in provider["mcp_servers"]["serena"]["args"]
     assert "codex" in provider["mcp_servers"]["serena"]["args"]
-
-    project_config = tomllib.loads((tmp_path / ".codex" / "config.toml").read_text())
-    assert project_config["features"]["hooks"] is True
-    assert (tmp_path / ".codex" / "hooks.json").exists()
 
 
 def test_init_claude_uses_custom_port(monkeypatch, tmp_path: Path) -> None:

@@ -89,6 +89,38 @@ class TestLearnNoLearnConflict:
         assert cfg.traffic_learning_enabled is False
 
 
+class TestHttpProxyOption:
+    """--http-proxy should configure only the provider HTTPX clients."""
+
+    def test_http_proxy_cli_flag(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy", "--http-proxy", "http://proxy.local:8080"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].http_proxy == "http://proxy.local:8080"
+
+    def test_http_proxy_env_var(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_HTTP_PROXY": "http://proxy.local:8080"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].http_proxy == "http://proxy.local:8080"
+
+    def test_direct_server_env_http_proxy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import headroom.proxy.server as server_mod
+
+        monkeypatch.delenv(server_mod._MULTI_WORKER_CONFIG_ENV, raising=False)
+        monkeypatch.setenv("HEADROOM_HTTP_PROXY", "http://proxy.local:8080")
+
+        config = server_mod._proxy_config_from_env()
+        assert config.http_proxy == "http://proxy.local:8080"
+
+
 class TestSubscriptionPollIntervalValidation:
     """--subscription-poll-interval should reject values outside 1-3600."""
 
@@ -448,3 +480,34 @@ class TestHelpTextCompleteness:
         result = runner.invoke(main, ["proxy", "--mode", "bogus_mode_xyz"])
         assert result.exit_code != 0
         assert "invalid" in result.output.lower() or "choice" in result.output.lower()
+
+
+class TestCompressionMaxWorkers:
+    """--compression-max-workers / HEADROOM_COMPRESSION_MAX_WORKERS must reach ProxyConfig.
+
+    Regression: the field was documented in ProxyConfig and consumed by the
+    server, but the CLI never defined the option or passed it through, so it
+    was permanently None (always resolving to the automatic server default).
+    """
+
+    def test_flag_reaches_config(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main, ["proxy", "--compression-max-workers", "3"], catch_exceptions=False
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].compression_max_workers == 3
+
+    def test_env_reaches_config(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={"HEADROOM_COMPRESSION_MAX_WORKERS": "5"},
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].compression_max_workers == 5
+
+    def test_default_is_none(self, runner: CliRunner, mock_run_server: dict) -> None:
+        result = runner.invoke(main, ["proxy"], catch_exceptions=False)
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].compression_max_workers is None

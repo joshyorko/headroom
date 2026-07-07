@@ -1272,6 +1272,27 @@ class AnthropicHandlerMixin:
                     # Flag compression failure for observability
                     _compression_failed = True
 
+            # Cache-safety (ALL modes): forward the previously-cached (compressed)
+            # prefix byte-identical. The freeze path can emit the agent's ORIGINAL
+            # bytes for a frozen message, but the provider cached whatever we
+            # FORWARDED last turn (the compressed form); forwarding original then
+            # mismatches the cached prefix and busts it (prefix_change was 100% of
+            # observed misses, ~56% of all cache-writes). Replaying the exact
+            # previously-forwarded prefix keeps it byte-identical → cache hits.
+            # Append-only-guarded and idempotent (cache mode already replays), so
+            # it is safe to run unconditionally here.
+            from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+            _ov = overlay_cached_prefix(
+                optimized_messages,
+                original_client_messages,
+                prefix_tracker.get_last_original_messages(),
+                prefix_tracker.get_last_forwarded_messages(),
+            )
+            if _ov != optimized_messages:
+                optimized_messages = _ov
+                optimized_tokens = tokenizer.count_messages(optimized_messages)
+
             # Guard: if "optimization" inflated tokens, revert to originals.
             # Skip in cache mode where prefix-stability may legitimately shift counts.
             if optimized_tokens > original_tokens and not is_cache_mode(self.config.mode):
@@ -1486,12 +1507,27 @@ class AnthropicHandlerMixin:
                 # no-op and the cache is unaffected.
                 # ponytail: ceiling is one extra cache miss on the first CCR
                 # turn in a frozen-prefix session.
-                from headroom.proxy.helpers import should_inject_ccr_tool
+                from headroom.proxy.helpers import (
+                    has_new_ccr_markers,
+                    should_inject_ccr_tool,
+                )
+
+                # #1850: only markers NEW this turn justify overriding the
+                # injection deferral (#1006). Markers replayed from the
+                # previously-forwarded prefix (overlay_cached_prefix) are
+                # historical — counting them would re-inject the tool on every
+                # frozen turn and bust the *tools* cache segment, undoing the
+                # overlay's messages-prefix cache-safety.
+                has_new_compressed_content = has_new_ccr_markers(
+                    current_detected_hashes=injector.detected_hashes,
+                    previous_forwarded_messages=prefix_tracker.get_last_forwarded_messages(),
+                    provider="anthropic",
+                )
 
                 should_inject, is_marker_override = should_inject_ccr_tool(
                     configured_inject_tool=configured_inject_tool,
                     frozen_message_count=frozen_message_count,
-                    has_compressed_content=injector.has_compressed_content,
+                    has_compressed_content=has_new_compressed_content,
                 )
                 if should_inject:
                     if is_marker_override:
@@ -1508,7 +1544,7 @@ class AnthropicHandlerMixin:
                         session_id=session_id,
                         request_id=request_id,
                         existing_tools=tools,
-                        has_compressed_content_this_turn=injector.has_compressed_content,
+                        has_compressed_content_this_turn=has_new_compressed_content,
                     )
                     if ccr_tool_injected:
                         logger.debug(

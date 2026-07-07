@@ -13,6 +13,7 @@ class TestAnthropicModelSanitization:
         from headroom.providers.anthropic import sanitize_anthropic_model_id
 
         assert sanitize_anthropic_model_id("claude-opus-4-8[1m]") == "claude-opus-4-8"
+        assert sanitize_anthropic_model_id("glm-5.2[1m]") == "glm-5.2"
 
     def test_sanitize_model_metadata_cleans_nested_model_ids(self):
         from headroom.providers.anthropic import sanitize_anthropic_model_metadata

@@ -7,18 +7,19 @@ effort routing on mechanical continuations, and the env-driven gate.
 from __future__ import annotations
 
 import copy
-import json
-from pathlib import Path
 from typing import Any
 
 from headroom.proxy.output_shaper import (
     LEGACY_THINKING_FLOOR,
     OutputShaperSettings,
     TurnKind,
+    apply_openai_responses_verbosity_steering,
     apply_verbosity_steering,
+    classify_openai_responses_input,
     classify_turn,
     route_effort,
-    shape_openai_chat_request,
+    route_openai_reasoning_effort,
+    route_openai_text_verbosity,
     shape_openai_responses_request,
     shape_request,
     steering_text,
@@ -288,110 +289,97 @@ class TestShapeRequest:
         assert settings.mechanical_effort == "low"
 
 
-class TestOpenAIOutputShaper:
-    def test_chat_shaper_off_does_nothing(self):
-        body = {"messages": [{"role": "user", "content": "Explain caches."}]}
-        settings = OutputShaperSettings(enabled=False)
+class TestOpenAIResponsesClassify:
+    def test_string_input_is_new_ask(self):
+        assert classify_openai_responses_input("explain this") == TurnKind.NEW_USER_ASK
 
-        result = shape_openai_chat_request(body, settings)
+    def test_function_call_output_only_is_mechanical(self):
+        input_data = [
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            }
+        ]
+        assert classify_openai_responses_input(input_data) == TurnKind.MECHANICAL_CONTINUATION
 
-        assert result.changed is False
-        assert result.labels == []
-        assert body == {"messages": [{"role": "user", "content": "Explain caches."}]}
+    def test_mixed_user_message_and_tool_output_is_new_ask(self):
+        input_data = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "also check foo.py"}],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+            },
+        ]
+        assert classify_openai_responses_input(input_data) == TurnKind.NEW_USER_ASK
 
-    def test_chat_shaper_appends_verbosity_to_system_tail(self):
-        body = {
-            "messages": [
-                {"role": "system", "content": "You are concise."},
-                {"role": "user", "content": "Explain caches."},
-            ]
-        }
 
-        result = shape_openai_chat_request(body, ENABLED)
+class TestOpenAIResponsesSteering:
+    def test_instructions_steering_is_idempotent_and_replaced(self):
+        body = {"instructions": f"System.\n\n{steering_text(1)}"}
 
-        assert result.changed is True
-        assert result.labels == ["output_shaper:verbosity:L2"]
-        assert body["messages"][0]["content"].startswith("You are concise.\n\n")
-        assert steering_text(2) in body["messages"][0]["content"]
-        assert len([m for m in body["messages"] if steering_text(2) in str(m.get("content"))]) == 1
-
-    def test_chat_shaper_is_idempotent(self):
-        body = {
-            "messages": [{"role": "system", "content": "Rules."}, {"role": "user", "content": "Hi"}]
-        }
-
-        first = shape_openai_chat_request(body, ENABLED)
-        second = shape_openai_chat_request(body, ENABLED)
-
-        assert first.changed is True
-        assert second.changed is False
-        assert str(body).count("<headroom_output_shaping>") == 1
-
-    def test_chat_level_change_replaces_existing_block(self):
-        body = {"messages": [{"role": "system", "content": f"Rules.\n\n{steering_text(2)}"}]}
-        settings = OutputShaperSettings(enabled=True, verbosity_level=4)
-
-        result = shape_openai_chat_request(body, settings)
-
-        assert result.changed is True
-        assert result.labels == ["output_shaper:verbosity:L4"]
-        assert steering_text(4) in body["messages"][0]["content"]
-        assert steering_text(2) not in body["messages"][0]["content"]
-        assert str(body).count("<headroom_output_shaping>") == 1
-
-    def test_chat_does_not_inject_effort_fields(self):
-        body = {"messages": [{"role": "user", "content": "Hi"}]}
-
-        shape_openai_chat_request(body, ENABLED)
-
-        assert "reasoning" not in body
-        assert "reasoning_effort" not in body
-        assert "output_config" not in body
-
-    def test_chat_lowers_existing_reasoning_effort_on_mechanical_turn(self):
-        body = {
-            "reasoning_effort": "high",
-            "messages": _mechanical_messages(),
-        }
-        settings = OutputShaperSettings(enabled=True, mechanical_effort="low")
-
-        result = shape_openai_chat_request(body, settings)
-
-        assert body["reasoning_effort"] == "low"
-        assert "output_shaper:openai_reasoning_effort:high->low" in result.labels
-
-    def test_responses_appends_verbosity_to_instructions(self):
-        body = {"instructions": "Be direct.", "input": "Explain caches."}
-
-        result = shape_openai_responses_request(body, ENABLED)
-
-        assert result.changed is True
-        assert result.labels == ["output_shaper:verbosity:L2"]
-        assert body["instructions"].startswith("Be direct.\n\n")
+        assert apply_openai_responses_verbosity_steering(body, 2) is True
+        assert body["instructions"].count("<headroom_output_shaping>") == 1
+        assert steering_text(1) not in body["instructions"]
         assert steering_text(2) in body["instructions"]
 
-    def test_responses_lowers_existing_reasoning_dict_effort_when_safe(self):
-        body = {
-            "instructions": "Be direct.",
-            "input": [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "tool_result", "content": "ok"}],
-                }
-            ],
-            "reasoning": {"effort": "high"},
-        }
-        settings = OutputShaperSettings(enabled=True, mechanical_effort="low")
+        snapshot = copy.deepcopy(body)
+        assert apply_openai_responses_verbosity_steering(body, 2) is False
+        assert body == snapshot
 
-        result = shape_openai_responses_request(body, settings)
 
+class TestOpenAIResponsesReasoning:
+    def test_reasoning_effort_lowers_only_for_mechanical_continuations(self):
+        body = {"reasoning": {"effort": "xhigh"}}
+        labels = route_openai_reasoning_effort(
+            body,
+            TurnKind.MECHANICAL_CONTINUATION,
+            ENABLED,
+        )
+        assert labels == ["output_shaper:reasoning_effort:xhigh->low"]
         assert body["reasoning"]["effort"] == "low"
-        assert "output_shaper:openai_reasoning_effort:high->low" in result.labels
 
-    def test_responses_lowers_effort_for_top_level_tool_outputs(self):
+        new_ask = {"reasoning": {"effort": "xhigh"}}
+        assert route_openai_reasoning_effort(new_ask, TurnKind.NEW_USER_ASK, ENABLED) == []
+        assert new_ask["reasoning"]["effort"] == "xhigh"
+
+    def test_reasoning_effort_is_not_injected_when_absent(self):
+        body: dict[str, Any] = {}
+        labels = route_openai_reasoning_effort(
+            body,
+            TurnKind.MECHANICAL_CONTINUATION,
+            ENABLED,
+        )
+        assert labels == []
+        assert "reasoning" not in body
+
+
+class TestOpenAIResponsesTextVerbosity:
+    def test_text_verbosity_set_for_gpt5_family(self):
+        body = {"model": "gpt-5.1"}
+        labels = route_openai_text_verbosity(body)
+        assert labels == ["output_shaper:text_verbosity:unset->low"]
+        assert body["text"] == {"verbosity": "low"}
+
+    def test_text_verbosity_not_injected_for_non_gpt5(self):
+        body = {"model": "gpt-4o"}
+        assert route_openai_text_verbosity(body) == []
+        assert "text" not in body
+
+    def test_existing_text_verbosity_is_lowered_for_any_model(self):
+        body = {"model": "gpt-4o", "text": {"verbosity": "medium"}}
+        labels = route_openai_text_verbosity(body)
+        assert labels == ["output_shaper:text_verbosity:medium->low"]
+        assert body["text"]["verbosity"] == "low"
+
+    def test_shape_openai_responses_combines_steering_native_knobs(self):
         body = {
-            "instructions": "Be direct.",
+            "model": "gpt-5",
             "input": [
                 {
                     "type": "function_call_output",
@@ -399,165 +387,18 @@ class TestOpenAIOutputShaper:
                     "output": "ok",
                 }
             ],
-            "reasoning": {"effort": "high"},
+            "instructions": "System.",
+            "reasoning": {"effort": "xhigh"},
+            "text": {"verbosity": "medium"},
         }
-        settings = OutputShaperSettings(enabled=True, mechanical_effort="low")
+        result = shape_openai_responses_request(body, ENABLED)
 
-        result = shape_openai_responses_request(body, settings)
-
+        assert result.changed is True
+        assert result.labels == [
+            "output_shaper:verbosity:L2",
+            "output_shaper:reasoning_effort:xhigh->low",
+            "output_shaper:text_verbosity:medium->low",
+        ]
+        assert steering_text(2) in body["instructions"]
         assert body["reasoning"]["effort"] == "low"
-        assert "output_shaper:openai_reasoning_effort:high->low" in result.labels
-
-    def test_codex_ws_nested_response_shape_serializes(self):
-        frame = {
-            "type": "response.create",
-            "response": {
-                "instructions": "Follow project rules.",
-                "input": "Fix failing test.",
-            },
-        }
-
-        result = shape_openai_responses_request(frame, ENABLED)
-
-        assert result.changed is True
-        assert steering_text(2) in frame["response"]["instructions"]
-        assert isinstance(__import__("json").dumps(frame), str)
-
-    def test_codex_ws_top_level_response_create_shape_serializes(self):
-        frame = {
-            "type": "response.create",
-            "model": "gpt-5.3-codex-spark",
-            "instructions": "Follow project rules.",
-            "input": "Fix failing test.",
-        }
-
-        result = shape_openai_responses_request(frame, ENABLED)
-
-        assert result.changed is True
-        assert result.decision == "applied"
-        assert result.labels == ["output_shaper:verbosity:L2"]
-        assert steering_text(2) in frame["instructions"]
-        assert isinstance(__import__("json").dumps(frame), str)
-
-
-def test_openai_responses_shaper_reports_disabled_decision() -> None:
-    body = {"model": "gpt-5", "instructions": "Rules.", "input": "Hello"}
-
-    result = shape_openai_responses_request(body, OutputShaperSettings(enabled=False))
-
-    assert result.changed is False
-    assert result.labels == []
-    assert result.decision == "skipped_disabled"
-    assert body == {"model": "gpt-5", "instructions": "Rules.", "input": "Hello"}
-
-
-def test_openai_responses_shaper_reports_applied_decision() -> None:
-    body = {"model": "gpt-5", "instructions": "Rules.", "input": "Hello"}
-
-    result = shape_openai_responses_request(body, OutputShaperSettings(enabled=True))
-
-    assert result.changed is True
-    assert result.decision == "applied"
-    assert result.labels == ["output_shaper:verbosity:L2"]
-    assert str(body["instructions"]).count("<headroom_output_shaping>") == 1
-
-
-def test_openai_responses_shaper_reports_already_shaped_decision() -> None:
-    body = {"model": "gpt-5", "instructions": steering_text(2), "input": "Hello"}
-
-    result = shape_openai_responses_request(body, OutputShaperSettings(enabled=True))
-
-    assert result.changed is False
-    assert result.labels == []
-    assert result.decision == "skipped_already_shaped"
-    assert body["instructions"] == steering_text(2)
-
-
-def test_openai_responses_shaper_reports_unsupported_shape_decision() -> None:
-    body = {
-        "model": "gpt-5",
-        "input": "Hello",
-        "instructions": [{"type": "text", "text": "Rules."}],
-    }
-
-    result = shape_openai_responses_request(body, OutputShaperSettings(enabled=True))
-
-    assert result.changed is False
-    assert result.labels == []
-    assert result.decision == "skipped_no_supported_request_shape"
-    assert body["instructions"] == [{"type": "text", "text": "Rules."}]
-
-
-def test_openai_responses_shaper_reports_level_zero_decision() -> None:
-    body = {"model": "gpt-5", "instructions": "Rules.", "input": "Hello"}
-
-    result = shape_openai_responses_request(
-        body,
-        OutputShaperSettings(enabled=True, verbosity_level=0),
-    )
-
-    assert result.changed is False
-    assert result.labels == []
-    assert result.decision == "skipped_level_zero"
-    assert body == {"model": "gpt-5", "instructions": "Rules.", "input": "Hello"}
-
-
-def test_openai_responses_shaper_does_not_mutate_reasoning_effort_field() -> None:
-    body = {
-        "model": "gpt-5",
-        "instructions": "Rules.",
-        "input": [
-            {
-                "type": "function_call_output",
-                "call_id": "call_1",
-                "output": "ok",
-            }
-        ],
-        "reasoning_effort": "high",
-    }
-
-    result = shape_openai_responses_request(
-        body,
-        OutputShaperSettings(enabled=True, mechanical_effort="low"),
-    )
-
-    assert result.decision == "applied"
-    assert body["reasoning_effort"] == "high"
-    assert not any("reasoning_effort" in label for label in result.labels)
-
-
-def test_openai_responses_shaper_lowers_supported_reasoning_effort() -> None:
-    body = {
-        "model": "gpt-5",
-        "instructions": "Rules.",
-        "input": [
-            {
-                "type": "function_call_output",
-                "call_id": "call_1",
-                "output": "ok",
-            }
-        ],
-        "reasoning": {"effort": "high"},
-    }
-
-    result = shape_openai_responses_request(
-        body,
-        OutputShaperSettings(enabled=True, mechanical_effort="low"),
-    )
-
-    assert result.decision == "applied"
-    assert body["reasoning"] == {"effort": "low"}
-    assert "output_shaper:openai_reasoning_effort:high->low" in result.labels
-
-
-def test_codex_ws_response_create_fixture_is_shaped() -> None:
-    frame = json.loads(Path("scripts/fixtures/codex_response_create_frame.json").read_text())
-
-    result = shape_openai_responses_request(frame, OutputShaperSettings(enabled=True))
-
-    assert result.decision == "applied"
-    assert result.labels == ["output_shaper:verbosity:L2"]
-    assert steering_text(2) in frame["response"]["instructions"]
-    assert "<headroom_output_shaping>" not in json.dumps(
-        {k: v for k, v in frame.items() if k != "response"}
-    )
+        assert body["text"]["verbosity"] == "low"

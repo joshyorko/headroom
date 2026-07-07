@@ -250,7 +250,12 @@ class TestWorkerConfiguration:
         from headroom.proxy.server import _MULTI_WORKER_CONFIG_ENV, run_server
 
         captured = {}
-        config = ProxyConfig(host="0.0.0.0", port=8787, max_connections=200)
+        config = ProxyConfig(
+            host="0.0.0.0",
+            port=8787,
+            max_connections=200,
+            http_proxy="http://proxy.local:8080",
+        )
 
         def fake_run(app, **kwargs):
             captured["app"] = app
@@ -270,9 +275,71 @@ class TestWorkerConfiguration:
             assert payload["host"] == "0.0.0.0"
             assert payload["port"] == 8787
             assert payload["max_connections"] == 200
+            assert payload["http_proxy"] == "http://proxy.local:8080"
         finally:
             # run_server sets this via raw os.environ. Pop it directly rather
             # than via monkeypatch.delenv: delenv records the current (JSON)
             # value and re-restores it on teardown, leaking the config into
             # later tests (e.g. _proxy_config_from_env then ignores HEADROOM_*).
             os.environ.pop(_MULTI_WORKER_CONFIG_ENV, None)
+
+    def test_run_server_uses_selector_loop_on_windows(self, monkeypatch):
+        from headroom.proxy import server as server_mod
+        from headroom.proxy.models import ProxyConfig
+
+        captured = {}
+
+        def fake_run(app, **kwargs):
+            captured["app"] = app
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(server_mod.sys, "platform", "win32")
+        monkeypatch.setattr(server_mod, "create_app", lambda config: "app")
+
+        with patch("headroom.proxy.server.uvicorn.run", fake_run):
+            server_mod.run_server(ProxyConfig(), print_banner=False)
+
+        assert captured["app"] == "app"
+        assert captured["kwargs"]["loop"] == "asyncio:SelectorEventLoop"
+
+    def test_run_server_keeps_default_loop_off_windows(self, monkeypatch):
+        from headroom.proxy import server as server_mod
+        from headroom.proxy.models import ProxyConfig
+
+        captured = {}
+
+        def fake_run(app, **kwargs):
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(server_mod.sys, "platform", "linux")
+        monkeypatch.setattr(server_mod, "create_app", lambda config: "app")
+
+        with patch("headroom.proxy.server.uvicorn.run", fake_run):
+            server_mod.run_server(ProxyConfig(), print_banner=False)
+
+        assert "loop" not in captured["kwargs"]
+
+
+class TestProviderHttpClientOptions:
+    """Provider HTTPX options should keep proxy settings scoped to provider clients."""
+
+    def test_default_http2_preserved_without_proxy(self):
+        from headroom.proxy.models import ProxyConfig
+        from headroom.proxy.server import _provider_httpx_client_options
+
+        http2, kwargs = _provider_httpx_client_options(ProxyConfig(http2=True), verify=True)
+
+        assert http2 is True
+        assert "proxy" not in kwargs
+
+    def test_http_proxy_sets_proxy_and_forces_http1(self):
+        from headroom.proxy.models import ProxyConfig
+        from headroom.proxy.server import _provider_httpx_client_options
+
+        http2, kwargs = _provider_httpx_client_options(
+            ProxyConfig(http2=True, http_proxy="http://proxy.local:8080"),
+            verify=True,
+        )
+
+        assert http2 is False
+        assert kwargs["proxy"] == "http://proxy.local:8080"

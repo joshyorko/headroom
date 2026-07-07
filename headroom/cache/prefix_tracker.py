@@ -112,6 +112,52 @@ class CacheMissAttribution:
     ttl_exceeded: bool = False
 
 
+def overlay_cached_prefix(
+    optimized_messages: list[dict[str, Any]],
+    current_original_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]] | None,
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Replay the previously-forwarded (cached, compressed) prefix byte-identical.
+
+    Provider-agnostic cache-safety guard for the freeze path. When a message is
+    "frozen", the compression pipeline may emit the agent's ORIGINAL bytes for
+    it — but the provider cached whatever we FORWARDED last turn (the compressed
+    form). Forwarding the original then mismatches the cached prefix and busts
+    the prompt cache from that point (100% of observed misses were this
+    ``prefix_change``). This overlays the exact previously-forwarded prefix onto
+    the corresponding leading messages so the forwarded prefix stays byte-for-byte
+    what the provider hashed for its cache key.
+
+    Safe only when this turn append-only-extends the previous turn (the standard
+    growing-conversation shape): the previous ORIGINAL messages must be an exact
+    prefix of the current ORIGINAL messages, and there is exactly one forwarded
+    message per original. Otherwise the previous forwarded bytes may not
+    correspond to the same positions, so we return ``optimized_messages``
+    unchanged (accept a possible bust rather than forward wrong content).
+
+    This makes freezing byte-identical in BOTH proxy modes, so the only remaining
+    difference between them is how large a mutable (still-compressible) tail each
+    leaves — not whether the frozen prefix busts the cache.
+    """
+    prev_orig = previous_original_messages
+    prev_fwd = previous_forwarded_messages
+    if not prev_orig or not prev_fwd:
+        return optimized_messages
+    n = len(prev_orig)
+    # One forwarded message per original, and the frozen prefix must fit within
+    # both the current originals and this turn's optimized output.
+    if len(prev_fwd) != n:
+        return optimized_messages
+    if len(current_original_messages) < n or len(optimized_messages) < n:
+        return optimized_messages
+    # Append-only guard: the frozen region must be the same messages we cached.
+    if current_original_messages[:n] != prev_orig:
+        return optimized_messages
+    # Replay the cached (compressed) prefix; keep this turn's compressed tail.
+    return list(prev_fwd) + list(optimized_messages[n:])
+
+
 class PrefixCacheTracker:
     """Tracks provider prefix cache state across turns in a session.
 

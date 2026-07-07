@@ -81,6 +81,7 @@ _OPENAI_CHAT_COMPLETIONS_PATH = "/chat/completions"
 _OPENAI_RESPONSES_PATH = "/responses"
 _OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
 _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
+_OPENROUTER_MODEL_PREFIX = "openrouter/"
 
 
 def _header_get(headers: dict[str, str], name: str) -> str | None:
@@ -128,6 +129,51 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
     if urlparse(normalized).scheme not in {"http", "https"}:
         return None
     return normalized
+
+
+def _is_openrouter_model(model: Any) -> bool:
+    return isinstance(model, str) and model.strip().lower().startswith(_OPENROUTER_MODEL_PREFIX)
+
+
+def _select_openai_chat_backend(proxy: Any, model: Any) -> Any | None:
+    """Return the translated backend that should handle an OpenAI chat request."""
+    if not _is_openrouter_model(model):
+        return proxy.anthropic_backend
+
+    cache = getattr(proxy, "_openai_model_prefix_backends", None)
+    if cache is None:
+        cache = {}
+        setattr(proxy, "_openai_model_prefix_backends", cache)
+
+    backend_name = "openrouter"
+    if backend_name not in cache:
+        from headroom.providers import registry as provider_registry
+
+        cache[backend_name] = provider_registry.create_proxy_backend(
+            backend=backend_name,
+            anyllm_provider=getattr(proxy.config, "anyllm_provider", "openai"),
+            bedrock_region=getattr(proxy.config, "bedrock_region", None),
+            bedrock_profile=getattr(proxy.config, "bedrock_profile", None),
+            logger=logger,
+            openai_api_url=getattr(proxy.config, "openai_api_url", None),
+        )
+    return cache[backend_name]
+
+
+def _openai_chat_backend_headers(
+    headers: dict[str, str],
+    *,
+    model: Any,
+    client: str | None,
+) -> dict[str, str]:
+    """Headers sent to translated chat backends."""
+    if client == "hermes" and _is_openrouter_model(model):
+        return {
+            key: value
+            for key, value in headers.items()
+            if key.lower() not in {"authorization", "x-api-key"}
+        }
+    return headers
 
 
 def _append_request_query(url: str, query: str) -> str:
@@ -2546,8 +2592,12 @@ class OpenAIHandlerMixin:
         optimized_tokens = tokenizer.count_messages(body["messages"])
         tokens_saved = original_tokens - optimized_tokens
 
-        # Route through LiteLLM/any-llm backend if configured
-        if self.anthropic_backend is not None:
+        # Route through LiteLLM/any-llm backend if configured. Provider-prefixed
+        # OpenAI-compatible models can select a backend even when the default
+        # proxy backend is direct Anthropic/OpenAI.
+        chat_backend = _select_openai_chat_backend(self, model)
+        backend_headers = _openai_chat_backend_headers(headers, model=model, client=client)
+        if chat_backend is not None:
             try:
                 if stream:
                     self.pipeline_extensions.emit(
@@ -2563,7 +2613,7 @@ class OpenAIHandlerMixin:
                     # Streaming: use stream_openai_message() → SSE events
                     return await self._stream_openai_via_backend(
                         body,
-                        headers,
+                        backend_headers,
                         model,
                         request_id,
                         start_time,
@@ -2577,12 +2627,11 @@ class OpenAIHandlerMixin:
                         waste_signals=waste_signals_dict,
                         prefix_tracker=openai_prefix_tracker,
                         optimized_messages=optimized_messages,
+                        backend=chat_backend,
                     )
                 else:
                     # Non-streaming: use send_openai_message() → JSON
-                    backend_response = await self.anthropic_backend.send_openai_message(
-                        body, headers
-                    )
+                    backend_response = await chat_backend.send_openai_message(body, backend_headers)
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,
                         operation="proxy.request",
@@ -2641,7 +2690,7 @@ class OpenAIHandlerMixin:
                     ):
                         logger.info(
                             f"[{request_id}] CCR: Detected retrieval tool call "
-                            f"on backend path, handling via {self.anthropic_backend.name}"
+                            f"on backend path, handling via {chat_backend.name}"
                         )
 
                         # Continuation closure — delegates transport to
@@ -2658,7 +2707,7 @@ class OpenAIHandlerMixin:
 
                             continuation_headers = {
                                 k: v
-                                for k, v in headers.items()
+                                for k, v in backend_headers.items()
                                 if k.lower()
                                 not in (
                                     "content-encoding",
@@ -2668,13 +2717,12 @@ class OpenAIHandlerMixin:
                                 )
                             }
 
-                            assert self.anthropic_backend is not None
                             logger.info(
                                 f"[{request_id}] CCR: Issuing continuation via "
-                                f"{self.anthropic_backend.name} backend "
+                                f"{chat_backend.name} backend "
                                 f"({len(msgs)} messages)"
                             )
-                            cont_resp = await self.anthropic_backend.send_openai_message(
+                            cont_resp = await chat_backend.send_openai_message(
                                 continuation_body, continuation_headers
                             )
                             return cont_resp.body
@@ -2741,7 +2789,7 @@ class OpenAIHandlerMixin:
                     await self._record_request_outcome(
                         RequestOutcome(
                             request_id=request_id,
-                            provider=self.anthropic_backend.name,
+                            provider=chat_backend.name,
                             model=model,
                             original_tokens=original_tokens,
                             optimized_tokens=total_input_tokens,
@@ -2765,7 +2813,7 @@ class OpenAIHandlerMixin:
                     if tokens_saved > 0:
                         logger.info(
                             f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
-                            f"(saved {tokens_saved:,} tokens) via {self.anthropic_backend.name}"
+                            f"(saved {tokens_saved:,} tokens) via {chat_backend.name}"
                         )
 
                     return JSONResponse(

@@ -155,6 +155,7 @@ from headroom.proxy.probe_recorder import probe_recorder_from_env
 from headroom.proxy.project_context import (
     classify_project,
     set_current_project,
+    strip_client_path_prefix,
     strip_project_path_prefix,
 )
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
@@ -2581,11 +2582,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def _record_headroom_stack(request, call_next):
         started = time.perf_counter()
         inbound_id = f"inbound-{time.time_ns()}"
-        # Project attribution: an explicit X-Headroom-Project header wins
-        # (claude/codex wraps); otherwise a /p/<name> base-URL prefix (aider,
-        # Copilot BYOK, Cursor — clients that cannot send custom headers).
+        # Client/project attribution: path prefixes cover clients that cannot
+        # send custom headers. Strip /c/<client> before /p/<project> so combined
+        # prefixes like /c/hermes/p/headroom/v1/... reach the canonical routes.
         # The prefix strip mutates the scope, so it must happen before
         # request.url is first accessed (Starlette caches the URL).
+        prefix_client = strip_client_path_prefix(request.scope)
+        if prefix_client is not None:
+            request.scope["headers"].append((b"x-headroom-client", prefix_client.encode()))
         prefix_project = strip_project_path_prefix(request.scope)
         path = request.url.path
         method = request.method

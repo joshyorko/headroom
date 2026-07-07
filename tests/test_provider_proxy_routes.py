@@ -9,6 +9,7 @@ import httpx
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+from headroom.proxy.project_context import get_current_project
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
 
@@ -25,6 +26,34 @@ def _app() -> Any:
             vertex_api_url="https://vertex.test",
         )
     )
+
+
+def test_client_and_project_prefixes_reach_openai_chat_handler(monkeypatch) -> None:
+    async def fake_handle(self, request):  # type: ignore[no-untyped-def]
+        return JSONResponse(
+            {
+                "path": request.url.path,
+                "client": request.headers.get("x-client"),
+                "headroom_client": request.headers.get("x-headroom-client"),
+                "project": get_current_project(),
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_chat", fake_handle)
+
+    with TestClient(_app()) as client:
+        response = client.post(
+            "/c/hermes/p/headroom/v1/chat/completions",
+            json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "ok"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "path": "/v1/chat/completions",
+        "client": None,
+        "headroom_client": "hermes",
+        "project": "headroom",
+    }
 
 
 def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> None:

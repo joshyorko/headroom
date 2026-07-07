@@ -44,7 +44,7 @@ servers:
       --mode token
       --target-ratio <%= headroom_target_ratio %>
       --memory
-      --memory-backend qdrant-neo4j
+      --memory-storage project
       --memory-db-path /home/nonroot/.headroom/memory.db
       --memory-project-root /home/nonroot
       --memory-top-k <%= headroom_memory_top_k %>

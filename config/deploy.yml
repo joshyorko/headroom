@@ -15,6 +15,17 @@ headroom_min_evidence = ENV.fetch("HEADROOM_MIN_EVIDENCE", "3")
 headroom_memory_context_timeout_seconds = ENV.fetch("HEADROOM_MEMORY_CONTEXT_TIMEOUT_SECONDS", "1.0")
 headroom_compression_max_workers = ENV.fetch("HEADROOM_COMPRESSION_MAX_WORKERS", "16")
 headroom_tool_output_compression_parallelism = ENV.fetch("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "8")
+headroom_lossless = ENV.fetch("HEADROOM_LOSSLESS", "1")
+headroom_dedupe = ENV.fetch("HEADROOM_DEDUPE", "1")
+headroom_lossless_then_lossy = ENV.fetch("HEADROOM_LOSSLESS_THEN_LOSSY", "0")
+headroom_disable_kompress = ENV.fetch("HEADROOM_DISABLE_KOMPRESS", "1")
+headroom_disable_kompress_fallback = ENV.fetch("HEADROOM_DISABLE_KOMPRESS_FALLBACK", "1")
+headroom_disable_kompress_anthropic = ENV.fetch("HEADROOM_DISABLE_KOMPRESS_ANTHROPIC", "1")
+headroom_disable_kompress_openai = ENV.fetch("HEADROOM_DISABLE_KOMPRESS_OPENAI", "1")
+headroom_debug_dump = ENV.fetch("HEADROOM_DEBUG_DUMP", "off")
+headroom_ws_origins = ENV.fetch("HEADROOM_WS_ORIGINS", "")
+headroom_ws_fail_open_on_compression_failure = ENV.fetch("HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE", "0")
+headroom_offline = ENV.fetch("HEADROOM_OFFLINE", "0")
 headroom_verbosity_level = ENV.fetch("HEADROOM_VERBOSITY_LEVEL", "").strip
 kamal_image = ENV.fetch("KAMAL_IMAGE", "joshyorko/headroom")
 kamal_registry_server = ENV.fetch("KAMAL_REGISTRY_SERVER", "ghcr.io")
@@ -90,10 +101,13 @@ env:
     HEADROOM_WORKSPACE_DIR: /home/nonroot/.headroom
     HEADROOM_CONFIG_DIR: /home/nonroot/.headroom/config
     HEADROOM_TARGET_RATIO: "<%= headroom_target_ratio %>"
-    HEADROOM_DISABLE_KOMPRESS: "0"
-    HEADROOM_DISABLE_KOMPRESS_FALLBACK: "0"
-    HEADROOM_DISABLE_KOMPRESS_ANTHROPIC: "1"
-    HEADROOM_DISABLE_KOMPRESS_OPENAI: "0"
+    HEADROOM_LOSSLESS: "<%= headroom_lossless %>"
+    HEADROOM_DEDUPE: "<%= headroom_dedupe %>"
+    HEADROOM_LOSSLESS_THEN_LOSSY: "<%= headroom_lossless_then_lossy %>"
+    HEADROOM_DISABLE_KOMPRESS: "<%= headroom_disable_kompress %>"
+    HEADROOM_DISABLE_KOMPRESS_FALLBACK: "<%= headroom_disable_kompress_fallback %>"
+    HEADROOM_DISABLE_KOMPRESS_ANTHROPIC: "<%= headroom_disable_kompress_anthropic %>"
+    HEADROOM_DISABLE_KOMPRESS_OPENAI: "<%= headroom_disable_kompress_openai %>"
     HEADROOM_KOMPRESS_MAX_TOKENS: "50000"
     HEADROOM_TEXT_CRUSHER: "1"
     HEADROOM_COMPRESSION_DEADLINE_MS: "12000"
@@ -119,6 +133,10 @@ env:
     HEADROOM_EFFORT_ROUTER: "0"
     HEADROOM_MECHANICAL_EFFORT: low
     HEADROOM_LOG_MESSAGES: "0"
+    HEADROOM_DEBUG_DUMP: "<%= headroom_debug_dump %>"
+    HEADROOM_WS_ORIGINS: "<%= headroom_ws_origins %>"
+    HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE: "<%= headroom_ws_fail_open_on_compression_failure %>"
+    HEADROOM_OFFLINE: "<%= headroom_offline %>"
 
 volumes:
   - "<%= kamal_storage_path %>/state:/home/nonroot/.headroom"

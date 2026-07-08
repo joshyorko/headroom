@@ -130,11 +130,13 @@ from headroom.proxy.helpers import (
     MAX_REQUEST_BODY_SIZE,  # noqa: F401
     MAX_SSE_BUFFER_SIZE,  # noqa: F401
     RETRYABLE_OVERLOAD_STATUSES,
+    _get_context_tool_reported_project_stats,
     _get_context_tool_stats,
     _get_image_compressor,  # noqa: F401
     _get_rtk_stats,  # noqa: F401
     _read_request_json,  # noqa: F401
     _setup_file_logging,  # noqa: F401
+    ingest_context_tool_stats,
     initialize_context_tool_session_baseline,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
@@ -2945,6 +2947,59 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "recent_requests": dashboard_recent_requests,
         }
 
+    def _project_name_from_cwd(cwd: Any) -> str | None:
+        if not isinstance(cwd, str) or not cwd.strip():
+            return None
+        clean = cwd.rstrip("/\\")
+        if not clean:
+            return None
+        return clean.replace("\\", "/").rsplit("/", 1)[-1] or None
+
+    def _merge_context_tool_project_savings(
+        projects: dict[str, Any],
+        context_tool_stats: dict[str, Any] | None,
+        reported_project_stats: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        merged = dict(projects)
+
+        def merge_snapshot(snapshot: dict[str, Any]) -> None:
+            if snapshot.get("scope") != "project":
+                return
+            project = str(snapshot.get("project") or "").strip() or _project_name_from_cwd(
+                snapshot.get("cwd")
+            )
+            if not project:
+                return
+            tokens_saved = int(snapshot.get("tokens_saved", 0) or 0)
+            commands = int(snapshot.get("total_commands", 0) or 0)
+            input_tokens = int(snapshot.get("input_tokens", 0) or 0)
+            existing = dict(merged.get(project, {}))
+            existing["requests"] = max(int(existing.get("requests", 0) or 0), commands)
+            existing["tokens_saved"] = max(int(existing.get("tokens_saved", 0) or 0), tokens_saved)
+            existing["rtk_tokens_saved"] = tokens_saved
+            existing["rtk_commands"] = commands
+            existing["total_input_tokens"] = max(
+                int(existing.get("total_input_tokens", 0) or 0), input_tokens
+            )
+            if input_tokens:
+                existing["savings_percent"] = round((tokens_saved / input_tokens) * 100, 2)
+            existing.setdefault("compression_savings_usd", 0.0)
+            existing.setdefault("total_input_cost_usd", 0.0)
+            reported_at = snapshot.get("reported_at")
+            if reported_at:
+                existing["last_activity_at"] = datetime.fromtimestamp(
+                    float(reported_at), tz=timezone.utc
+                ).isoformat()
+            merged[project] = existing
+
+        if reported_project_stats:
+            for snapshot in reported_project_stats.values():
+                if isinstance(snapshot, dict):
+                    merge_snapshot(snapshot)
+        elif isinstance(context_tool_stats, dict):
+            merge_snapshot(context_tool_stats)
+        return merged
+
     async def _build_stats_payload() -> dict[str, Any]:
         """Build the full `/stats` response payload.
 
@@ -3029,6 +3084,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Fetch CLI filtering savings from the selected context tool. These
         # tokens are avoided before they reach model context.
         cli_filtering_stats = await asyncio.to_thread(_get_context_tool_stats)
+        cli_filtering_project_stats = await asyncio.to_thread(
+            _get_context_tool_reported_project_stats
+        )
         cli_filtering_tool = (
             str(cli_filtering_stats.get("tool", "rtk")) if cli_filtering_stats else "rtk"
         )
@@ -3043,6 +3101,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         cli_filtering_lifetime = (
             cli_filtering_stats.get("lifetime", {}) if cli_filtering_stats else {}
+        )
+        cli_filtering_baseline = (
+            cli_filtering_stats.get("baseline", {}) if cli_filtering_stats else {}
         )
         rtk_tokens_avoided = cli_tokens_avoided if cli_filtering_tool == "rtk" else 0
         lean_ctx_tokens_avoided = cli_tokens_avoided if cli_filtering_tool == "lean-ctx" else 0
@@ -3155,7 +3216,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "agent_usage": agent_usage,
             "savings": {
                 "total_tokens": total_tokens_all_layers,
-                "per_project": persistent_savings.get("projects", {}),
+                "per_project": _merge_context_tool_project_savings(
+                    persistent_savings.get("projects", {}),
+                    cli_filtering_stats,
+                    cli_filtering_project_stats,
+                ),
                 "by_layer": {
                     "cli_filtering": {
                         "tool": cli_filtering_tool,
@@ -3164,6 +3229,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         "tokens_saved": cli_tokens_avoided,
                         "session": cli_filtering_session,
                         "lifetime": cli_filtering_lifetime,
+                        "baseline": cli_filtering_baseline,
+                        "session_delta_available": (
+                            cli_filtering_stats.get("session_delta_available")
+                            if cli_filtering_stats
+                            else None
+                        ),
+                        "session_delta_unavailable_reason": (
+                            cli_filtering_stats.get("session_delta_unavailable_reason")
+                            if cli_filtering_stats
+                            else None
+                        ),
                         "session_savings_pct": (
                             cli_filtering_stats.get("session_savings_pct")
                             if cli_filtering_stats
@@ -3530,6 +3606,28 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             payload.pop("recent_requests", None)
             payload.pop("request_logs", None)
         return payload
+
+    @app.post("/stats/context-tool")
+    async def report_context_tool_stats(request: Request):
+        """Accept aggregate context-tool counters from a remote workstation."""
+
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            raise HTTPException(status_code=400, detail="invalid JSON body") from None
+        try:
+            stats_payload = ingest_context_tool_stats(
+                body,
+                source=request.client.host if request.client else "unknown",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        async with _stats_snapshot_lock:
+            _stats_snapshot["value"] = None
+            _stats_snapshot["expires_at"] = 0.0
+
+        return {"ok": True, "context_tool": stats_payload}
 
     @app.post("/stats/reset", dependencies=[Depends(_require_loopback)])
     async def stats_reset():

@@ -6,6 +6,10 @@ needing API key access.
 """
 
 import json
+import os
+import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +21,16 @@ from .main import main
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 MCP_CONFIG_PATH = CLAUDE_CONFIG_DIR / "mcp.json"
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
+
+_RTK_GAIN_SCOPES = {"global", "project"}
+
+
+def _rtk_gain_command(rtk_path: Path, scope: str) -> list[str]:
+    command = [str(rtk_path), "gain"]
+    if scope == "project":
+        command.append("--project")
+    command.extend(["--format", "json"])
+    return command
 
 
 def get_headroom_command() -> list[str]:
@@ -85,6 +99,97 @@ def mcp() -> None:
     bare tool name `headroom_retrieve`.
     """
     pass
+
+
+@mcp.command("report-rtk")
+@click.option(
+    "--proxy-url",
+    default=None,
+    envvar="HEADROOM_PROXY_URL",
+    help=f"Headroom proxy URL (default: {DEFAULT_PROXY_URL})",
+)
+@click.option(
+    "--scope",
+    type=click.Choice(sorted(_RTK_GAIN_SCOPES)),
+    default="project",
+    show_default=True,
+    help="RTK gain scope to report. Project scope uses the current directory.",
+)
+@click.option(
+    "--timeout",
+    type=float,
+    default=5.0,
+    show_default=True,
+    help="Timeout in seconds for RTK and proxy calls.",
+)
+def mcp_report_rtk(proxy_url: str | None, scope: str, timeout: float) -> None:
+    """Report local RTK aggregate counters to a remote Headroom proxy."""
+    from headroom.rtk import get_rtk_path
+
+    rtk_path = get_rtk_path()
+    if rtk_path is None:
+        click.echo("Error: rtk is not installed or not on PATH.", err=True)
+        raise SystemExit(1)
+
+    try:
+        result = subprocess.run(
+            _rtk_gain_command(rtk_path, scope),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        click.echo("Error: timed out reading rtk gain stats.", err=True)
+        raise SystemExit(1) from None
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        click.echo(f"Error: rtk gain failed: {stderr}", err=True)
+        raise SystemExit(1)
+
+    try:
+        gain_payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        click.echo(f"Error: rtk gain returned invalid JSON: {exc}", err=True)
+        raise SystemExit(1) from exc
+    if not isinstance(gain_payload, dict):
+        click.echo("Error: rtk gain returned a non-object JSON payload.", err=True)
+        raise SystemExit(1)
+
+    target_base = (proxy_url or DEFAULT_PROXY_URL).rstrip("/")
+    payload = {
+        "tool": "rtk",
+        "scope": scope,
+        "installed": True,
+        "summary": gain_payload.get("summary", gain_payload),
+        "cwd": os.getcwd(),
+    }
+    url = f"{target_base}/stats/context-tool"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.URLError as exc:
+        click.echo(f"Error: failed to report RTK stats to {url}: {exc}", err=True)
+        raise SystemExit(1) from exc
+
+    try:
+        response_payload = json.loads(raw)
+    except json.JSONDecodeError:
+        response_payload = {}
+
+    context_tool = response_payload.get("context_tool", {})
+    tokens_saved = int(context_tool.get("tokens_saved", 0) or 0)
+    commands = int(context_tool.get("total_commands", 0) or 0)
+    click.echo(
+        f"Reported RTK stats to {target_base} ({scope}): "
+        f"{tokens_saved:,} tokens saved across {commands:,} commands."
+    )
 
 
 @mcp.command("install")

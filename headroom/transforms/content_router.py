@@ -4360,14 +4360,16 @@ class ContentRouter(Transform):
         # Role-based gate for `text` blocks. Tool/function roles are tool
         # outputs and compress freely; assistant defaults to skip (cache
         # safety) with explicit opt-in; unknown roles default to skip.
-        if (skip_user and role == "user") or (skip_system and role in {"system", "developer"}):
-            protect_text_blocks = True
-        elif role == "assistant" and not compress_assistant_text_blocks:
-            protect_text_blocks = True
-        elif role not in ("assistant", "tool", "function"):
-            protect_text_blocks = True
-        else:
+        if role == "user":
+            protect_text_blocks = skip_user
+        elif role in {"system", "developer"}:
+            protect_text_blocks = skip_system
+        elif role == "assistant":
+            protect_text_blocks = not compress_assistant_text_blocks
+        elif role in ("tool", "function"):
             protect_text_blocks = False
+        else:
+            protect_text_blocks = True
 
         for block in content_blocks:
             if not isinstance(block, dict):

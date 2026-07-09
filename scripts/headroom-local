@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/headroom-local <command>
+
+
+Commands:
+  up        Build and start the local Headroom Compose stack
+  down      Stop the stack without deleting named volumes
+  restart   Recreate headroom-proxy so .env and Compose changes take effect
+  logs      Follow headroom-proxy logs
+  status    Check readyz and stats on 127.0.0.1:8787
+  perf      Run headroom perf inside the proxy container
+  shell     Open a shell inside the proxy container
+  check-profile
+            Validate the rendered local Compose profile
+  doctor    Print local setup checks
+USAGE
+}
+
+
+need() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "error: required command not found: $1" >&2
+    exit 1
+  fi
+}
+
+
+compose() {
+  docker compose "$@"
+}
+
+
+proxy_url() {
+  printf 'http://127.0.0.1:%s' "${HEADROOM_PORT:-8787}"
+}
+
+
+json_pretty() {
+  if command -v jq >/dev/null 2>&1; then
+    jq "$@"
+  else
+    cat
+  fi
+}
+
+
+curl_json() {
+  local path="$1"
+  curl --fail --silent --show-error "$(proxy_url)${path}"
+}
+
+
+status() {
+  local base
+  base="$(proxy_url)"
+
+
+  echo "readyz: ${base}/readyz"
+  curl_json /readyz | json_pretty .
+  echo
+
+
+  echo "stats: ${base}/stats"
+  curl_json /stats | json_pretty '{
+    requests_total: (.requests_total 
+// .total_requests // null),
+
+    tokens_in: (.tokens_in 
+// .tokens_input_total // .total_input_tokens // null),
+
+    tokens_saved: (.tokens_saved 
+// .tokens_saved_total // null),
+
+    cache_hit_rate: (.prefix_cache.hit_rate 
+// .cache_hit_rate // null),
+
+    cache_read_tokens: (.prefix_cache.read_tokens 
+// .cache_read_tokens // null),
+
+    cache_write_tokens: (.prefix_cache.write_tokens 
+// .cache_write_tokens // null),
+
+    avg_overhead_ms: (.avg_optimization_overhead_ms 
+// .optimization.avg_overhead_ms // null),
+
+    max_overhead_ms: (.max_optimization_overhead_ms 
+// .optimization.max_overhead_ms // null),
+
+    raw: .
+  }'
+}
+
+
+tcp_check() {
+  local host="$1"
+  local port="$2"
+  timeout 2 bash -c "cat < /dev/null > /dev/tcp/${host}/${port}" >/dev/null 2>&1
+}
+
+
+check_profile() {
+  need jq
+
+
+  local rendered
+  rendered="$(compose config --format json)"
+
+
+  jq -e '
+    def host_bound($service; $published):
+      (.services[$service].ports 
+// [])
+
+      | map(select(.published == $published))
+      | length == 1
+      and all(.[]; select(.published == $published) | .host_ip == "127.0.0.1");
+
+
+    (.services["headroom-proxy"].environment.HEADROOM_MODE == "token")
+    and (.services["headroom-proxy"].environment.HEADROOM_TARGET_RATIO == "0.4")
+    and (.services["headroom-proxy"].environment.HEADROOM_OUTPUT_SHAPER == "1")
+    and (.services["headroom-proxy"].environment.HEADROOM_VERBOSITY_LEVEL == "2")
+    and (.services["headroom-proxy"].environment.HEADROOM_EFFORT_ROUTER == "0")
+    and (.services["headroom-proxy"].environment.HEADROOM_DISABLE_KOMPRESS == "1")
+    and (.services["headroom-proxy"].environment.HEADROOM_DISABLE_KOMPRESS_FALLBACK == "1")
+    and (.services["headroom-proxy"].environment.HEADROOM_CODE_AWARE_ENABLED == "0")
+    and (.services["headroom-proxy"].environment.HEADROOM_COMPRESS_USER_MESSAGES == "0")
+    and (.services["headroom-proxy"].environment.HEADROOM_MIN_TOKENS == "5000")
+    and (.services["headroom-proxy"].environment.HEADROOM_LOG_MESSAGES == "0")
+    and ((.services["headroom-proxy"].command 
+// []) | index("--no-learn") != null)
+
+    and ((.services["headroom-proxy"].command 
+// []) | index("--code-aware") == null)
+
+    and host_bound("headroom-proxy"; "8787")
+    and host_bound("qdrant"; "6333")
+    and host_bound("qdrant"; "6334")
+    and host_bound("neo4j"; "7474")
+    and host_bound("neo4j"; "7687")
+  ' >/dev/null <<<"$rendered"
+
+
+  echo "profile: ok (codex latency lane, output shaper on, expensive compression downshifted, no-learn, localhost-only published ports)"
+}
+
+
+check_live_bindings() {
+  need jq
+
+
+  local wide_bindings
+  wide_bindings="$(
+    compose ps --format json \
+      | jq -r '
+          .Service as $service
+          | (.Publishers 
+// [])[]
+
+          | select((.PublishedPort 
+// 0) != 0)
+
+          | select(.URL != "127.0.0.1")
+          | "\($service) \(.URL):\(.PublishedPort)->\(.TargetPort)/\(.Protocol)"
+        '
+  )"
+
+
+  if [[ -n "$wide_bindings" ]]; then
+    echo "live bindings: needs recreate (currently published beyond 127.0.0.1)"
+    sed 's/^/  /' <<<"$wide_bindings"
+    return 1
+  fi
+
+
+  echo "live bindings: ok"
+}
+
+
+doctor() {
+  local base
+  local live_bindings_ok=0
+  base="$(proxy_url)"
+
+
+  check_profile
+  check_live_bindings || live_bindings_ok=$?
+  echo
+
+
+  echo "compose services:"
+  compose ps
+  echo
+
+
+  if curl --fail --silent --show-error "${base}/readyz" >/dev/null; then
+    echo "readyz: ok (${base}/readyz)"
+  else
+    echo "readyz: failed (${base}/readyz)"
+  fi
+
+
+  if curl --fail --silent --show-error "${base}/stats" >/dev/null; then
+    echo "stats: ok (${base}/stats)"
+  else
+    echo "stats: failed (${base}/stats)"
+  fi
+
+
+  if curl --fail --silent --show-error "http://127.0.0.1:6333/collections" >/dev/null; then
+    echo "qdrant: ok (127.0.0.1:6333)"
+  else
+    echo "qdrant: failed (127.0.0.1:6333)"
+  fi
+
+
+  if tcp_check 127.0.0.1 7687; then
+    echo "neo4j bolt: ok (127.0.0.1:7687)"
+  else
+    echo "neo4j bolt: failed (127.0.0.1:7687)"
+  fi
+
+
+  if [[ "$live_bindings_ok" -ne 0 ]]; then
+    echo
+    echo "Recreate the stack after active agents finish:"
+    echo "  scripts/headroom-local down"
+    echo "  scripts/headroom-local up"
+  fi
+}
+
+
+main() {
+  need docker
+
+
+  case "${1:-}" in
+    up)
+      compose up -d --build
+      ;;
+    down)
+      compose down
+      ;;
+    restart)
+      compose up -d --force-recreate --no-deps headroom-proxy
+      ;;
+    logs)
+      compose logs -f headroom-proxy
+      ;;
+    status)
+      need curl
+      status
+      ;;
+    perf)
+      compose exec -T headroom-proxy headroom perf
+      ;;
+    check-profile)
+      check_profile
+      ;;
+    shell)
+      compose exec headroom-proxy sh
+      ;;
+    doctor)
+      need curl
+      doctor
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+
+main "$@"

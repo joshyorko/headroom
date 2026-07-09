@@ -48,8 +48,19 @@ class CodexRegistrar(MCPRegistrar):
     name = "codex"
     display_name = "OpenAI Codex CLI"
 
-    def __init__(self, *, home_dir: Path | None = None) -> None:
-        if home_dir is not None:
+    def __init__(
+        self,
+        *,
+        home_dir: Path | None = None,
+        scope: str = "user",
+        project_dir: Path | None = None,
+    ) -> None:
+        if scope not in ("user", "project"):
+            raise ValueError(f"scope must be 'user' or 'project', got {scope!r}")
+        self._scope = scope
+        if scope == "project":
+            self._codex_dir = (project_dir if project_dir is not None else Path.cwd()) / ".codex"
+        elif home_dir is not None:
             self._codex_dir = home_dir / ".codex"
         elif os.environ.get("CODEX_HOME"):
             self._codex_dir = Path(os.environ["CODEX_HOME"]).expanduser()
@@ -62,6 +73,8 @@ class CodexRegistrar(MCPRegistrar):
     # ------------------------------------------------------------------
 
     def detect(self) -> bool:
+        if self._scope == "project":
+            return True
         return self._codex_dir.is_dir()
 
     def get_server(self, server_name: str) -> ServerSpec | None:

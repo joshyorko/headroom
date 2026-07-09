@@ -322,15 +322,14 @@ def test_init_codex_full_setup_skips_code_intelligence_by_default(
     assert headroom_provider["name"] == "OpenAI via Headroom proxy"
     assert headroom_provider["base_url"] == "http://headroom.example.test/v1"
     assert headroom_provider["env_http_headers"] == {"X-Headroom-Project": "HEADROOM_PROJECT"}
-    assert provider["mcp_servers"]["headroom"]["args"][-2:] == ["mcp", "serve"]
-    assert provider["mcp_servers"]["headroom"]["env"]["HEADROOM_PROXY_URL"] == (
-        "http://headroom.example.test"
-    )
-    assert "tokensave" not in provider["mcp_servers"]
-    assert "serena" not in provider["mcp_servers"]
-
     project_config = tomllib.loads((tmp_path / ".codex" / "config.toml").read_text())
     assert project_config["features"]["hooks"] is True
+    assert project_config["mcp_servers"]["headroom"]["args"][-2:] == ["mcp", "serve"]
+    assert project_config["mcp_servers"]["headroom"]["env"]["HEADROOM_PROXY_URL"] == (
+        "http://headroom.example.test"
+    )
+    assert "tokensave" not in project_config["mcp_servers"]
+    assert "serena" not in project_config["mcp_servers"]
     assert (tmp_path / ".codex" / "hooks.json").exists()
 
 
@@ -362,12 +361,12 @@ def test_init_codex_full_setup_registers_code_intelligence_when_explicit(
         serena=True,
     )
 
-    provider = tomllib.loads((tmp_path / "user-codex" / "config.toml").read_text())
-    assert provider["mcp_servers"]["tokensave"]["command"] == "/usr/local/bin/tokensave"
-    assert provider["mcp_servers"]["tokensave"]["args"] == ["serve"]
-    assert provider["mcp_servers"]["serena"]["command"] == "uvx"
-    assert "--context" in provider["mcp_servers"]["serena"]["args"]
-    assert "codex" in provider["mcp_servers"]["serena"]["args"]
+    project_config = tomllib.loads((tmp_path / ".codex" / "config.toml").read_text())
+    assert project_config["mcp_servers"]["tokensave"]["command"] == "/usr/local/bin/tokensave"
+    assert project_config["mcp_servers"]["tokensave"]["args"] == ["serve"]
+    assert project_config["mcp_servers"]["serena"]["command"] == "uvx"
+    assert "--context" in project_config["mcp_servers"]["serena"]["args"]
+    assert "codex" in project_config["mcp_servers"]["serena"]["args"]
 
 
 def test_init_claude_uses_custom_port(monkeypatch, tmp_path: Path) -> None:
@@ -1602,6 +1601,28 @@ def test_run_init_targets_remote_codex_skips_local_runtime_manifest(monkeypatch)
             "verbose": False,
         }
     ]
+
+
+def test_install_headroom_mcp_for_targets_uses_project_scope_for_local_init(
+    monkeypatch,
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "headroom.mcp_registry.install_everywhere",
+        lambda **kwargs: captured.update(kwargs) or {},
+    )
+    monkeypatch.setattr("headroom.mcp_registry.format_results", lambda *args, **kwargs: [])
+
+    init_cli._install_headroom_mcp_for_targets(
+        targets=["claude", "codex"],
+        proxy_url="http://headroom.example.test",
+        global_scope=False,
+    )
+
+    assert captured["agents"] == ["claude", "codex"]
+    assert captured["scope"] == "project"
 
 
 def test_init_subcommand_uses_group_options(monkeypatch) -> None:

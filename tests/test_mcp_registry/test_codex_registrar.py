@@ -66,6 +66,10 @@ def _codex_home_config_path(codex_home: Path) -> Path:
     return codex_home / "config.toml"
 
 
+def _project_config_path(project_dir: Path) -> Path:
+    return project_dir / ".codex" / "config.toml"
+
+
 # ----------------------------------------------------------------------
 # detect()
 # ----------------------------------------------------------------------
@@ -100,6 +104,20 @@ def test_register_uses_codex_home_env(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert _codex_home_config_path(codex_home).exists()
     assert not _config_path(tmp_path).exists()
     text = _codex_home_config_path(codex_home).read_text()
+    assert "[mcp_servers.headroom]" in text
+
+
+def test_project_scope_writes_project_config_even_without_user_codex_dir(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    reg = CodexRegistrar(scope="project", project_dir=project_dir)
+
+    assert reg.detect() is True
+    result = reg.register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    assert _project_config_path(project_dir).exists()
+    assert not _config_path(tmp_path).exists()
+    text = _project_config_path(project_dir).read_text()
     assert "[mcp_servers.headroom]" in text
 
 

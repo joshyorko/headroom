@@ -36,6 +36,8 @@ class ClaudeRegistrar(MCPRegistrar):
         claude_cli: str | None | object = ...,
         home_dir: Path | None = None,
         config_dir: Path | None = None,
+        scope: str = "user",
+        project_dir: Path | None = None,
     ) -> None:
         """Allow overrides for testing.
 
@@ -44,11 +46,20 @@ class ClaudeRegistrar(MCPRegistrar):
         path to point at a specific binary. ``CLAUDE_CONFIG_DIR`` is honored
         for real user sessions; ``home_dir`` keeps tests isolated from the
         caller's environment unless ``config_dir`` is passed explicitly.
+
+        ``scope`` controls where MCP config is written: ``"user"`` (default)
+        writes to ``~/.claude/``, while ``"project"`` writes to
+        ``<project_dir>/.mcp.json`` and uses the ``-s project`` CLI flag.
         """
+        if scope not in ("user", "project"):
+            raise ValueError(f"scope must be 'user' or 'project', got {scope!r}")
+        self._scope = scope
+        self._project_dir = project_dir if project_dir is not None else Path.cwd()
         home = home_dir if home_dir is not None else Path.home()
         self._claude_dir = _resolve_claude_config_dir(home, config_dir, honor_env=home_dir is None)
         self._modern_config = self._claude_dir / ".claude.json"
         self._legacy_config = self._claude_dir / "mcp.json"
+        self._project_config = self._project_dir / ".mcp.json"
         if claude_cli is ...:
             self._claude_cli = shutil.which("claude")
         else:
@@ -60,6 +71,8 @@ class ClaudeRegistrar(MCPRegistrar):
     # ------------------------------------------------------------------
 
     def detect(self) -> bool:
+        if self._scope == "project":
+            return True
         if self._claude_cli:
             return True
         return self._claude_dir.is_dir()
@@ -67,6 +80,8 @@ class ClaudeRegistrar(MCPRegistrar):
     def get_server(self, server_name: str) -> ServerSpec | None:
         # Read from disk regardless of whether the CLI is present — the file
         # format is stable and easier to compare than CLI output.
+        if self._scope == "project":
+            return self._read_server_entry(self._project_config, server_name)
         for config_path in (self._modern_config, self._legacy_config):
             entry = self._read_server_entry(config_path, server_name)
             if entry is not None:
@@ -93,7 +108,7 @@ class ClaudeRegistrar(MCPRegistrar):
     def unregister_server(self, server_name: str) -> bool:
         if self._claude_cli:
             result = run(
-                [str(self._claude_cli), "mcp", "remove", server_name, "-s", "user"],
+                [str(self._claude_cli), "mcp", "remove", server_name, "-s", self._scope],
                 capture_output=True,
                 text=True,
             )
@@ -101,10 +116,13 @@ class ClaudeRegistrar(MCPRegistrar):
                 return True
             logger.debug("claude mcp remove failed: %s", result.stderr.strip())
             # Fall through to file-based removal in case CLI didn't know
-            # about the user-scope entry but the file still has it.
+            # about the scope's entry but the file still has it.
         removed = False
-        for config_path in (self._modern_config, self._legacy_config):
-            removed = self._remove_from_file(config_path, server_name) or removed
+        if self._scope == "project":
+            removed = self._remove_from_file(self._project_config, server_name)
+        else:
+            for config_path in (self._modern_config, self._legacy_config):
+                removed = self._remove_from_file(config_path, server_name) or removed
         return removed
 
     # ------------------------------------------------------------------
@@ -112,7 +130,7 @@ class ClaudeRegistrar(MCPRegistrar):
     # ------------------------------------------------------------------
 
     def _register_via_cli(self, spec: ServerSpec) -> RegisterResult:
-        cmd = [str(self._claude_cli), "mcp", "add", spec.name, "-s", "user"]
+        cmd = [str(self._claude_cli), "mcp", "add", spec.name, "-s", self._scope]
         for k, v in spec.env.items():
             cmd += ["-e", f"{k}={v}"]
         cmd += ["--", spec.command, *spec.args]
@@ -123,7 +141,7 @@ class ClaudeRegistrar(MCPRegistrar):
             text=True,
         )
         if result.returncode == 0:
-            return RegisterResult(RegisterStatus.REGISTERED, "via `claude mcp add` (scope: user)")
+            return RegisterResult(RegisterStatus.REGISTERED, f"via `claude mcp add` (scope: {self._scope})")
         # CLI failed — try the file fallback rather than giving up.
         logger.warning("claude mcp add failed: %s", result.stderr.strip())
         file_result = self._register_via_file(spec)
@@ -142,11 +160,14 @@ class ClaudeRegistrar(MCPRegistrar):
     # ------------------------------------------------------------------
 
     def _register_via_file(self, spec: ServerSpec) -> RegisterResult:
-        # Prefer the modern config path. If only the legacy file exists,
-        # write to that to avoid surprising older clients.
-        target = self._modern_config
-        if not self._modern_config.exists() and self._legacy_config.exists():
-            target = self._legacy_config
+        if self._scope == "project":
+            target = self._project_config
+        else:
+            # Prefer the modern config path. If only the legacy file exists,
+            # write to that to avoid surprising older clients.
+            target = self._modern_config
+            if not self._modern_config.exists() and self._legacy_config.exists():
+                target = self._legacy_config
 
         try:
             target.parent.mkdir(parents=True, exist_ok=True)

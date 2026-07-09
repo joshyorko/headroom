@@ -1070,13 +1070,17 @@ def _configure_codex_durable_setup(
             targets=["codex"],
             proxy_url=normalized_proxy_url,
             force=True,
+            global_scope=global_scope,
         )
 
     if code_graph or serena or no_serena or no_tokensave:
         from headroom.cli import wrap as wrap_cli
         from headroom.mcp_registry import CodexRegistrar
 
-        registrar = CodexRegistrar()
+        registrar = CodexRegistrar(
+            scope="user" if global_scope else "project",
+            project_dir=Path.cwd(),
+        )
         if no_tokensave:
             wrap_cli._disable_tokensave_mcp(registrar, verbose=verbose)
         elif code_graph:
@@ -1218,11 +1222,15 @@ def _run_init_targets(
     # add Cursor / Codex / Continue / Cline / Windsurf / Goose without
     # touching the call sites.
     non_codex_targets = [target for target in targets if target != "codex"]
-    _install_headroom_mcp_for_targets(targets=non_codex_targets, proxy_url=normalized_proxy_url)
+    _install_headroom_mcp_for_targets(
+        targets=non_codex_targets,
+        proxy_url=normalized_proxy_url,
+        global_scope=global_scope,
+    )
 
 
 def _install_headroom_mcp_for_targets(
-    *, targets: list[str], proxy_url: str, force: bool = False
+    *, targets: list[str], proxy_url: str, global_scope: bool, force: bool = False
 ) -> None:
     """Install the headroom MCP server into each detected target agent."""
     from headroom.mcp_registry import format_results, install_everywhere
@@ -1230,7 +1238,13 @@ def _install_headroom_mcp_for_targets(
     if not targets:
         return
 
-    results = install_everywhere(proxy_url=proxy_url, agents=targets, force=force)
+    results = install_everywhere(
+        proxy_url=proxy_url,
+        agents=targets,
+        force=force,
+        scope="user" if global_scope else "project",
+        project_dir=Path.cwd(),
+    )
     if not results:
         return
 

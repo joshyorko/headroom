@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 
 from headroom.install.runtime import resolve_headroom_config_command
 
@@ -11,16 +12,28 @@ from .claude import ClaudeRegistrar
 from .codex import CodexRegistrar
 from .opencode import OpencodeRegistrar
 
+
+def resolve_headroom_command() -> list[str]:
+    return resolve_headroom_config_command()
+
 #: Default proxy URL used when none is given.
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
 
 
-def get_all_registrars() -> list[MCPRegistrar]:
+def get_all_registrars(
+    *, scope: str = "user", project_dir: Path | None = None
+) -> list[MCPRegistrar]:
     """Return one instance of every registrar implemented today.
 
     The list grows as we add adapters for Cursor, Continue, Cline, etc.
     """
-    return [ClaudeRegistrar(), CodexRegistrar(), OpencodeRegistrar()]
+    registrars: list[MCPRegistrar] = [
+        ClaudeRegistrar(scope=scope, project_dir=project_dir),
+        CodexRegistrar(scope=scope, project_dir=project_dir),
+    ]
+    if scope == "user":
+        registrars.append(OpencodeRegistrar())
+    return registrars
 
 
 def build_headroom_spec(proxy_url: str = DEFAULT_PROXY_URL) -> ServerSpec:
@@ -32,7 +45,7 @@ def build_headroom_spec(proxy_url: str = DEFAULT_PROXY_URL) -> ServerSpec:
     env: dict[str, str] = {}
     if proxy_url and proxy_url != DEFAULT_PROXY_URL:
         env["HEADROOM_PROXY_URL"] = proxy_url
-    command = resolve_headroom_config_command()
+    command = resolve_headroom_command()
     return ServerSpec(
         name="headroom",
         command=command[0],
@@ -93,6 +106,8 @@ def install_everywhere(
     agents: Iterable[str] | None = None,
     force: bool = False,
     registrars: Iterable[MCPRegistrar] | None = None,
+    scope: str = "user",
+    project_dir: Path | None = None,
 ) -> dict[str, RegisterResult]:
     """Install the headroom MCP server into every detected agent.
 
@@ -101,13 +116,19 @@ def install_everywhere(
         agents: If given, only install into agents whose ``name`` matches.
         force: Pass through to each registrar — overwrites mismatched config.
         registrars: Inject a custom registrar list (test seam).
+        scope: Write user or project-scoped agent config where supported.
+        project_dir: Base directory for project-scoped config.
 
     Returns:
         Dict keyed by registrar name. Includes :attr:`RegisterStatus.NOT_DETECTED`
         entries for agents we know about that aren't installed locally.
     """
     spec = build_headroom_spec(proxy_url)
-    selected = list(registrars) if registrars is not None else get_all_registrars()
+    selected = (
+        list(registrars)
+        if registrars is not None
+        else get_all_registrars(scope=scope, project_dir=project_dir)
+    )
 
     if agents is not None:
         agent_set = set(agents)

@@ -1368,7 +1368,7 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
 _CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
 
 
-def _setup_code_graph(verbose: bool = False) -> bool:
+def _setup_code_graph(verbose: bool = False, *, registrar: Any | None = None) -> bool:
     """Ensure the tokensave code graph is set up and the project indexed.
 
     tokensave is Headroom's primary code-graph compressor and is normally
@@ -1382,13 +1382,20 @@ def _setup_code_graph(verbose: bool = False) -> bool:
     Earlier releases backed this flag with ``codebase-memory-mcp``; that
     server is no longer installed, and ``headroom unwrap`` still cleans up any
     legacy ``codebase-memory-mcp`` entry a prior wrap left behind.
+
+    When ``registrar`` is provided it is used as-is (allowing scope-aware
+    registrars from the caller); otherwise a default ``ClaudeRegistrar()``
+    is used for backward compatibility.
     """
-    from headroom.mcp_registry import ClaudeRegistrar
+    if registrar is None:
+        from headroom.mcp_registry import ClaudeRegistrar
 
-    return _setup_tokensave_mcp(ClaudeRegistrar(), verbose=verbose, force=True)
+        registrar = ClaudeRegistrar()
+
+    return _setup_tokensave_mcp(registrar, verbose=verbose, force=True)
 
 
-# rtk instructions for tools without hook support (Codex, Cursor, Aider).
+# rtk instructions for tool surfaces where prompt guidance is still useful.
 # These get injected into AGENTS.md / .cursorrules so the LLM voluntarily
 # uses rtk-prefixed commands. Kept concise to minimize instruction overhead.
 RTK_INSTRUCTIONS_BLOCK = """\
@@ -3666,6 +3673,13 @@ def unwrap() -> None:
 )
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
+@click.option(
+    "--scope",
+    type=click.Choice(["user", "project"]),
+    default="user",
+    show_default=True,
+    help="Where to write MCP config: 'user' (~/.claude) or 'project' (./.mcp.json)",
+)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def claude(
     port: int,
@@ -3684,6 +3698,7 @@ def claude(
     context_1m: bool,
     verbose: bool,
     prepare_only: bool,
+    scope: str,
     claude_args: tuple,
 ) -> None:
     """Launch Claude Code through Headroom proxy.
@@ -3838,15 +3853,17 @@ def claude(
         if not no_mcp:
             from headroom.mcp_registry import ClaudeRegistrar
 
-            _setup_headroom_mcp(ClaudeRegistrar(), port, verbose=verbose)
+            claude_registrar = ClaudeRegistrar(scope=scope, project_dir=Path.cwd())
+            _setup_headroom_mcp(claude_registrar, port, verbose=verbose)
         elif verbose:
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
         # Coding-task compressor: tokensave primary, Serena backup.
         from headroom.mcp_registry import ClaudeRegistrar
 
+        claude_registrar = ClaudeRegistrar(scope=scope, project_dir=Path.cwd())
         _setup_coding_compressor(
-            ClaudeRegistrar(),
+            claude_registrar,
             serena_context="claude-code",
             serena=serena,
             no_serena=no_serena,
@@ -3855,7 +3872,7 @@ def claude(
         )
 
         if code_graph:
-            _setup_code_graph(verbose=verbose)
+            _setup_code_graph(verbose=verbose, registrar=claude_registrar)
 
         click.echo()
         click.echo("  Launching Claude Code (API routed through Headroom)...")
@@ -4492,6 +4509,24 @@ def codex(
                 global_agents = _codex_home_dir() / "AGENTS.md"
                 _inject_rtk_instructions(global_agents, verbose=verbose)
 
+    if prepare_only:
+        from headroom.cli import init as init_cli
+
+        init_cli._configure_codex_durable_setup(
+            global_scope=False,
+            profile=init_cli._local_profile(),
+            port=port,
+            proxy_url=proxy_url,
+            install_hooks=True,
+            install_headroom_mcp=not no_mcp,
+            serena=serena,
+            no_serena=no_serena,
+            no_tokensave=no_tokensave,
+            code_graph=code_graph,
+            verbose=verbose,
+        )
+        return
+
     # Register headroom MCP server in Codex config.toml so Codex can
     # call headroom_retrieve on compression markers from the proxy.
     if not no_mcp:
@@ -4523,23 +4558,6 @@ def codex(
         verbose=verbose,
         force=True,
     )
-
-    if prepare_only:
-        from headroom.cli import init as init_cli
-
-        init_cli._configure_codex_durable_setup(
-            global_scope=False,
-            profile=init_cli._local_profile(),
-            port=port,
-            proxy_url=proxy_url,
-            install_hooks=True,
-            install_headroom_mcp=not no_mcp,
-            serena=False,
-            no_serena=False,
-            no_tokensave=False,
-            code_graph=False,
-            verbose=verbose,
-        )
 
     # Setup memory MCP server for Codex (native tool integration)
     if memory:

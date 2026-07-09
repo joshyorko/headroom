@@ -64,6 +64,23 @@ def test_detect_false_when_neither_present(tmp_path: Path) -> None:
     assert reg.detect() is False
 
 
+def test_project_scope_detects_and_writes_project_mcp_without_user_claude_dir(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    reg = ClaudeRegistrar(claude_cli=None, home_dir=tmp_path, scope="project", project_dir=project_dir)
+
+    assert reg.detect() is True
+    result = reg.register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    project_config = project_dir / ".mcp.json"
+    assert project_config.exists()
+    assert not (tmp_path / ".claude" / ".claude.json").exists()
+    data = json.loads(project_config.read_text())
+    assert data["mcpServers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
+
+
 # ----------------------------------------------------------------------
 # get_server() — file-based reads
 # ----------------------------------------------------------------------

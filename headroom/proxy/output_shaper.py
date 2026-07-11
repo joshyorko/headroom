@@ -39,6 +39,16 @@ from enum import Enum
 from typing import Any
 
 from headroom.proxy import runtime_env
+from headroom.proxy.output_effort_policy import (
+    EFFORT_RANK as _EFFORT_RANK,
+)
+from headroom.proxy.output_effort_policy import (
+    LEGACY_THINKING_FLOOR,
+    can_create_openai_text_verbosity,
+    clamp_legacy_thinking_budget,
+    lower_effort_value,
+    lower_text_verbosity_value,
+)
 from headroom.proxy.output_steering import (
     apply_openai_responses_verbosity_steering,
     apply_verbosity_steering,
@@ -65,15 +75,6 @@ __all__ = [
     "shape_request",
     "steering_text",
 ]
-
-# Documented Anthropic API minimum for thinking.budget_tokens on models
-# that still accept the legacy enabled/budget_tokens form.
-LEGACY_THINKING_FLOOR = 1024
-
-# Ordering for output_config.effort values. Unknown values are left alone.
-_EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
-
-_TEXT_VERBOSITY_RANK = {"low": 0, "medium": 1, "high": 2}
 
 _OPENAI_RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
     {
@@ -265,22 +266,24 @@ def route_effort(
     output_config = body.get("output_config")
     if isinstance(output_config, dict):
         effort = output_config.get("effort")
-        if (
-            isinstance(effort, str)
-            and effort in _EFFORT_RANK
-            and _EFFORT_RANK[effort] > _EFFORT_RANK[settings.mechanical_effort]
-        ):
-            output_config["effort"] = settings.mechanical_effort
-            labels.append(f"output_shaper:effort:{effort}->{settings.mechanical_effort}")
+        lowered = lower_effort_value(effort, settings.mechanical_effort)
+        if lowered is not None:
+            output_config["effort"] = lowered
+            labels.append(f"output_shaper:effort:{effort}->{lowered}")
 
     # Legacy lever: clamp thinking.budget_tokens on models still using the
     # enabled/budget_tokens form. The type field itself is never touched.
     thinking = body.get("thinking")
-    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+    if isinstance(thinking, dict):
         budget = thinking.get("budget_tokens")
-        if isinstance(budget, int) and budget > LEGACY_THINKING_FLOOR:
-            thinking["budget_tokens"] = LEGACY_THINKING_FLOOR
-            labels.append(f"output_shaper:thinking_budget:{budget}->{LEGACY_THINKING_FLOOR}")
+        clamped = clamp_legacy_thinking_budget(
+            thinking_type=thinking.get("type"),
+            budget_tokens=budget,
+            floor=LEGACY_THINKING_FLOOR,
+        )
+        if clamped is not None:
+            thinking["budget_tokens"] = clamped
+            labels.append(f"output_shaper:thinking_budget:{budget}->{clamped}")
 
     return labels
 
@@ -363,22 +366,17 @@ def route_openai_reasoning_effort(
         return []
     effort = reasoning.get("effort")
     target = settings.mechanical_effort
-    if (
-        isinstance(effort, str)
-        and effort in _EFFORT_RANK
-        and target in _EFFORT_RANK
-        and _EFFORT_RANK[effort] > _EFFORT_RANK[target]
-    ):
-        reasoning["effort"] = target
-        return [f"output_shaper:reasoning_effort:{effort}->{target}"]
+    lowered = lower_effort_value(effort, target)
+    if lowered is not None:
+        reasoning["effort"] = lowered
+        return [f"output_shaper:reasoning_effort:{effort}->{lowered}"]
     return []
 
 
 def route_openai_text_verbosity(body: dict[str, Any]) -> list[str]:
     """Set or lower OpenAI ``text.verbosity`` conservatively."""
-    model = str(body.get("model") or "").lower()
     text_config = body.get("text")
-    can_create = model.startswith("gpt-5")
+    can_create = can_create_openai_text_verbosity(body.get("model"))
     if text_config is None:
         if not can_create:
             return []
@@ -393,13 +391,10 @@ def route_openai_text_verbosity(body: dict[str, Any]) -> list[str]:
             return []
         text_config["verbosity"] = "low"
         return ["output_shaper:text_verbosity:unset->low"]
-    if (
-        isinstance(verbosity, str)
-        and verbosity in _TEXT_VERBOSITY_RANK
-        and _TEXT_VERBOSITY_RANK[verbosity] > _TEXT_VERBOSITY_RANK["low"]
-    ):
-        text_config["verbosity"] = "low"
-        return [f"output_shaper:text_verbosity:{verbosity}->low"]
+    lowered = lower_text_verbosity_value(verbosity)
+    if lowered is not None:
+        text_config["verbosity"] = lowered
+        return [f"output_shaper:text_verbosity:{verbosity}->{lowered}"]
     return []
 
 

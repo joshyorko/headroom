@@ -1,10 +1,12 @@
 """Claude Code MCP registrar.
 
-Claude Code 2.x stores MCP server configuration in ``~/.claude/.claude.json``
-and ships a CLI (``claude mcp add/remove/list/get``) that owns the file.
+Claude Code 2.x stores user-scope MCP server configuration in
+``~/.claude.json``, directly under the home directory. The ``claude`` CLI
+(``claude mcp add/remove/list/get``) owns this file; setting
+``CLAUDE_CONFIG_DIR`` relocates it to ``$CLAUDE_CONFIG_DIR/.claude.json``.
 Older Claude Code releases (and the Claude Desktop app) read
-``~/.claude/mcp.json``. This registrar prefers the CLI for writes when
-available, and reads the underlying JSON files directly for compare /
+``~/.claude/mcp.json`` instead. This registrar prefers the CLI for writes
+when available, and reads the underlying JSON files directly for compare /
 ``get_server`` so it is robust to CLI output format changes.
 """
 
@@ -44,20 +46,25 @@ class ClaudeRegistrar(MCPRegistrar):
         ``claude_cli`` defaults to :func:`shutil.which` lookup. Pass
         ``None`` to force the file-based fallback path. Pass an explicit
         path to point at a specific binary. ``CLAUDE_CONFIG_DIR`` is honored
-        for real user sessions; ``home_dir`` keeps tests isolated from the
-        caller's environment unless ``config_dir`` is passed explicitly.
-
-        ``scope`` controls where MCP config is written: ``"user"`` (default)
-        writes to ``~/.claude/``, while ``"project"`` writes to
-        ``<project_dir>/.mcp.json`` and uses the ``-s project`` CLI flag.
+        for real user sessions; ``home_dir`` isolates file-based reads and
+        writes from the caller's real home directory, unless ``config_dir``
+        is passed explicitly. It does not isolate CLI subprocess calls (see
+        ``claude_cli``) — pass ``claude_cli=None`` alongside ``home_dir`` to
+        keep a test fully off the real ``claude`` binary.
         """
         if scope not in ("user", "project"):
             raise ValueError(f"scope must be 'user' or 'project', got {scope!r}")
         self._scope = scope
         self._project_dir = project_dir if project_dir is not None else Path.cwd()
         home = home_dir if home_dir is not None else Path.home()
-        self._claude_dir = _resolve_claude_config_dir(home, config_dir, honor_env=home_dir is None)
-        self._modern_config = self._claude_dir / ".claude.json"
+        modern_dir = _resolve_claude_config_dir(home, config_dir, honor_env=home_dir is None)
+        # Legacy config lives under the real ``.claude`` directory regardless
+        # of where the modern config resolved to (CLAUDE_CONFIG_DIR only
+        # relocates the modern file, per Claude Code's own behavior).
+        self._claude_dir = home / ".claude"
+        self._modern_dir = modern_dir
+        self._isolated_cli_env = home_dir is not None or config_dir is not None
+        self._modern_config = modern_dir / ".claude.json"
         self._legacy_config = self._claude_dir / "mcp.json"
         self._project_config = self._project_dir / ".mcp.json"
         if claude_cli is ...:
@@ -75,7 +82,7 @@ class ClaudeRegistrar(MCPRegistrar):
             return True
         if self._claude_cli:
             return True
-        return self._claude_dir.is_dir()
+        return self._claude_dir.is_dir() or self._modern_config.exists()
 
     def get_server(self, server_name: str) -> ServerSpec | None:
         # Read from disk regardless of whether the CLI is present — the file
@@ -106,23 +113,22 @@ class ClaudeRegistrar(MCPRegistrar):
         return self._register_via_file(spec)
 
     def unregister_server(self, server_name: str) -> bool:
+        removed = False
         if self._claude_cli:
             result = run(
                 [str(self._claude_cli), "mcp", "remove", server_name, "-s", self._scope],
                 capture_output=True,
                 text=True,
+                env=self._claude_cli_env(),
             )
             if result.returncode == 0:
-                return True
-            logger.debug("claude mcp remove failed: %s", result.stderr.strip())
-            # Fall through to file-based removal in case CLI didn't know
-            # about the scope's entry but the file still has it.
-        removed = False
-        if self._scope == "project":
-            removed = self._remove_from_file(self._project_config, server_name)
-        else:
-            for config_path in (self._modern_config, self._legacy_config):
-                removed = self._remove_from_file(config_path, server_name) or removed
+                removed = True
+            else:
+                logger.debug("claude mcp remove failed: %s", result.stderr.strip())
+        # Always clean up both files too — the CLI only touches the modern
+        # config, so a legacy entry (or one it didn't know about) can remain.
+        for config_path in (self._modern_config, self._legacy_config):
+            removed = self._remove_from_file(config_path, server_name) or removed
         return removed
 
     # ------------------------------------------------------------------
@@ -139,9 +145,12 @@ class ClaudeRegistrar(MCPRegistrar):
             cmd,
             capture_output=True,
             text=True,
+            env=self._claude_cli_env(),
         )
         if result.returncode == 0:
-            return RegisterResult(RegisterStatus.REGISTERED, f"via `claude mcp add` (scope: {self._scope})")
+            return RegisterResult(
+                RegisterStatus.REGISTERED, f"via `claude mcp add` (scope: {self._scope})"
+            )
         # CLI failed — try the file fallback rather than giving up.
         logger.warning("claude mcp add failed: %s", result.stderr.strip())
         file_result = self._register_via_file(spec)
@@ -172,7 +181,9 @@ class ClaudeRegistrar(MCPRegistrar):
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             config = _read_json(target)
-            servers = config.setdefault("mcpServers", {})
+            servers = config.get("mcpServers")
+            if not isinstance(servers, dict):
+                config["mcpServers"] = servers = {}
             servers[spec.name] = _spec_to_entry(spec)
             _write_json(target, config)
         except OSError as exc:
@@ -186,8 +197,8 @@ class ClaudeRegistrar(MCPRegistrar):
             config = _read_json(path)
         except OSError:
             return False
-        servers = config.get("mcpServers", {})
-        if server_name not in servers:
+        servers = config.get("mcpServers")
+        if not isinstance(servers, dict) or server_name not in servers:
             return False
         del servers[server_name]
         try:
@@ -203,15 +214,26 @@ class ClaudeRegistrar(MCPRegistrar):
             config = _read_json(path)
         except OSError:
             return None
-        entry = config.get("mcpServers", {}).get(server_name)
+        servers = config.get("mcpServers")
+        if not isinstance(servers, dict):
+            return None
+        entry = servers.get(server_name)
         if not isinstance(entry, dict):
             return None
         return _entry_to_spec(server_name, entry)
 
+    # ----------------------------------------------------------------------
+    # Helpers
+    # ----------------------------------------------------------------------
 
-# ----------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------
+    def _claude_cli_env(self) -> dict[str, str] | None:
+        if not self._isolated_cli_env:
+            return None
+        env = os.environ.copy()
+        # Point the CLI at the directory holding the modern ``.claude.json``
+        # (CLAUDE_CONFIG_DIR relocates that file), not the legacy ``.claude`` dir.
+        env["CLAUDE_CONFIG_DIR"] = str(self._modern_dir)
+        return env
 
 
 def _resolve_claude_config_dir(
@@ -220,13 +242,19 @@ def _resolve_claude_config_dir(
     *,
     honor_env: bool,
 ) -> Path:
+    """Resolve the directory holding the *modern* ``.claude.json`` config.
+
+    Defaults to ``home`` itself, since Claude Code's modern config lives at
+    ``~/.claude.json`` directly under the home directory. ``CLAUDE_CONFIG_DIR``,
+    when set, relocates it to ``$CLAUDE_CONFIG_DIR/.claude.json``.
+    """
     if config_dir is not None:
         return config_dir
     if honor_env:
         env_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
         if env_dir:
             return Path(env_dir).expanduser()
-    return home / ".claude"
+    return home
 
 
 def _read_json(path: Path) -> dict[str, Any]:

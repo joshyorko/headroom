@@ -370,6 +370,79 @@ class TestSessionTrackerStore:
         id3 = store.compute_session_id(MockRequest(), "gpt-4", messages)
         assert id3 != id1
 
+    def test_compute_session_id_uses_all_system_messages(self, store):
+        """Different dynamic system messages should not collide."""
+
+        class MockRequest:
+            headers = {}
+
+        static_prompt = "framework prompt " * 80
+        conv_a = [
+            {"role": "system", "content": [{"type": "text", "text": static_prompt}]},
+            {"role": "system", "content": [{"type": "text", "text": "context: session A"}]},
+            {"role": "user", "content": "hello"},
+        ]
+        conv_b = [
+            {"role": "system", "content": [{"type": "text", "text": static_prompt}]},
+            {"role": "system", "content": [{"type": "text", "text": "context: session B"}]},
+            {"role": "user", "content": "hello"},
+        ]
+
+        id_a = store.compute_session_id(MockRequest(), "claude-3", conv_a)
+        id_b = store.compute_session_id(MockRequest(), "claude-3", conv_b)
+
+        assert id_a != id_b
+
+    def test_compute_session_id_distinguishes_top_level_system(self, store):
+        """Anthropic carries the system prompt as a top-level field (not a
+        role:'system' message). The handler folds it in as a synthetic system
+        message so two conversations with the same model and turns but different
+        system prompts get distinct ids — otherwise they share one tracker and
+        their sticky state cross-contaminates. This exercises that mechanism."""
+
+        class MockRequest:
+            headers = {}
+
+        turns = [{"role": "user", "content": "hello"}]
+
+        def with_system(system):
+            # Mirror what handlers/anthropic.py does for the top-level system.
+            return [{"role": "system", "content": system}, *turns]
+
+        id_a = store.compute_session_id(
+            MockRequest(), "claude-3", with_system("You are a Python expert.")
+        )
+        id_b = store.compute_session_id(
+            MockRequest(), "claude-3", with_system("You are a Rust expert.")
+        )
+        assert id_a != id_b
+
+        # A list-of-text-blocks system folds the same text as the string form.
+        id_a_list = store.compute_session_id(
+            MockRequest(),
+            "claude-3",
+            with_system([{"type": "text", "text": "You are a Python expert."}]),
+        )
+        assert id_a_list == id_a
+
+    def test_compute_session_id_is_stable_when_only_non_system_turns_change(self, store):
+        """Appending non-system turns should keep the same fallback session id."""
+
+        class MockRequest:
+            headers = {}
+
+        base_messages = [
+            {"role": "system", "content": [{"type": "text", "text": "framework prompt"}]},
+            {"role": "system", "content": [{"type": "text", "text": "context: session A"}]},
+            {"role": "user", "content": "hello"},
+        ]
+        extended_messages = base_messages + [{"role": "assistant", "content": "hi there"}]
+
+        id1 = store.compute_session_id(MockRequest(), "claude-3", base_messages)
+        id2 = store.compute_session_id(MockRequest(), "claude-3", extended_messages)
+
+        assert id1 == id2
+
     def test_compute_session_id_no_system(self, store):
         """Should work without system messages."""
 

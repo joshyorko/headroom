@@ -22,10 +22,16 @@ from typing import Any
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from headroom.copilot_auth import is_copilot_api_url
+from headroom.proxy.project_policy import (
+    PROJECT_HEADER,
+    PROJECT_PATH_PREFIX,
+    classify_project,
+    split_project_path,
+    with_project_prefix,
+)
+from headroom.proxy.request_scope import normalize_scope_path
 from headroom.proxy.savings_tracker import sanitize_project_name
 
-PROJECT_HEADER = "x-headroom-project"
-PROJECT_PATH_PREFIX = "/p/"
 CLIENT_PATH_PREFIX = "/c/"
 COPILOT_UPSTREAM_PATH_PREFIX = "/_copilot/"
 _PROJECT_PAYLOAD_KEYS = {
@@ -70,15 +76,6 @@ def _decode_copilot_api_url(value: str) -> str | None:
         return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
     except Exception:
         return None
-
-
-def classify_project(headers: Mapping[str, Any] | Any) -> str | None:
-    """Extract a sanitized project name from request headers, if present."""
-    get = getattr(headers, "get", None)
-    if get is None:
-        return None
-    value = get(PROJECT_HEADER) or get("X-Headroom-Project")
-    return sanitize_project_name(value)
 
 
 def _project_name_from_value(value: Any) -> str | None:
@@ -151,24 +148,6 @@ def get_current_copilot_api_url() -> str | None:
     return _current_copilot_api_url.get()
 
 
-def split_project_path(path: str) -> tuple[str | None, str]:
-    """Split ``/p/<name>/rest`` into ``(name, /rest)``.
-
-    Clients that cannot send custom headers (aider, Copilot BYOK, Cursor)
-    are pointed at a project-prefixed base URL instead; the first path
-    segment after ``/p/`` is the URL-encoded project name. Returns
-    ``(None, path)`` unchanged when the prefix is absent or unusable.
-    """
-    if not path.startswith(PROJECT_PATH_PREFIX):
-        return None, path
-    remainder = path[len(PROJECT_PATH_PREFIX) :]
-    segment, sep, rest = remainder.partition("/")
-    project = sanitize_project_name(unquote(segment)) if segment else None
-    if project is None:
-        return None, path
-    return project, ("/" + rest) if sep else "/"
-
-
 def split_client_path(path: str) -> tuple[str | None, str]:
     """Split ``/c/<client>/rest`` into ``(client, /rest)``."""
     if not path.startswith(CLIENT_PATH_PREFIX):
@@ -201,9 +180,7 @@ def strip_project_path_prefix(scope: MutableMapping[str, Any]) -> str | None:
     """
     project, stripped = split_project_path(scope.get("path", ""))
     if project is not None:
-        scope["path"] = stripped
-        if "raw_path" in scope:
-            scope["raw_path"] = quote(stripped).encode("ascii")
+        normalize_scope_path(scope, stripped)
     return project
 
 
@@ -211,9 +188,7 @@ def strip_client_path_prefix(scope: MutableMapping[str, Any]) -> str | None:
     """Strip a ``/c/<client>`` prefix from an ASGI scope, returning the client."""
     client, stripped = split_client_path(scope.get("path", ""))
     if client is not None:
-        scope["path"] = stripped
-        if "raw_path" in scope:
-            scope["raw_path"] = quote(stripped).encode("ascii")
+        normalize_scope_path(scope, stripped)
     return client
 
 
@@ -221,25 +196,8 @@ def strip_copilot_upstream_path_prefix(scope: MutableMapping[str, Any]) -> str |
     """Strip a Copilot upstream prefix from an ASGI scope, returning the API URL."""
     api_url, stripped = split_copilot_upstream_path(scope.get("path", ""))
     if api_url is not None:
-        scope["path"] = stripped
-        if "raw_path" in scope:
-            scope["raw_path"] = quote(stripped).encode("ascii")
+        normalize_scope_path(scope, stripped)
     return api_url
-
-
-def with_project_prefix(base_url: str, project: str | None) -> str:
-    """Insert ``/p/<name>`` ahead of the path of a local proxy base URL.
-
-    Producer-side counterpart of :func:`split_project_path`, used by
-    ``headroom wrap`` for clients that cannot send custom headers.
-    Returns ``base_url`` unchanged when the project name is unusable.
-    """
-    name = sanitize_project_name(project)
-    if name is None:
-        return base_url
-    parts = urlsplit(base_url)
-    prefixed = f"{PROJECT_PATH_PREFIX}{quote(name, safe='')}{parts.path}"
-    return urlunsplit(parts._replace(path=prefixed.rstrip("/")))
 
 
 def with_client_prefix(base_url: str, client: str | None) -> str:

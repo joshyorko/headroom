@@ -84,6 +84,11 @@ pub fn detect(content: &str) -> ContentType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transforms::magika_detector::magika_runtime_available_for_session_init;
+
+    fn magika_available() -> bool {
+        magika_runtime_available_for_session_init().is_ok()
+    }
 
     #[test]
     fn empty_input_short_circuits_to_plain_text() {
@@ -93,19 +98,31 @@ mod tests {
     #[test]
     fn json_array_routes_via_tier_1() {
         let payload = r#"[{"id": 1}, {"id": 2}, {"id": 3}]"#;
-        assert_eq!(detect(payload), ContentType::JsonArray);
+        if magika_available() {
+            assert_eq!(detect(payload), ContentType::JsonArray);
+        } else {
+            assert_eq!(detect(payload), ContentType::PlainText);
+        }
     }
 
     #[test]
     fn source_code_routes_via_tier_1() {
         let py = "def hello():\n    print('world')\n\nclass Foo:\n    pass\n";
-        assert_eq!(detect(py), ContentType::SourceCode);
+        if magika_available() {
+            assert_eq!(detect(py), ContentType::SourceCode);
+        } else {
+            assert_eq!(detect(py), ContentType::PlainText);
+        }
     }
 
     #[test]
     fn html_routes_via_tier_1() {
         let html = "<!DOCTYPE html><html><body><h1>x</h1></body></html>";
-        assert_eq!(detect(html), ContentType::Html);
+        if magika_available() {
+            assert_eq!(detect(html), ContentType::Html);
+        } else {
+            assert_eq!(detect(html), ContentType::PlainText);
+        }
     }
 
     #[test]
@@ -195,7 +212,11 @@ mod tests {
         // YAML lives in magika's `code` group; the chain returns it
         // as SourceCode so the router picks the code-aware compressor.
         let yaml = "name: my-app\nversion: 1.0\ndependencies:\n  - foo\n";
-        assert_eq!(detect(yaml), ContentType::SourceCode);
+        if magika_available() {
+            assert_eq!(detect(yaml), ContentType::SourceCode);
+        } else {
+            assert_eq!(detect(yaml), ContentType::PlainText);
+        }
     }
 
     #[test]
@@ -205,7 +226,11 @@ mod tests {
                   impl Counter {\n    \
                       pub fn new() -> Self { Self { counts: HashMap::new() } }\n\
                   }\n";
-        assert_eq!(detect(rs), ContentType::SourceCode);
+        if magika_available() {
+            assert_eq!(detect(rs), ContentType::SourceCode);
+        } else {
+            assert_eq!(detect(rs), ContentType::PlainText);
+        }
     }
 
     #[test]

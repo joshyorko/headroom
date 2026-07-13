@@ -23,9 +23,7 @@ SOURCE_IGNORE = [
 class HeadroomBuilder:
     """Build and smoke-test Headroom from the active checkout."""
 
-    def _build_env(
-        self, source: dagger.Directory, python_version: str
-    ) -> dagger.Container:
+    def _build_env(self, source: dagger.Directory, python_version: str) -> dagger.Container:
         return (
             dag.container()
             .from_(f"python:{python_version}-bookworm")
@@ -63,15 +61,11 @@ class HeadroomBuilder:
                     "maturin>=1.5,<2.0",
                 ]
             )
-            .with_mounted_cache(
-                "/root/.cache/uv", dag.cache_volume("headroom-uv-cache")
-            )
+            .with_mounted_cache("/root/.cache/uv", dag.cache_volume("headroom-uv-cache"))
             .with_mounted_cache(
                 "/root/.cargo/registry", dag.cache_volume("headroom-cargo-registry")
             )
-            .with_mounted_cache(
-                "/work/target", dag.cache_volume("headroom-cargo-target")
-            )
+            .with_mounted_cache("/work/target", dag.cache_volume("headroom-cargo-target"))
             .with_directory("/work", source)
             .with_workdir("/work")
         )

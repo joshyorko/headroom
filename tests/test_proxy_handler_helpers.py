@@ -80,7 +80,7 @@ class _ChatGPTAccountRequest:
 class _PassthroughRequest:
     method = "GET"
     headers = {}
-    url = SimpleNamespace(path="/favicon.ico", query="")
+    url = SimpleNamespace(path="/some/other/path", query="")
 
     async def body(self) -> bytes:
         return b""
@@ -217,6 +217,27 @@ def test_openai_handler_prefix_helpers_cover_edge_cases() -> None:
     assert (
         OpenAIHandlerMixin._strict_previous_turn_frozen_count(
             [{"role": "assistant"}, {"role": "user"}],
+            0,
+        )
+        == 1
+    )
+    assert (
+        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+            [{"role": "assistant"}, {"role": "tool", "content": "observation"}],
+            0,
+        )
+        == 1
+    )
+    assert (
+        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "assistant"}, {"role": "tool", "content": "obs"}],
+            3,
+        )
+        == 2
+    )
+    assert (
+        OpenAIHandlerMixin._strict_previous_turn_frozen_count(
+            [{"role": "assistant"}, {"role": "function", "content": "legacy observation"}],
             0,
         )
         == 1
@@ -946,3 +967,85 @@ class TestHasNewCcrMarkers:
             )
             is False
         )
+
+
+def test_strict_frozen_count_tool_and_function_tail_are_mutable():
+    # OpenAI function-calling harnesses (Kimi / fireworks) end each turn with a
+    # role:"tool" (or legacy role:"function") observation — NOT role:"user".
+    # Gating the mutable tail on role=="user" froze the whole conversation on
+    # every such turn => zero compression. Tool/function observations must be
+    # treated as the mutable delta (freeze all-but-last), like a user obs.
+    from headroom.proxy.handlers.openai import OpenAIHandlerMixin as M
+
+    # role:tool tail -> only the last message is mutable (frozen = final_idx)
+    assert (
+        M._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "assistant"}, {"role": "tool"}], 0
+        )
+        == 2
+    )
+    assert (
+        M._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "assistant"}, {"role": "function"}], 0
+        )
+        == 2
+    )
+    # assistant/system tail is NOT an observation -> freeze everything
+    assert (
+        M._strict_previous_turn_frozen_count(
+            [{"role": "user"}, {"role": "tool"}, {"role": "assistant"}], 0
+        )
+        == 3
+    )
+
+
+class _ClientDisconnectRequest:
+    """Mock request whose body() raises ClientDisconnect to simulate mid-stream cancel."""
+
+    method = "POST"
+    headers = {"content-type": "application/json"}
+    url = SimpleNamespace(path="/v1/chat/completions", query="")
+
+    async def body(self) -> bytes:
+        from starlette.requests import ClientDisconnect
+
+        raise ClientDisconnect()
+
+
+class _ClientDisconnectStreamRequest:
+    """Mock request for streaming passthrough with ClientDisconnect."""
+
+    method = "POST"
+    headers = {"content-type": "application/json"}
+    url = SimpleNamespace(
+        path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent",
+        query="alt=sse",
+    )
+
+    async def body(self) -> bytes:
+        from starlette.requests import ClientDisconnect
+
+        raise ClientDisconnect()
+
+
+def test_handle_passthrough_client_disconnect():
+    """ClientDisconnect during body read returns 204 instead of crashing TaskGroup."""
+    handler = object.__new__(OpenAIHandlerMixin)
+    response = asyncio.run(
+        handler.handle_passthrough(_ClientDisconnectRequest(), "https://api.openai.com")
+    )
+    assert response.status_code == 204
+
+
+def test_handle_streaming_passthrough_client_disconnect():
+    """ClientDisconnect during streaming body read returns 204."""
+    handler = object.__new__(OpenAIHandlerMixin)
+    response = asyncio.run(
+        handler.handle_passthrough(
+            _ClientDisconnectStreamRequest(),
+            "https://us-central1-aiplatform.googleapis.com",
+            endpoint_name="streamRawPredict",
+            provider="vertex:google",
+        )
+    )
+    assert response.status_code == 204

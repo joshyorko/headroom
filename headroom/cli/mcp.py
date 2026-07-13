@@ -15,6 +15,8 @@ from typing import Any
 
 import click
 
+from headroom._subprocess import run
+
 from .main import main
 
 # Default paths
@@ -132,7 +134,7 @@ def mcp_report_rtk(proxy_url: str | None, scope: str, timeout: float) -> None:
         raise SystemExit(1)
 
     try:
-        result = subprocess.run(
+        result = run(
             _rtk_gain_command(rtk_path, scope),
             capture_output=True,
             text=True,

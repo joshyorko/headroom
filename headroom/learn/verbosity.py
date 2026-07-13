@@ -151,7 +151,7 @@ class VerbosityProfile:
     @classmethod
     def load(cls, path: Path) -> VerbosityProfile | None:
         try:
-            d = json.loads(Path(path).read_text())
+            d = json.loads(Path(path).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError):
             return None
         return cls(
@@ -166,7 +166,7 @@ class VerbosityProfile:
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2))
+        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
 
 def _parse_ts(s: str | None) -> float | None:
@@ -225,9 +225,7 @@ def _estimate_tokens_from_text(text: str) -> int:
 def _usage_input_tokens(usage: dict[str, Any]) -> int:
     base = usage.get("input_tokens", usage.get("prompt_tokens", 0))
     return int(
-        base
-        + usage.get("cache_read_input_tokens", 0)
-        + usage.get("cache_creation_input_tokens", 0)
+        base + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
     )
 
 
@@ -315,7 +313,7 @@ def _parse_session(path: Path) -> tuple[list[_Response], list[_HumanMsg], bool]:
     recent_context: list[str] = []
 
     try:
-        lines = path.read_text().splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return [], [], False
 
@@ -406,7 +404,7 @@ def _ordered_events(path: Path) -> list[tuple[float | None, str, _Response | _Hu
     """
     out: list[tuple[float | None, str, Any]] = []
     try:
-        lines = path.read_text().splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return out
     responses, humans, _ = _parse_session(path)

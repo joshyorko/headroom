@@ -465,7 +465,7 @@ class CCRToolInjector:
 def parse_tool_call(
     tool_call: dict[str, Any],
     provider: str = "anthropic",
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None] | str | None:
     """Parse a CCR tool call to extract hash and query.
 
     Args:
@@ -486,6 +486,8 @@ def parse_tool_call(
         args_str = function.get("arguments", "{}")
         try:
             input_data = json.loads(args_str)
+        except TypeError:
+            return None
         except json.JSONDecodeError:
             input_data = {}
     elif provider == "google":
@@ -493,13 +495,33 @@ def parse_tool_call(
         function_call = tool_call.get("functionCall", {})
         name = function_call.get("name")
         input_data = function_call.get("args", {})
+    elif provider == "openai_responses":
+        # Responses API: flat `function_call` item — name and arguments
+        # live directly on it, not nested under "function" like chat
+        # completions tool_calls.
+        name = tool_call.get("name")
+        args_str = tool_call.get("arguments", "{}")
+        try:
+            input_data = json.loads(args_str)
+        except TypeError:
+            return None
+        except json.JSONDecodeError:
+            input_data = {}
     else:
         # Generic fallback
         name = tool_call.get("name")
         input_data = tool_call.get("input", tool_call.get("args", {}))
 
     if name != CCR_TOOL_NAME:
+        if provider == "openai_responses":
+            return None
         return None, None
+
+    # A CCR-named tool call whose decoded arguments/input are not an object
+    # (a JSON array/string/number, or a non-dict Anthropic `input`) is simply
+    # not a valid CCR call — return None instead of crashing on `.get`.
+    if not isinstance(input_data, dict):
+        return None
 
     hash_key = input_data.get("hash")
     query = input_data.get("query")
@@ -509,9 +531,15 @@ def parse_tool_call(
     # either real length and reject anything else as malformed.
     if hash_key is not None:
         if not isinstance(hash_key, str) or len(hash_key) not in (12, 24):
+            if provider == "openai_responses":
+                return None
             return None, None
         # Validate hex characters only
         if not all(c in "0123456789abcdef" for c in hash_key.lower()):
+            if provider == "openai_responses":
+                return None
             return None, None
 
+    if provider == "openai_responses":
+        return hash_key
     return hash_key, query

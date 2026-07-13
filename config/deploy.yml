@@ -9,6 +9,12 @@ kamal_storage_path = ENV.fetch("KAMAL_STORAGE_PATH", "/var/lib/headroom")
 kamal_arch = ENV.fetch("KAMAL_ARCH", "amd64")
 kamal_proxy_http_port = ENV.fetch("KAMAL_PROXY_HTTP_PORT", "80")
 headroom_port = ENV.fetch("HEADROOM_PORT", "8787")
+headroom_savings_profile = ENV.fetch("HEADROOM_SAVINGS_PROFILE", "balanced")
+headroom_tool_search = ENV.fetch("HEADROOM_TOOL_SEARCH", "1")
+headroom_protect_reads = ENV.fetch("HEADROOM_PROTECT_READS", "1")
+headroom_memory_injection_mode = ENV.fetch("HEADROOM_MEMORY_INJECTION_MODE", "live_zone_tail")
+headroom_strip_internal_headers = ENV.fetch("HEADROOM_STRIP_INTERNAL_HEADERS", "enabled")
+headroom_output_shaper = ENV.fetch("HEADROOM_OUTPUT_SHAPER", "1")
 headroom_target_ratio = ENV.fetch("HEADROOM_TARGET_RATIO", "0.4")
 headroom_memory_top_k = ENV.fetch("HEADROOM_MEMORY_TOP_K", "5")
 headroom_min_evidence = ENV.fetch("HEADROOM_MIN_EVIDENCE", "3")
@@ -98,12 +104,15 @@ env:
     HEADROOM_HOST: 0.0.0.0
     HEADROOM_PORT: "<%= headroom_port %>"
     HEADROOM_MODE: token
+    HEADROOM_SAVINGS_PROFILE: "<%= headroom_savings_profile %>"
     HEADROOM_AGENT_TYPE: codex
     HEADROOM_WORKSPACE_DIR: /home/nonroot/.headroom
     HEADROOM_CONFIG_DIR: /home/nonroot/.headroom/config
     HEADROOM_TARGET_RATIO: "<%= headroom_target_ratio %>"
     HEADROOM_LOSSLESS: "<%= headroom_lossless %>"
     HEADROOM_DEDUPE: "<%= headroom_dedupe %>"
+    HEADROOM_TOOL_SEARCH: "<%= headroom_tool_search %>"
+    HEADROOM_PROTECT_READS: "<%= headroom_protect_reads %>"
     HEADROOM_LOSSLESS_THEN_LOSSY: "<%= headroom_lossless_then_lossy %>"
     HEADROOM_DISABLE_KOMPRESS: "<%= headroom_disable_kompress %>"
     HEADROOM_DISABLE_KOMPRESS_FALLBACK: "<%= headroom_disable_kompress_fallback %>"
@@ -121,13 +130,15 @@ env:
     HEADROOM_MEMORY_TOP_K: "<%= headroom_memory_top_k %>"
     HEADROOM_MIN_EVIDENCE: "<%= headroom_min_evidence %>"
     HEADROOM_MEMORY_CONTEXT_TIMEOUT_SECONDS: "<%= headroom_memory_context_timeout_seconds %>"
+    HEADROOM_MEMORY_INJECTION_MODE: "<%= headroom_memory_injection_mode %>"
     HEADROOM_COMPRESSION_MAX_WORKERS: "<%= headroom_compression_max_workers %>"
     HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM: "<%= headroom_tool_output_compression_parallelism %>"
     HEADROOM_QDRANT_HOST: qdrant
     HEADROOM_QDRANT_PORT: "6333"
     HEADROOM_NEO4J_URI: neo4j://neo4j:7687
     HEADROOM_NEO4J_USER: neo4j
-    HEADROOM_OUTPUT_SHAPER: "1"
+    HEADROOM_OUTPUT_SHAPER: "<%= headroom_output_shaper %>"
+    HEADROOM_STRIP_INTERNAL_HEADERS: "<%= headroom_strip_internal_headers %>"
 <% unless headroom_verbosity_level.empty? %>
     HEADROOM_VERBOSITY_LEVEL: "<%= headroom_verbosity_level %>"
 <% end %>

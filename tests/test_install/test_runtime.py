@@ -9,8 +9,8 @@ from pathlib import Path
 import headroom.install.runtime as runtime_mod
 from headroom.install.models import DeploymentManifest, InstallPreset
 from headroom.install.runtime import (
-    _clear_pid,
     _checkout_headroom_script,
+    _clear_pid,
     _deployment_env,
     _mount_source,
     _read_pid,
@@ -18,8 +18,8 @@ from headroom.install.runtime import (
     _write_pid,
     acquire_runtime_start_lock,
     build_runtime_command,
-    resolve_headroom_config_command,
     resolve_headroom_command,
+    resolve_headroom_config_command,
     run_foreground,
     runtime_status,
     start_detached_agent,
@@ -311,7 +311,12 @@ def test_runtime_start_lock_blocks_another_process(monkeypatch, tmp_path: Path) 
         "with acquire_runtime_start_lock('default') as acquired:\n"
         "    print(acquired)\n"
     )
-    env = {**os.environ, "HOME": str(tmp_path), "PYTHONPATH": str(Path.cwd())}
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "USERPROFILE": str(tmp_path),
+        "PYTHONPATH": str(Path.cwd()),
+    }
 
     with acquire_runtime_start_lock("default") as acquired:
         assert acquired is True

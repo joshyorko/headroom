@@ -11,17 +11,10 @@ from fastapi import Request
 
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
-    _apply_openai_responses_output_shaper,
-    _estimate_openai_responses_output_shaper_input_tokens,
-    _extract_responses_usage,
     _is_allowed_websocket_origin,
-    _openai_responses_output_shaper_savings_label,
-    _openai_responses_output_shaper_seed,
     _openai_responses_unit_cache_key,
-    _openai_responses_ws_output_shaper_session_key,
     _resolve_codex_routing_headers,
 )
-from headroom.proxy.outcome import RequestOutcome
 
 
 def _jwt(payload: dict) -> str:
@@ -199,10 +192,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
     def _extract_tags(self, headers: dict[str, str]) -> dict[str, str]:
         return {}
 
-    async def _observe_traffic_for_learning(self, *args, **kwargs):  # noqa: ANN002, ANN003
-        return None
-
-    async def _retry_request(self, method: str, url: str, headers: dict, body: dict):
+    async def _retry_request(self, method: str, url: str, headers: dict, body: dict, **kwargs):
         self.captured_request = (method, url, headers, body)
         return _ResponseStub()
 
@@ -296,6 +286,39 @@ def test_handle_openai_responses_routes_chatgpt_auth_to_backend_api(monkeypatch)
     assert headers["ChatGPT-Account-ID"] == "acct-from-jwt"
     assert body["input"] == "hello"
     assert response.status_code == 200
+
+
+def test_handle_openai_responses_strips_codex_lite_header_upstream(monkeypatch):
+    # OpenAI rejects newer Codex models when the client-only lite header leaks
+    # upstream. The HTTP POST path must drop it like the WS handler does, while
+    # leaving adjacent headers intact.
+    token = _jwt(
+        {
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-from-jwt",
+            }
+        }
+    )
+    request = _build_request(
+        {"model": "gpt-5.4", "input": "hello"},
+        {
+            "Authorization": f"Bearer {token}",
+            "X-OpenAI-Internal-Codex-Responses-Lite": "true",
+            "X-OpenAI-Debug": "keep-me",
+        },
+    )
+    handler = _DummyOpenAIHandler()
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _method, _url, headers, _body = handler.captured_request
+    lowered = {k.lower(): v for k, v in headers.items()}
+    assert "x-openai-internal-codex-responses-lite" not in lowered
+    assert lowered.get("x-openai-debug") == "keep-me"
 
 
 def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
@@ -512,400 +535,6 @@ def test_handle_openai_responses_ws_resolves_codex_routing_headers():
         ):
             with pytest.raises(SentinelError, match="resolved"):
                 anyio.run(handler.handle_openai_responses_ws, websocket)
-
-def test_openai_responses_output_shaper_reaches_upstream_body(monkeypatch, caplog):
-    from headroom.proxy.output_shaper import steering_text
-
-    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
-    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
-    caplog.set_level("INFO", logger="headroom.proxy")
-    handler = _DummyOpenAIHandler()
-    request = _build_request(
-        {
-            "model": "gpt-5",
-            "instructions": "Follow project rules.",
-            "input": "Fix failing test.",
-        },
-        {"Authorization": "Bearer test"},
-    )
-
-    response = anyio.run(handler.handle_openai_responses, request)
-
-    assert response.status_code == 200
-    assert handler.captured_request is not None
-    _, _, _, body = handler.captured_request
-    assert body["instructions"].startswith("Follow project rules.\n\n")
-    assert steering_text(3) in body["instructions"]
-    assert str(body).count("<headroom_output_shaping>") == 1
-    assert "output_shaper:stratum:" in caplog.text
-    assert "output_shaper:verbosity:L3" in caplog.text
-
-
-def test_openai_responses_output_shaper_holdout_control_skips_shape(monkeypatch, caplog):
-    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
-    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "1")
-    caplog.set_level("INFO", logger="headroom.proxy")
-
-    handler = _DummyOpenAIHandler()
-    request = _build_request(
-        {
-            "model": "gpt-5",
-            "instructions": "Follow project rules.",
-            "input": "Fix failing test.",
-        },
-        {"Authorization": "Bearer test"},
-    )
-
-    response = anyio.run(handler.handle_openai_responses, request)
-
-    assert response.status_code == 200
-    assert handler.captured_request is not None
-    _, _, _, body = handler.captured_request
-    assert body["instructions"] == "Follow project rules."
-    assert "<headroom_output_shaping>" not in str(body)
-    assert "decision=skipped_holdout_control" in caplog.text
-    assert "output_shaper:control:" in caplog.text
-
-
-def test_openai_responses_holdout_arm_ignores_current_turn_input(monkeypatch):
-    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0.5")
-    first = {
-        "model": "gpt-5",
-        "instructions": "Follow project rules.",
-        "input": "Fix failing test A.",
-    }
-    second = {
-        "model": "gpt-5",
-        "instructions": "Follow project rules.",
-        "input": "Completely different turn B.",
-    }
-
-    first_label, first_arm, first_stratum = _openai_responses_output_shaper_savings_label(
-        first,
-        model="gpt-5",
-        input_tokens=128,
-        session_key="session-123",
-    )
-    second_label, second_arm, second_stratum = _openai_responses_output_shaper_savings_label(
-        second,
-        model="gpt-5",
-        input_tokens=128,
-        session_key="session-123",
-    )
-
-    assert first_arm == second_arm
-    assert first_stratum == second_stratum
-    assert first_label == second_label
-
-
-def test_openai_responses_holdout_seed_ignores_mutable_instructions_with_session_key():
-    first = {
-        "model": "gpt-5",
-        "instructions": "Initial project rules.",
-        "input": "Fix failing test A.",
-    }
-    second = {
-        "model": "gpt-5",
-        "instructions": "Injected memory plus different current instructions.",
-        "input": "Completely different turn B.",
-    }
-
-    assert _openai_responses_output_shaper_seed(
-        first,
-        session_key="conversation-123",
-    ) == _openai_responses_output_shaper_seed(
-        second,
-        session_key="conversation-123",
-    )
-
-
-def test_openai_responses_holdout_seed_uses_instructions_without_session_key():
-    first = {"model": "gpt-5", "instructions": "Rules A.", "input": "same"}
-    second = {"model": "gpt-5", "instructions": "Rules B.", "input": "same"}
-
-    assert _openai_responses_output_shaper_seed(first) != _openai_responses_output_shaper_seed(
-        second
-    )
-
-
-def test_openai_responses_ws_shaper_session_key_survives_reconnects_and_mutable_headers():
-    first_headers = {
-        "x-headroom-session-id": "conversation-123",
-        "user-agent": "codex/1",
-        "authorization": "Bearer first",
-    }
-    reconnect_headers = {
-        "x-headroom-session-id": "conversation-123",
-        "user-agent": "codex/2",
-        "authorization": "Bearer changed",
-    }
-
-    assert _openai_responses_ws_output_shaper_session_key(
-        first_headers,
-        client="codex",
-        project="headroom",
-    ) == _openai_responses_ws_output_shaper_session_key(
-        reconnect_headers,
-        client="codex",
-        project="headroom",
-    )
-
-
-def test_openai_responses_output_shaper_fail_open(monkeypatch, caplog):
-    def boom(*args, **kwargs):
-        raise RuntimeError("boom")
-
-    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
-    monkeypatch.setattr(
-        "headroom.proxy.handlers.openai._openai_responses_output_shaper_savings_label",
-        boom,
-    )
-    caplog.set_level("ERROR", logger="headroom.proxy")
-    body = {"model": "gpt-5", "instructions": "Rules.", "input": "Hello"}
-    transforms: list[str] = []
-
-    _apply_openai_responses_output_shaper(
-        body,
-        model="gpt-5",
-        input_tokens=42,
-        transforms_applied=transforms,
-        request_id="req-1",
-        endpoint="responses_http",
-        session_key="session-123",
-    )
-
-    assert body == {"model": "gpt-5", "instructions": "Rules.", "input": "Hello"}
-    assert transforms == []
-    assert "decision=error_fail_open" in caplog.text
-
-
-def test_openai_responses_output_shaper_fail_open_after_partial_mutation_is_transactional(
-    monkeypatch, caplog
-):
-    def mutate_then_boom(body, settings):
-        body["instructions"] = "partially mutated"
-        raise RuntimeError("boom")
-
-    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
-    monkeypatch.setattr(
-        "headroom.proxy.output_shaper.shape_openai_responses_request",
-        mutate_then_boom,
-    )
-    caplog.set_level("ERROR", logger="headroom.proxy")
-    body = {"model": "gpt-5", "instructions": "Rules.", "input": "Hello"}
-    transforms: list[str] = []
-
-    _apply_openai_responses_output_shaper(
-        body,
-        model="gpt-5",
-        input_tokens=42,
-        transforms_applied=transforms,
-        request_id="req-1",
-        endpoint="responses_http",
-        session_key="session-123",
-    )
-
-    assert body == {"model": "gpt-5", "instructions": "Rules.", "input": "Hello"}
-    assert transforms == []
-    assert "decision=error_fail_open" in caplog.text
-
-
-def test_codex_ws_output_shaper_estimator_uses_tokenizer_exact_count(monkeypatch):
-    seen_messages = []
-
-    class ExactTokenizer:
-        def count_messages(self, messages):
-            seen_messages.extend(messages)
-            return 123
-
-    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: ExactTokenizer())
-    frame = {
-        "type": "response.create",
-        "response": {
-            "model": "gpt-5",
-            "instructions": "Follow project rules.",
-            "input": "Fix failing test.",
-        },
-    }
-
-    assert _estimate_openai_responses_output_shaper_input_tokens(frame, model="gpt-5") == 123
-    assert seen_messages
-
-
-def test_codex_ws_output_shaper_stratum_uses_estimated_input_tokens():
-    frame = {
-        "type": "response.create",
-        "response": {
-            "model": "gpt-5",
-            "instructions": "Follow project rules.",
-            "input": [
-                {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "Fix the failing proxy test."}],
-                }
-            ],
-        },
-    }
-
-    input_tokens = _estimate_openai_responses_output_shaper_input_tokens(
-        frame,
-        model="gpt-5",
-    )
-
-    assert input_tokens > 0
-
-
-def test_codex_ws_response_completed_records_shaped_response_in_stats(monkeypatch, tmp_path):
-    pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
-
-    import headroom.proxy.output_savings as output_savings
-    from headroom.proxy.output_savings import SavingsRecorder, stratum_label
-    from headroom.proxy.server import ProxyConfig, create_app
-
-    recorder = SavingsRecorder(tmp_path / "output_savings.json", flush_every=999)
-    monkeypatch.setattr(output_savings, "get_recorder", lambda: recorder)
-    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
-    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
-    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0")
-
-    frame = {
-        "type": "response.create",
-        "response": {
-            "model": "gpt-5",
-            "instructions": "Follow project rules.",
-            "input": [
-                {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "Fix the failing proxy test."}],
-                }
-            ],
-        },
-    }
-    transforms: list[str] = []
-    _apply_openai_responses_output_shaper(
-        frame,
-        model="gpt-5",
-        input_tokens=_estimate_openai_responses_output_shaper_input_tokens(
-            frame,
-            model="gpt-5",
-        ),
-        transforms_applied=transforms,
-        request_id="ws-req-1",
-        endpoint="responses_ws",
-        session_key="ws-session-1",
-    )
-    completed_event = {
-        "type": "response.completed",
-        "response": {
-            "usage": {
-                "input_tokens": 64,
-                "output_tokens": 10,
-                "input_tokens_details": {"cached_tokens": 0},
-            }
-        },
-    }
-    input_tokens, output_tokens, cache_read, cache_write, uncached = _extract_responses_usage(
-        completed_event
-    )
-    handler = _DummyOpenAIHandler()
-
-    anyio.run(
-        handler._record_request_outcome,
-        RequestOutcome(
-            request_id="ws-req-1",
-            provider="openai",
-            model="gpt-5",
-            original_tokens=input_tokens,
-            optimized_tokens=input_tokens,
-            output_tokens=output_tokens,
-            tokens_saved=0,
-            attempted_input_tokens=input_tokens,
-            cache_read_tokens=cache_read,
-            cache_write_tokens=cache_write,
-            uncached_input_tokens=uncached,
-            total_latency_ms=1.0,
-            transforms_applied=tuple(transforms),
-            tags={"client": "codex"},
-            client="codex",
-        ),
-    )
-
-    assert sum(acc.n for acc in recorder._ledger.treatment.values()) == 1
-    treatment_key = next(iter(recorder._ledger.treatment))
-    assert recorder.record_from_labels([stratum_label("control", treatment_key)], 20)
-
-    app = create_app(
-        ProxyConfig(
-            optimize=False,
-            cache_enabled=False,
-            rate_limit_enabled=False,
-            cost_tracking_enabled=False,
-            log_requests=False,
-            ccr_inject_tool=False,
-            ccr_handle_responses=False,
-            ccr_context_tracking=False,
-        )
-    )
-    with TestClient(app) as client:
-        payload = client.get("/stats").json()
-
-    assert payload["tokens"]["output_reduction"]["requests"] == 1
-    assert "output_shaper:verbosity:L2" in transforms
-
-
-def test_openai_responses_output_shaper_records_output_savings(monkeypatch, tmp_path):
-    pytest.importorskip("fastapi")
-
-    from fastapi.testclient import TestClient
-
-    import headroom.proxy.output_savings as output_savings
-    from headroom.proxy.output_savings import SavingsRecorder, stratum_label
-    from headroom.proxy.server import ProxyConfig, create_app
-
-    recorder = SavingsRecorder(tmp_path / "output_savings.json", flush_every=999)
-    monkeypatch.setattr(output_savings, "get_recorder", lambda: recorder)
-    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
-    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
-    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0")
-
-    handler = _DummyOpenAIHandler()
-    request = _build_request(
-        {
-            "model": "gpt-5",
-            "instructions": "Follow project rules.",
-            "input": "Fix failing test.",
-        },
-        {"Authorization": "Bearer test"},
-    )
-
-    response = anyio.run(handler.handle_openai_responses, request)
-
-    assert response.status_code == 200
-    assert sum(acc.n for acc in recorder._ledger.treatment.values()) == 1
-    treatment_key = next(iter(recorder._ledger.treatment))
-    assert recorder.record_from_labels([stratum_label("control", treatment_key)], 20)
-
-    estimate = recorder.estimate()
-    assert estimate.n_requests == 1
-    assert estimate.baseline_tokens > 0
-
-    app = create_app(
-        ProxyConfig(
-            optimize=False,
-            cache_enabled=False,
-            rate_limit_enabled=False,
-            cost_tracking_enabled=False,
-            log_requests=False,
-            ccr_inject_tool=False,
-            ccr_handle_responses=False,
-            ccr_context_tracking=False,
-        )
-    )
-    with TestClient(app) as client:
-        payload = client.get("/stats").json()
-
-    assert payload["tokens"]["output_reduction"]["requests"] == 1
 
 
 def test_handle_openai_responses_ws_closes_unconfigured_origin(monkeypatch):

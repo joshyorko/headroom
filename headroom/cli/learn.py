@@ -402,13 +402,17 @@ def _run_verbosity(
     if agent == "auto":
         plugins = [p for p in auto_detect_plugins() if p.name in _VERBOSITY_AGENTS]
         if not plugins:
-            click.echo("Verbosity learning currently supports Claude Code and Codex transcripts only.")
+            click.echo(
+                "Verbosity learning currently supports Claude Code and Codex transcripts only."
+            )
             return
         plugin = plugins[0]
     else:
         plugin = get_plugin(agent)
         if plugin.name not in _VERBOSITY_AGENTS:
-            click.echo("Verbosity learning currently supports Claude Code and Codex transcripts only.")
+            click.echo(
+                "Verbosity learning currently supports Claude Code and Codex transcripts only."
+            )
             return
 
     all_projects = plugin.discover_projects()

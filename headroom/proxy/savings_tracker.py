@@ -14,7 +14,6 @@ import math
 import os
 import tempfile
 import threading
-import urllib.parse
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -22,16 +21,19 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom.proxy import project_name_policy
+
+PROJECT_NAME_MAX_LENGTH = project_name_policy.PROJECT_NAME_MAX_LENGTH
+sanitize_project_name = project_name_policy.sanitize_project_name
 
 logger = logging.getLogger(__name__)
 
 HEADROOM_SAVINGS_PATH_ENV_VAR = _paths.HEADROOM_SAVINGS_PATH_ENV
 DEFAULT_SAVINGS_DIR = ".headroom"
 DEFAULT_SAVINGS_FILE = "proxy_savings.json"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_MAX_HISTORY_POINTS = 5000
 DEFAULT_MAX_PROJECTS = 50
-PROJECT_NAME_MAX_LENGTH = 128
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
 DEFAULT_MAX_RESPONSE_HISTORY_POINTS = 500
 DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES = 60
@@ -107,6 +109,8 @@ def _bucket_start(timestamp: datetime, bucket: str) -> datetime:
 
 
 def _coerce_int(value: Any, default: int = 0) -> int:
+    # OverflowError: int(float("inf")) — json accepts bare Infinity, and a
+    # corrupted state file must not crash proxy startup.
     try:
         return max(int(value), 0)
     except (TypeError, ValueError, OverflowError):
@@ -114,12 +118,12 @@ def _coerce_int(value: Any, default: int = 0) -> int:
 
 
 def _coerce_float(value: Any, default: float = 0.0) -> float:
+    # NaN is absorbing under += — one poisoned value would brick an
+    # accumulator forever, so reject non-finite values outright.
     try:
         coerced = float(value)
     except (TypeError, ValueError, OverflowError):
         return default
-    # Reject NaN/inf -- float() accepts them, but they poison arithmetic and
-    # serialize to JSON the dashboard's JSON.parse rejects.
     if not math.isfinite(coerced):
         return default
     return max(coerced, 0.0)
@@ -210,6 +214,42 @@ def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
         return float(tokens_saved) * float(input_cost_per_token)
     except Exception:
         return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+
+
+def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
+    """Estimate cache-read savings in USD — the discount delta vs list price.
+
+    Cache reads bill at the provider's discounted rate, so the saving per token
+    is ``input_cost_per_token - cache_read_input_token_cost``. Unknown models
+    price as 0.0 (fail open); tokens still accumulate. An unavailable litellm
+    falls back to ``DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN``, matching
+    ``_estimate_input_cost_usd``/``_estimate_compression_savings_usd`` — otherwise
+    cache_savings_usd silently reads as $0 forever on any install without
+    litellm (e.g. Python 3.14, where headroom's own dependency spec excludes it).
+
+    Deliberately diverges from ``proxy/cost.py``'s session-scoped provider
+    multipliers (``_CACHE_ECONOMICS``): this lifetime figure follows the
+    per-model litellm pricing the rest of this module already uses.
+    """
+    litellm = _get_litellm_module()
+    if cache_read_tokens <= 0:
+        return 0.0
+    if litellm is None:
+        return float(cache_read_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+
+    try:
+        resolved = _resolve_litellm_model(model)
+        info = litellm.model_cost.get(resolved, {})
+        input_cost_per_token = info.get("input_cost_per_token")
+        if not input_cost_per_token:
+            return 0.0
+        cache_read_cost = info.get("cache_read_input_token_cost", input_cost_per_token)
+        discount = float(input_cost_per_token) - float(cache_read_cost)
+        if discount <= 0:
+            return 0.0
+        return float(cache_read_tokens) * discount
+    except Exception:
+        return 0.0
 
 
 def _estimate_input_cost_usd(
@@ -322,29 +362,14 @@ def _empty_display_session() -> dict[str, Any]:
         "requests": 0,
         "tokens_saved": 0,
         "compression_savings_usd": 0.0,
+        "cache_read_tokens": 0,
+        "cache_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
         "savings_percent": 0.0,
         "started_at": None,
         "last_activity_at": None,
     }
-
-
-def sanitize_project_name(value: Any) -> str | None:
-    """Normalize a client-supplied project name; ``None`` when unusable.
-
-    Strips control characters, trims whitespace, and caps length so a
-    misbehaving client cannot bloat the persisted state or the dashboard.
-    Percent-encoded values (from non-ASCII cwd names) are decoded first so
-    the stored project name matches the original directory name.
-    """
-    if not isinstance(value, str):
-        return None
-    value = urllib.parse.unquote(value)
-    cleaned = "".join(ch for ch in value if ch.isprintable()).strip()
-    if not cleaned:
-        return None
-    return cleaned[:PROJECT_NAME_MAX_LENGTH]
 
 
 def _empty_project_entry() -> dict[str, Any]:
@@ -414,6 +439,11 @@ def _normalize_display_session(entry: Any) -> dict[str, Any]:
         "tokens_saved": tokens_saved,
         "compression_savings_usd": round(
             _coerce_float(entry.get("compression_savings_usd")),
+            6,
+        ),
+        "cache_read_tokens": _coerce_int(entry.get("cache_read_tokens")),
+        "cache_savings_usd": round(
+            _coerce_float(entry.get("cache_savings_usd")),
             6,
         ),
         "total_input_tokens": total_input_tokens,
@@ -567,6 +597,8 @@ class SavingsTracker:
         delta_tokens_saved = _coerce_int(tokens_saved)
         delta_input_tokens = _coerce_int(input_tokens)
         delta_savings_usd = _estimate_compression_savings_usd(model, delta_tokens_saved)
+        delta_cache_read_tokens = _coerce_int(cache_read_tokens)
+        delta_cache_savings_usd = _estimate_cache_savings_usd(model, delta_cache_read_tokens)
         delta_input_cost_usd = _estimate_input_cost_usd(
             model,
             delta_input_tokens,
@@ -612,6 +644,11 @@ class SavingsTracker:
                 lifetime["compression_savings_usd"] + delta_savings_usd,
                 6,
             )
+            lifetime["cache_read_tokens"] += delta_cache_read_tokens
+            lifetime["cache_savings_usd"] = round(
+                lifetime["cache_savings_usd"] + delta_cache_savings_usd,
+                6,
+            )
             lifetime["total_input_tokens"] = next_total_input_tokens
             lifetime["total_input_cost_usd"] = next_total_input_cost_usd
 
@@ -629,6 +666,11 @@ class SavingsTracker:
             session["tokens_saved"] += delta_tokens_saved
             session["compression_savings_usd"] = round(
                 session["compression_savings_usd"] + delta_savings_usd,
+                6,
+            )
+            session["cache_read_tokens"] += delta_cache_read_tokens
+            session["cache_savings_usd"] = round(
+                session["cache_savings_usd"] + delta_cache_savings_usd,
                 6,
             )
             session["total_input_tokens"] += session_input_tokens_delta
@@ -849,6 +891,8 @@ class SavingsTracker:
                 "requests": 0,
                 "tokens_saved": 0,
                 "compression_savings_usd": 0.0,
+                "cache_read_tokens": 0,
+                "cache_savings_usd": 0.0,
                 "total_input_tokens": 0,
                 "total_input_cost_usd": 0.0,
             },
@@ -888,12 +932,16 @@ class SavingsTracker:
         lifetime_requests = 0
         lifetime_tokens_saved = 0
         lifetime_savings_usd = 0.0
+        lifetime_cache_read_tokens = 0
+        lifetime_cache_savings_usd = 0.0
         lifetime_input_tokens = 0
         lifetime_input_cost_usd = 0.0
         if isinstance(lifetime_raw, dict):
             lifetime_requests = _coerce_int(lifetime_raw.get("requests"))
             lifetime_tokens_saved = _coerce_int(lifetime_raw.get("tokens_saved"))
             lifetime_savings_usd = _coerce_float(lifetime_raw.get("compression_savings_usd"))
+            lifetime_cache_read_tokens = _coerce_int(lifetime_raw.get("cache_read_tokens"))
+            lifetime_cache_savings_usd = _coerce_float(lifetime_raw.get("cache_savings_usd"))
             lifetime_input_tokens = _coerce_int(lifetime_raw.get("total_input_tokens"))
             lifetime_input_cost_usd = _coerce_float(lifetime_raw.get("total_input_cost_usd"))
 
@@ -922,6 +970,8 @@ class SavingsTracker:
                 "requests": lifetime_requests,
                 "tokens_saved": lifetime_tokens_saved,
                 "compression_savings_usd": round(lifetime_savings_usd, 6),
+                "cache_read_tokens": lifetime_cache_read_tokens,
+                "cache_savings_usd": round(lifetime_cache_savings_usd, 6),
                 "total_input_tokens": lifetime_input_tokens,
                 "total_input_cost_usd": round(lifetime_input_cost_usd, 6),
             },
@@ -1063,6 +1113,23 @@ class SavingsTracker:
                 except OSError:
                     pass
                 raise
+
+            # Persist the rename itself — the fsync above flushed the file's
+            # bytes, but the directory entry the rename created isn't durable
+            # until the parent directory is fsynced too (POSIX). Best-effort —
+            # directory fsync is unsupported on Windows and some virtual
+            # filesystems; the file and atomic rename are already durable, so a
+            # failure here only forgoes the last-save crash guarantee, never
+            # correctness. (FP4b)
+            try:
+                dir_fd = os.open(self._path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+
             # Reset only after a durable write. A failed save leaves the counter
             # untouched so the next record retries instead of waiting a full window.
             self._since_save = 0

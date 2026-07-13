@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from headroom.cache import compression_store as compression_store_module
 from headroom.cache.compression_store import (
     get_compression_store,
     reset_compression_store,
@@ -91,10 +92,94 @@ def test_compress_savings_percent_tracks_token_counts(fresh_store) -> None:
         assert result["savings_percent"] > 0.0
 
 
-def test_mcp_retrieve_with_nonmatching_query_returns_full_content(fresh_store) -> None:
-    """A query that matches no item above the relevance floor must still return
-    the stored entry (it exists and is unexpired) rather than the "Content not
-    found" error, which is reserved for genuine misses."""
+def test_mcp_compress_surfaces_unreachable_proxy(fresh_store) -> None:
+    server = mcp_server.HeadroomMCPServer(
+        proxy_url="http://127.0.0.1:9",
+        check_proxy=True,
+    )
+
+    response = asyncio.run(server._handle_compress({"content": "dead proxy check"}))
+    payload = json.loads(response[0].kwargs["text"])
+
+    assert payload["proxy"]["status"] == "unreachable"
+    assert payload["proxy"]["url"] == "http://127.0.0.1:9"
+    assert "unreachable" in payload["warning"].lower()
+
+
+def test_mcp_stats_surfaces_unreachable_proxy() -> None:
+    server = mcp_server.HeadroomMCPServer(
+        proxy_url="http://127.0.0.1:9",
+        check_proxy=True,
+    )
+
+    response = asyncio.run(server._handle_stats())
+    payload = json.loads(response[0].kwargs["text"])
+
+    assert payload["proxy"]["status"] == "unreachable"
+    assert payload["proxy"]["url"] == "http://127.0.0.1:9"
+    assert "unreachable" in payload["warning"].lower()
+
+
+def test_mcp_proxy_probe_preserves_shared_proxy_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ProbeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {"status": "healthy", "alive": True}
+
+    class ProbeClient:
+        def __init__(self, *, timeout: float) -> None:
+            seen["timeout"] = timeout
+
+        async def __aenter__(self) -> ProbeClient:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            seen["closed"] = True
+
+        async def get(self, url: str) -> ProbeResponse:
+            seen["url"] = url
+            return ProbeResponse()
+
+    seen: dict[str, object] = {}
+    shared_client = object()
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", ProbeClient)
+
+    server = mcp_server.HeadroomMCPServer(
+        proxy_url="http://127.0.0.1:8765",
+        check_proxy=True,
+    )
+    server._http_client = shared_client  # type: ignore[assignment]
+
+    result = asyncio.run(server._probe_proxy_unreachable())
+
+    assert result is None
+    assert seen == {
+        "timeout": 5.0,
+        "url": "http://127.0.0.1:8765/livez",
+        "closed": True,
+    }
+    assert server._http_client is shared_client
+
+
+def test_mcp_local_mode_still_works_without_proxy_checking(fresh_store) -> None:
+    server = mcp_server.HeadroomMCPServer(
+        proxy_url="http://127.0.0.1:9",
+        check_proxy=False,
+    )
+
+    response = asyncio.run(server._handle_compress({"content": "local mode stays available"}))
+    payload = json.loads(response[0].kwargs["text"])
+
+    assert "proxy" not in payload
+    assert "warning" not in payload or "unreachable" not in payload["warning"].lower()
+
+
+def test_mcp_retrieve_returns_full_content(fresh_store) -> None:
+    """Retrieval is by hash: a stored, unexpired entry always returns its full
+    original content (never empty, never a spurious "not found")."""
     original = "the the the the the the the the the the\n" * 5
     hash_key = get_compression_store().store(original, "<<small>>")
     # Precondition: the query genuinely matches nothing above the BM25 floor.
@@ -109,8 +194,220 @@ def test_mcp_retrieve_with_nonmatching_query_returns_full_content(fresh_store) -
     assert result["count"] == 0
 
 
-def test_mcp_retrieve_missing_hash_still_errors(fresh_store) -> None:
-    """A genuinely missing hash must still report "Content not found"."""
+def test_mcp_retrieve_expired_hash_returns_terminal_guidance(
+    monkeypatch,
+    fresh_store,
+) -> None:
+    """An expired local hash should say it expired and tell the agent to stop retrying."""
+    current_time = [1000.0]
+
+    def fake_time() -> float:
+        return current_time[0]
+
+    monkeypatch.setattr(mcp_server.time, "time", fake_time)
+    monkeypatch.setattr(compression_store_module.time, "time", fake_time)
+
+    store = get_compression_store()
+    hash_key = store.store("expired content", "<<small>>", ttl=1)
+    current_time[0] = 1002.0
+
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
-    result = asyncio.run(server._retrieve_content("nonexistent_hash", query="anything"))
-    assert "Content not found" in result.get("error", "")
+    result = asyncio.run(server._retrieve_content(hash_key))
+
+    assert result["status"] == "expired"
+    assert result["ttl_seconds"] == 1
+    assert result["age_seconds"] == pytest.approx(2.0)
+    assert "Entry expired" in result["error"]
+    assert "do not retry the same hash" in result["error"].lower()
+    assert "re-run the command" in result["hint"].lower()
+
+
+def test_mcp_retrieve_hash_expiring_during_lookup_returns_terminal_guidance(
+    monkeypatch,
+    fresh_store,
+) -> None:
+    phase = "store"
+    status_seen = False
+
+    def fake_time() -> float:
+        if phase == "store":
+            return 1000.0
+        return 1001.1 if status_seen else 1000.5
+
+    monkeypatch.setattr(mcp_server.time, "time", fake_time)
+    monkeypatch.setattr(compression_store_module.time, "time", fake_time)
+
+    store = get_compression_store()
+    hash_key = store.store("expired during retrieve", "<<small>>", ttl=1)
+    phase = "retrieve"
+
+    original_get_entry_status = store.get_entry_status
+    original_retrieve = store.retrieve
+
+    def get_entry_status_then_expire(*args, **kwargs):
+        nonlocal status_seen
+        result = original_get_entry_status(*args, **kwargs)
+        status_seen = True
+        return result
+
+    monkeypatch.setattr(store, "get_entry_status", get_entry_status_then_expire)
+    monkeypatch.setattr(store, "retrieve", original_retrieve)
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content(hash_key))
+
+    assert result["status"] == "expired"
+    assert result["ttl_seconds"] == 1
+    assert result["age_seconds"] == pytest.approx(1.1)
+    assert "Entry expired" in result["error"]
+    assert "do not retry the same hash" in result["error"].lower()
+
+
+def test_mcp_retrieve_missing_local_hash_can_still_hit_proxy(
+    monkeypatch,
+    fresh_store,
+) -> None:
+    monkeypatch.setattr(mcp_server, "HTTPX_AVAILABLE", True)
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+
+    async def retrieve_via_proxy(hash_key: str) -> dict[str, object]:
+        return {"hash": hash_key, "original_content": "from proxy"}
+
+    server._retrieve_via_proxy = retrieve_via_proxy
+
+    result = asyncio.run(server._retrieve_content("proxy_hash"))
+
+    assert result["source"] == "proxy"
+    assert result["hash"] == "proxy_hash"
+    assert result["original_content"] == "from proxy"
+
+
+def test_mcp_retrieve_expired_local_hash_can_still_hit_proxy(
+    monkeypatch,
+    fresh_store,
+) -> None:
+    current_time = [1000.0]
+
+    def fake_time() -> float:
+        return current_time[0]
+
+    monkeypatch.setattr(mcp_server, "HTTPX_AVAILABLE", True)
+    monkeypatch.setattr(mcp_server.time, "time", fake_time)
+    monkeypatch.setattr(compression_store_module.time, "time", fake_time)
+
+    store = get_compression_store()
+    hash_key = store.store("expired local content", "<<small>>", ttl=1)
+    current_time[0] = 1002.0
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+
+    async def retrieve_via_proxy(proxy_hash_key: str) -> dict[str, object]:
+        return {"hash": proxy_hash_key, "original_content": "from proxy"}
+
+    server._retrieve_via_proxy = retrieve_via_proxy
+
+    result = asyncio.run(server._retrieve_content(hash_key))
+
+    assert result["source"] == "proxy"
+    assert result["hash"] == hash_key
+    assert result["original_content"] == "from proxy"
+
+
+def test_mcp_retrieve_missing_hash_still_errors(fresh_store) -> None:
+    """A never-stored hash must stay on the generic missing path, not expired guidance."""
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content("nonexistent_hash"))
+    assert result.get("status") is None
+    assert result["error"] == "Content not found. It may have expired or the hash may be incorrect."
+    assert "do not retry the same hash" not in result.get("hint", "").lower()
+
+
+def test_handle_stats_session_output_is_window_scoped() -> None:
+    """window-scoped stats output should be explicitly labeled after this change."""
+
+    async def fetch_stats() -> dict[str, object]:
+        return {
+            "summary": {
+                "mode": "token",
+                "api_requests": 3,
+                "compression": {},
+            }
+        }
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._fetch_full_proxy_stats = fetch_stats
+    response = asyncio.run(server._handle_stats())
+    text = response[0].kwargs["text"]
+
+    assert "Headroom Window-Scoped Session Summary" in text
+    assert "Headroom Session Summary" not in text
+
+
+def test_handle_stats_includes_lifetime_totals_from_persistent_savings() -> None:
+    """Lifetime savings are appended from /stats persistent_savings.lifetime."""
+
+    async def fetch_stats() -> dict[str, object]:
+        return {
+            "summary": {
+                "mode": "token",
+                "api_requests": 3,
+                "compression": {},
+            },
+            "persistent_savings": {
+                "lifetime": {"tokens_saved": 12345, "compression_savings_usd": 7.25}
+            },
+        }
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._fetch_full_proxy_stats = fetch_stats
+    response = asyncio.run(server._handle_stats())
+    text = response[0].kwargs["text"]
+
+    assert "Lifetime Savings:" in text
+    assert "Tokens saved: 12,345" in text
+    assert "Compression savings: $7.25" in text
+
+
+def test_handle_stats_falls_back_gracefully_without_persistent_lifetime() -> None:
+    """Missing lifetime data should still return a valid session summary."""
+
+    async def fetch_stats() -> dict[str, object]:
+        return {
+            "summary": {
+                "mode": "token",
+                "api_requests": 3,
+                "compression": {},
+            },
+            "persistent_savings": {"lifetime": None},
+        }
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._fetch_full_proxy_stats = fetch_stats
+    response = asyncio.run(server._handle_stats())
+    text = response[0].kwargs["text"]
+
+    assert "Headroom Window-Scoped Session Summary" in text
+    assert "Lifetime Savings:" not in text
+
+
+def test_handle_stats_shows_zero_lifetime_totals_when_present() -> None:
+    """A present lifetime payload should still render explicit zero totals."""
+
+    async def fetch_stats() -> dict[str, object]:
+        return {
+            "summary": {
+                "mode": "token",
+                "api_requests": 3,
+                "compression": {},
+            },
+            "persistent_savings": {"lifetime": {"tokens_saved": 0, "compression_savings_usd": 0.0}},
+        }
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._fetch_full_proxy_stats = fetch_stats
+    response = asyncio.run(server._handle_stats())
+    text = response[0].kwargs["text"]
+
+    assert "Lifetime Savings:" in text
+    assert "Tokens saved: 0" in text
+    assert "Compression savings: $0.00" in text

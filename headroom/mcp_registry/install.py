@@ -16,6 +16,7 @@ from .opencode import OpencodeRegistrar
 def resolve_headroom_command() -> list[str]:
     return resolve_headroom_config_command()
 
+
 #: Default proxy URL used when none is given.
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
 

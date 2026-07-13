@@ -45,7 +45,7 @@ jobs:
           - { name: amd64, runs_on: ubuntu-24.04, platform: linux/amd64 }
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Normalize image name
         id: image-name

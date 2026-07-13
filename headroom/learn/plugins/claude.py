@@ -70,12 +70,14 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 
             project_path = _decode_project_path(entry.name)
             if project_path is None:
-                fallback_parts = entry.name[1:].split("-")
-                if len(fallback_parts[0]) == 1 and fallback_parts[0].isalpha():
-                    drive = fallback_parts[0].upper()
-                    project_path = Path(f"{drive}:\\" + "\\".join(fallback_parts[1:]))
+                win = re.match(r"^-?([A-Za-z])--?(.+)$", entry.name)
+                if win:
+                    drive = win.group(1).upper()
+                    tokens = [p for p in win.group(2).split("-") if p]
+                    project_path = Path(f"{drive}:\\" + "\\".join(tokens))
                 else:
-                    project_path = Path("/" + entry.name[1:].replace("-", "/"))
+                    stripped = entry.name.lstrip("-")
+                    project_path = Path("/" + stripped.replace("-", "/"))
 
             name = _project_display_name(project_path, entry.name)
 
@@ -94,6 +96,11 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
             if not jsonl_files:
                 continue
 
+            session_project_path = self._project_path_from_session_cwd(jsonl_files)
+            if session_project_path is not None:
+                project_path = session_project_path
+                name = _project_display_name(project_path, entry.name)
+
             projects.append(
                 ProjectInfo(
                     name=name,
@@ -105,6 +112,27 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
             )
 
         return projects
+
+    @staticmethod
+    def _project_path_from_session_cwd(jsonl_files: list[Path]) -> Path | None:
+        for jsonl_path in sorted(jsonl_files):
+            try:
+                with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        cwd = event.get("cwd")
+                        if isinstance(cwd, str) and cwd:
+                            project_path = Path(cwd)
+                            if project_path.exists():
+                                return project_path
+            except (OSError, UnicodeDecodeError):
+                continue
+        return None
 
     def scan_project(
         self, project: ProjectInfo, max_workers: int = 1, include_subagents: bool = True
@@ -335,27 +363,47 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 # =============================================================================
 
 
+def _decode_windows_path(drive: str, parts: list[str]) -> Path | None:
+    """Reconstruct a Windows path from drive letter + dash-split tokens.
+
+    Empty tokens (from consecutive dashes in the encoded name) are dropped so
+    the literal join never produces doubled separators.
+    """
+    tokens = [p for p in parts if p]
+    if not tokens:
+        return None
+    win_path = Path(f"{drive}:\\" + "\\".join(tokens))
+    if win_path.exists():
+        return win_path
+    drive_root = Path(f"{drive}:\\")
+    if drive_root.exists():
+        result = _greedy_path_decode(drive_root, tokens)
+        if result:
+            return result
+    if tokens[0].lower() == "users":
+        return win_path
+    return None
+
+
 def _decode_project_path(escaped_name: str) -> Path | None:
     """Decode a Claude Code escaped project path."""
+    # Windows paths are encoded without a leading dash: "C:\Users\x" becomes
+    # "C--Users-x" (":" and "\" each collapse to "-"). Older callers also pass
+    # the legacy "-C-Users-x" form; accept both.
+    win = re.match(r"^-?([A-Za-z])--?(.+)$", escaped_name)
+    if win:
+        result = _decode_windows_path(win.group(1).upper(), win.group(2).split("-"))
+        if result is not None:
+            return result
+        if not escaped_name.startswith("-"):
+            return None
+
     if not escaped_name.startswith("-"):
         return None
 
     parts = escaped_name[1:].split("-")
     if len(parts) < 2:
         return None
-
-    if len(parts[0]) == 1 and parts[0].isalpha():
-        drive = parts[0].upper()
-        win_path = Path(f"{drive}:\\" + "\\".join(parts[1:]))
-        if win_path.exists():
-            return win_path
-        win_base = Path(f"{drive}:\\{parts[1]}") if len(parts) > 1 else win_path
-        if win_base.exists() and len(parts) > 2:
-            result = _greedy_path_decode(win_base, parts[2:])
-            if result:
-                return result
-        if len(parts) > 1 and parts[1].lower() == "users":
-            return win_path
 
     simple = Path("/" + escaped_name[1:].replace("-", "/"))
     if simple.exists():
@@ -398,9 +446,23 @@ def _greedy_path_decode(base: Path, parts: list[str]) -> Path | None:
         return None
 
     try:
-        children = sorted(child for child in base.iterdir() if child.is_dir())
+        entries = list(base.iterdir())
     except OSError:
         return None
+
+    # Windows profiles routinely contain reparse-point junctions (e.g.
+    # "AppData\Local\Temporary Internet Files") that raise PermissionError on
+    # is_dir(). Skip those entries individually instead of letting one
+    # inaccessible sibling abort the whole listing — and thus every project
+    # path that happens to walk through this directory.
+    children = []
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                children.append(entry)
+        except OSError:
+            continue
+    children.sort()
 
     for child in children:
         for tokenization in _component_tokenizations(child.name):

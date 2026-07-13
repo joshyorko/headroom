@@ -15,12 +15,12 @@ Usage:
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import io
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import socket
@@ -30,6 +30,7 @@ import tempfile
 import time
 import urllib.parse
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -45,10 +46,12 @@ import click
 
 from headroom import fsutil
 from headroom._version import __version__ as _HEADROOM_VERSION
+from headroom._version import normalize_release_version as _normalize_release_version
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
 from headroom.copilot_auth import (
+    DEFAULT_API_URL,
     has_oauth_auth,
     resolve_client_bearer_token,
     resolve_copilot_api_url,
@@ -85,6 +88,9 @@ from headroom.providers.copilot import (
 )
 from headroom.providers.copilot import (
     model_configured as _copilot_model_configured_impl,
+)
+from headroom.providers.copilot import (
+    normalize_proxy_root_url as _normalize_copilot_proxy_root_url,
 )
 from headroom.providers.copilot import (
     provider_key_source as _copilot_provider_key_source,
@@ -125,6 +131,12 @@ from headroom.providers.opencode.config import (
     opencode_config_paths,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
+)
+from headroom.proxy.project_context import (
+    with_client_prefix as _with_client_prefix,
+)
+from headroom.proxy.project_context import (
+    with_copilot_upstream_prefix as _with_copilot_upstream_prefix,
 )
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
@@ -349,20 +361,27 @@ def _port_bind_error(port: int) -> OSError | None:
             s.bind(("127.0.0.1", port))
     except OSError as exc:
         return exc
+    except OverflowError:
+        return OSError(errno.EADDRNOTAVAIL, f"Port {port} out of range (0-65535)")
     return None
 
 
-def _format_unbindable_port_error(port: int, error: OSError, agent_type: str) -> str:
-    """Build an actionable message for ports that fail before uvicorn can bind."""
-    command = "headroom proxy"
-    if agent_type != "unknown":
-        command = f"headroom wrap {agent_type}"
-    suggested_port = port + 1
-    return (
-        f"Port {port} is unavailable on 127.0.0.1 before the proxy can start: {error}. "
-        "On Windows this can happen when the port is in an excluded or reserved range. "
-        f"Rerun with a different port, for example `{command} --port {suggested_port}`."
-    )
+def _find_available_port(start_port: int, max_attempts: int = 100) -> int:
+    """Find first available port >= start_port via socket.bind probe.
+
+    Skips ports with EADDRINUSE (busy) and EACCES (reserved on Windows,
+    privileged on Linux) — both indicate the port can't be bound here.
+    Other OS errors (EADDRNOTAVAIL) propagate immediately.
+    Raises RuntimeError when no port is found in range.
+    """
+    end_port = min(start_port + max_attempts, 65536)
+    for port in range(start_port, end_port):
+        error = _port_bind_error(port)
+        if error is None:
+            return port
+        if error.errno not in (errno.EADDRINUSE, errno.EACCES):
+            raise error
+    raise RuntimeError(f"No available port found in range {start_port}-{end_port - 1}")
 
 
 def _get_log_path() -> Path:
@@ -400,7 +419,11 @@ def _start_proxy(
     Stdout and stderr are written to a dedicated sibling file, usually
     `~/.headroom/logs/proxy-stdio.log`, to avoid pipe deadlock risk without
     competing with the rotating `proxy.log` runtime log.
+
+    The caller is responsible for ensuring *port* is available
+    (see ``_find_available_port``).
     """
+
     cmd = [sys.executable, "-m", "headroom.cli", "proxy", "--port", str(port)]
 
     # Forward HEADROOM_MODE env var so the proxy respects the user's mode choice
@@ -581,65 +604,89 @@ def _setup_rtk(verbose: bool = False) -> Path | None:
         if verbose:
             click.echo("  rtk hooks registered in Claude Code")
         try:
-            patched = _patch_rtk_hook_absolute_path(rtk_path)
-            if patched and verbose:
-                click.echo("  rtk hook script patched to use absolute path")
+            linked = _ensure_rtk_on_path(rtk_path)
+            if linked and verbose:
+                click.echo(f"  rtk linked onto PATH at {linked}")
         except Exception as e:
             if verbose:
-                click.echo(f"  rtk hook absolute-path patch skipped: {e}")
+                click.echo(f"  rtk PATH link skipped: {e}")
     else:
         click.echo("  rtk hook registration failed — continuing without it")
 
     return rtk_path
 
 
-def _patch_rtk_hook_absolute_path(rtk_path: Path, hook_script_path: Path | None = None) -> bool:
-    """Rewrite bare ``rtk`` invocations in the generated Claude hook script
-    to use the absolute path to the RTK binary Headroom manages.
+def _ensure_rtk_on_path(rtk_path: Path, path_dirs: list[str] | None = None) -> Path | None:
+    """Make the Headroom-managed rtk resolvable as a bare ``rtk`` on PATH.
 
-    ``rtk init --global --auto-patch`` writes ``~/.claude/hooks/rtk-rewrite.sh``
-    with a bare ``rtk`` command that depends on PATH lookup. Since
-    ``~/.headroom/bin`` (where Headroom installs rtk) is not automatically
-    added to PATH, that lookup fails and the hook silently does nothing.
+    ``rtk init --global --auto-patch`` writes ``~/.claude/hooks/rtk-rewrite.sh``,
+    and ``rtk rewrite`` emits a bare ``rtk`` token at runtime that the hook feeds
+    back to the shell — so bare ``rtk`` has to resolve on PATH regardless of the
+    hook's contents. Since ``~/.headroom/bin`` (where Headroom installs rtk) is
+    not on PATH by default, that lookup fails and compression silently never
+    runs (issue #487).
 
-    This rewrites bare ``rtk`` command tokens to the absolute, shell-quoted
-    path of the rtk binary so the hook works regardless of PATH.
+    An earlier fix rewrote the generated hook to hard-code rtk's absolute path.
+    That mutates the hook *after* ``rtk init`` bakes in its expected SHA-256, so
+    rtk's integrity guard rejects it (``hook integrity check FAILED … RTK will
+    not execute``) and only absolutizes the hook's own ``rtk`` call — not the
+    bare ``rtk`` that ``rtk rewrite`` emits at runtime (issue #1631). Instead,
+    leave the canonical hook untouched and link the managed binary into a PATH
+    directory so bare ``rtk`` resolves.
 
-    Idempotent: only rewrites bare ``rtk`` tokens (not paths that already
-    point elsewhere), and only writes the file back if content changed.
+    Idempotent and conservative:
+      * no-op if a ``rtk`` already resolves on PATH (managed or system);
+      * no-op on Windows (symlinks need privilege; hooks resolve differently);
+      * only creates/refreshes a symlink Headroom owns — never clobbers an
+        existing real file or foreign binary.
 
-    Returns True if the hook script was modified.
+    Returns the link path that was created or already correct, else ``None``.
     """
-    if hook_script_path is None:
-        hook_script_path = Path.home() / ".claude" / "hooks" / "rtk-rewrite.sh"
+    if sys.platform == "win32":
+        return None
 
-    if not hook_script_path.exists():
-        return False
+    # A bare `rtk` already resolves — the hook will find it, nothing to do.
+    if shutil.which("rtk"):
+        return None
 
-    original = _read_text(hook_script_path)
+    if path_dirs is None:
+        path_dirs = os.environ.get("PATH", "").split(os.pathsep)
 
-    # Quote the absolute path safely for POSIX shells. This matters because
-    # paths containing spaces or other shell-special characters (e.g.
-    # "/Users/Alice Smith/.headroom/bin/rtk") must be quoted, or the
-    # generated script will break when the shell splits on whitespace.
-    quoted_path = shlex.quote(str(rtk_path))
+    preferred = Path.home() / ".local" / "bin"
 
-    # Replace bare `rtk` command tokens with the quoted absolute path.
-    # Matches `rtk` as a standalone word (preceded by start-of-line or
-    # whitespace/operators, followed by whitespace or end-of-line), so it
-    # won't touch things like "rtkfoo" or "/some/path/rtk" that are already
-    # absolute.
-    patched, count = re.subn(
-        r"(?<![\w/-])rtk(?=\s|$)",
-        lambda _match: quoted_path,
-        original,
-    )
+    # Prefer ~/.local/bin (conventionally on PATH), then any other PATH dir.
+    ordered: list[Path] = []
+    if str(preferred) in path_dirs:
+        ordered.append(preferred)
+    for entry in path_dirs:
+        if not entry:
+            continue
+        candidate = Path(entry)
+        if candidate not in ordered:
+            ordered.append(candidate)
 
-    if count and patched != original:
-        _write_text(hook_script_path, patched)
-        return True
+    target = rtk_path.resolve()
 
-    return False
+    for target_dir in ordered:
+        link = target_dir / "rtk"
+        try:
+            # Existing correct link — done.
+            if link.is_symlink() and link.resolve() == target:
+                return link
+            # Never clobber a real file or a link pointing elsewhere.
+            if link.exists() or link.is_symlink():
+                continue
+            # Create ~/.local/bin on demand; other PATH dirs must already exist.
+            if target_dir == preferred:
+                target_dir.mkdir(parents=True, exist_ok=True)
+            if not target_dir.is_dir() or not os.access(target_dir, os.W_OK):
+                continue
+            link.symlink_to(target)
+            return link
+        except OSError:
+            continue
+
+    return None
 
 
 def _setup_lean_ctx_agent(agent: str, verbose: bool = False) -> Path | None:
@@ -1484,6 +1531,27 @@ def _codex_home_dir() -> Path:
     return Path.home() / ".codex"
 
 
+@contextmanager
+def _codex_session_home_overlay() -> Any:
+    """Seed a temporary Codex home from the active home and point the process at it."""
+    source_home = _codex_home_dir()
+    original_codex_home = os.environ.get("CODEX_HOME")
+
+    with tempfile.TemporaryDirectory(prefix="headroom-codex-home-") as tmp_dir:
+        session_home = Path(tmp_dir)
+        if source_home.exists():
+            shutil.copytree(source_home, session_home, dirs_exist_ok=True)
+
+        os.environ["CODEX_HOME"] = str(session_home)
+        try:
+            yield session_home
+        finally:
+            if original_codex_home is None:
+                os.environ.pop("CODEX_HOME", None)
+            else:
+                os.environ["CODEX_HOME"] = original_codex_home
+
+
 def _codex_config_paths() -> tuple[Path, Path]:
     """Return ``(config_file, backup_file)`` paths for the Codex TOML config."""
     config_dir = _codex_home_dir()
@@ -1758,7 +1826,97 @@ def _apply_project_header_env(env: dict[str, str]) -> None:
         env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
 
 
-def _inject_codex_provider_config(port: int, *, proxy_url: str | None = None) -> None:
+# Codex's own built-in providers plus Headroom's injected one — never treated
+# as a "custom upstream to preserve" by _detect_custom_codex_upstream_base_url.
+_CODEX_BUILTIN_PROVIDER_NAMES = frozenset({"openai", "anthropic", "azure", "headroom"})
+
+# Header carrying a preserved custom upstream (freemodel.dev, LiteLLM, vLLM,
+# ...) so the proxy forwards to it instead of the hardcoded OpenAI default.
+# Codex's env_http_headers only accepts an env-var *name* per header (not a
+# literal value), so the detected URL is exported into this env var by the
+# `wrap codex` launch path — see its use in `codex()` below.
+_UPSTREAM_BASE_URL_HEADER_NAME = "X-Headroom-Base-Url"
+_UPSTREAM_BASE_URL_ENV_VAR = "HEADROOM_CODEX_UPSTREAM_BASE_URL"
+
+
+def _codex_custom_provider_base_urls(content: str) -> dict[str, str]:
+    """Return ``{provider_name: base_url}`` for user-declared custom providers.
+
+    Excludes Codex's built-ins (``openai``/``anthropic``/``azure``) and
+    Headroom's own ``headroom`` table.  A table with no ``base_url`` line, or
+    one already pointing at Headroom's own localhost proxy (a leftover from a
+    prior wrap this pass hasn't stripped yet), is excluded too.
+    """
+    import re
+
+    tables: dict[str, str] = {}
+    for match in re.finditer(
+        r"(?ms)^[ \t]*\[model_providers\.(?P<name>[^\]\s]+)\][ \t]*\n"
+        r"(?P<body>.*?)(?=^[ \t]*\[|\Z)",
+        content,
+    ):
+        name = match.group("name")
+        if name in _CODEX_BUILTIN_PROVIDER_NAMES:
+            continue
+        base_match = re.search(
+            r'(?m)^[ \t]*base_url[ \t]*=[ \t]*"(?P<url>[^"\n]*)"', match.group("body")
+        )
+        if not base_match:
+            continue
+        url = base_match.group("url").strip().rstrip("/")
+        if not url or url.startswith(("http://127.0.0.1", "http://localhost")):
+            continue
+        tables[name] = url
+    return tables
+
+
+def _detect_custom_codex_upstream_base_url(content: str) -> str | None:
+    """Return a user-configured custom provider ``base_url`` to preserve, if any.
+
+    Codex lets users declare OpenAI-compatible gateways (LiteLLM, vLLM,
+    freemodel.dev, ...) under ``[model_providers.<name>]`` and select one via
+    the top-level ``model_provider`` key. Before this, ``headroom wrap codex``
+    unconditionally pointed the proxy's upstream OpenAI route at
+    ``api.openai.com``, silently discarding that selection — the user's
+    gateway API key then gets sent to OpenAI, which rejects it (#1614).
+
+    If the top-level ``model_provider`` names one of the detected custom
+    tables, that selection wins unambiguously. This also covers the
+    already-wrapped case: once wrap has run once, the top-level key reads
+    ``model_provider = "headroom"  # was: <original>`` (see
+    ``_redirect_existing_top_level_keys``), so the original selection is
+    recovered from that trailing comment on re-wrap / port changes.
+
+    Falls back to the sole candidate when exactly one custom table exists
+    and there is no (or no matching) top-level selection — the common case
+    from the bug report, where the table is declared but selection happens
+    via ``--profile`` rather than a static top-level key. Returns ``None``
+    when there are multiple, un-selected candidates (ambiguous — guessing
+    wrong is worse than the prior default behavior) or none at all.
+    """
+    import re
+
+    candidates = _codex_custom_provider_base_urls(content)
+    if not candidates:
+        return None
+
+    selected = re.search(
+        r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"(?P<name>[^"\n]*)"'
+        r"(?:[ \t]*#[ \t]*was:[ \t]*(?P<was>[^\r\n]*))?",
+        content,
+    )
+    if selected:
+        was = (selected.group("was") or "").strip()
+        chosen = was or selected.group("name")
+        if chosen in candidates:
+            return candidates[chosen]
+
+    if len(candidates) == 1:
+        return next(iter(candidates.values()))
+    return None
+
+
+def _inject_codex_provider_config(port: int, proxy_url: str | None = None) -> str | None:
     """Inject a Headroom model provider into Codex's config.toml.
 
     Two keys need to be in effect for the proxy to route all traffic:
@@ -1785,10 +1943,32 @@ def _inject_codex_provider_config(port: int, *, proxy_url: str | None = None) ->
     Before the first injection, the pre-wrap file is snapshotted to
     ``config.toml.headroom-backup`` so ``headroom unwrap codex``
     can restore it byte-for-byte.
+
+    Returns the custom upstream ``base_url`` preserved from an existing
+    ``[model_providers.*]`` table, if one was detected (#1614); ``None``
+    otherwise. Callers that go on to launch Codex should export this value
+    into ``HEADROOM_CODEX_UPSTREAM_BASE_URL`` (the injected
+    ``env_http_headers`` entry maps it to the ``X-Headroom-Base-Url`` header,
+    which the proxy's OpenAI HTTP handlers honor over the hardcoded
+    ``api.openai.com`` default) — see its use in ``codex()`` below.
     """
     config_file, backup_file = _codex_config_paths()
     config_dir = config_file.parent
     provider_url = _proxy_v1_url(_normalize_proxy_url(proxy_url, port))
+
+    # Detect an existing custom OpenAI-compatible provider BEFORE building the
+    # injected block below, so it can be preserved as the upstream the proxy
+    # forwards to instead of silently rerouting to api.openai.com (#1614).
+    # Best-effort: any read/parse failure just means nothing is preserved,
+    # matching prior behavior.
+    custom_upstream_base_url: str | None = None
+    if config_file.exists():
+        try:
+            custom_upstream_base_url = _detect_custom_codex_upstream_base_url(
+                _read_text(config_file)
+            )
+        except OSError:
+            custom_upstream_base_url = None
 
     # The injected content is split into two self-contained, marker-delimited
     # blocks: a top-level key block (at the start of the file, because bare
@@ -1805,6 +1985,15 @@ def _inject_codex_provider_config(port: int, *, proxy_url: str | None = None) ->
     requires_openai_auth = (
         "requires_openai_auth = true\n" if codex_uses_chatgpt_auth(config_dir / "auth.json") else ""
     )
+    # Per-project savings: Codex sends the X-Headroom-Project header only
+    # when the mapped env var (HEADROOM_PROJECT, set by `headroom wrap
+    # codex`) exists at Codex runtime. When a custom upstream was detected,
+    # add a second entry so Codex also sends X-Headroom-Base-Url — the proxy
+    # forwards there instead of api.openai.com (#1614).
+    env_http_headers_map = {_PROJECT_HEADER_NAME: "HEADROOM_PROJECT"}
+    if custom_upstream_base_url:
+        env_http_headers_map[_UPSTREAM_BASE_URL_HEADER_NAME] = _UPSTREAM_BASE_URL_ENV_VAR
+    env_http_headers_toml = ", ".join(f'"{k}" = "{v}"' for k, v in env_http_headers_map.items())
     provider_section = (
         f"{_CODEX_TOP_LEVEL_MARKER}\n"
         "[model_providers.headroom]\n"
@@ -1812,11 +2001,9 @@ def _inject_codex_provider_config(port: int, *, proxy_url: str | None = None) ->
         f'base_url = "{provider_url}"\n'
         f"supports_websockets = true\n"
         f"{requires_openai_auth}"
-        # Per-project savings: Codex sends the header only when the mapped
-        # env var (HEADROOM_PROJECT, set by `headroom wrap codex`) exists at
-        # Codex runtime.  Inline table keeps the key inside this section so
+        # Inline table keeps the key inside this section so
         # _strip_codex_headroom_blocks removes it with the rest of the block.
-        f'env_http_headers = {{ "{_PROJECT_HEADER_NAME}" = "HEADROOM_PROJECT" }}\n'
+        f"env_http_headers = {{ {env_http_headers_toml} }}\n"
         f"{_CODEX_END_MARKER}\n"
     )
 
@@ -1895,11 +2082,20 @@ def _inject_codex_provider_config(port: int, *, proxy_url: str | None = None) ->
 
         _write_text(config_file, content)
         click.echo(f"  Codex config: injected Headroom provider (WS + HTTP) into {config_file}")
+        if custom_upstream_base_url:
+            click.echo(
+                f"  Codex config: preserving existing custom upstream "
+                f"{custom_upstream_base_url} (from a pre-existing [model_providers.*] "
+                "base_url)"
+            )
         # Pull existing native threads into the headroom-provider menu so Codex's
         # history list stays whole once it routes through Headroom. Best-effort.
         retag_to_headroom(_codex_home_dir())
     except Exception as e:
         click.echo(f"  Warning: could not update Codex config: {e}")
+        return None
+
+    return custom_upstream_base_url
 
 
 def _restore_codex_provider_config() -> tuple[str, Path]:
@@ -2063,7 +2259,7 @@ def _run_proxy_only_watcher(
     learn: bool,
     memory: bool,
     agent_type: str,
-    print_setup_lines: Callable[[], None],
+    print_setup_lines: Callable[[int], None],
 ) -> None:
     """Shared scaffolding for proxy-only wrap subcommands (no child binary launch).
 
@@ -2077,19 +2273,24 @@ def _run_proxy_only_watcher(
     through here. ``_launch_tool`` owns the proxy lifecycle on that path.
     """
     proxy_holder: list[subprocess.Popen | None] = [None]
-    cleanup = _make_cleanup(proxy_holder, port)
-    _register_proxy_client(port)
+    port_holder: list[int] = [port]
+    cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
     try:
         _print_wrap_banner(agent_label)
-        proxy_holder[0] = _ensure_proxy(
+        _register_proxy_client(port)
+        proxy_holder[0], actual_port = _ensure_proxy(
             port, no_proxy, learn=learn, memory=memory, agent_type=agent_type
         )
-        _push_runtime_env(port, no_proxy)
+        if actual_port != port:
+            _unregister_proxy_client(port)
+            _register_proxy_client(actual_port)
+        port_holder[0] = actual_port
+        _push_runtime_env(actual_port, no_proxy)
         click.echo()
-        print_setup_lines()
+        print_setup_lines(actual_port)
         click.echo()
         click.echo("  Press Ctrl+C to stop the proxy.")
         click.echo()
@@ -2529,11 +2730,12 @@ def _proxy_version(payload: dict[str, Any] | None) -> str | None:
 def _proxy_needs_version_restart(payload: dict[str, Any] | None) -> bool:
     """Return True when a running Headroom proxy uses a different package version."""
     running_version = _proxy_version(payload)
+    running_release = _normalize_release_version(running_version)
+    current_release = _normalize_release_version(_HEADROOM_VERSION)
     return (
-        running_version is not None
-        and running_version != "unknown"
-        and _HEADROOM_VERSION != "unknown"
-        and running_version != _HEADROOM_VERSION
+        running_release is not None
+        and current_release is not None
+        and running_release != current_release
     )
 
 
@@ -2810,8 +3012,8 @@ def _ensure_proxy(
     vertex_api_url: str | None = None,
     clear_vertex_api_url: bool = False,
     copilot_api_token: str | None = None,
-) -> subprocess.Popen | None:
-    """Start or verify proxy. Returns process handle if we started it."""
+) -> tuple[subprocess.Popen | None, int]:
+    """Start or verify proxy. Returns (process_handle, actual_port)."""
     helpers = _live_wrap_module()
     # --no-proxy reuses an already-running proxy, so backend/region/provider
     # flags (which only apply when we start one) would be silently dropped.
@@ -2845,9 +3047,9 @@ def _ensure_proxy(
                             f"  Leaving it running because {detail} "
                             "are still attached; it will be restarted when idle."
                         )
-                        return None
+                        return None, port
                     if helpers._restart_persistent_proxy(manifest, port):
-                        return None
+                        return None, port
                     raise click.ClickException(
                         f"Persistent deployment '{manifest.profile}' on port {port} "
                         f"is running stale Headroom {running_version} and could not be restarted."
@@ -2877,7 +3079,7 @@ def _ensure_proxy(
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
-                        return None
+                        return None, port
                 # Features mismatch or config unavailable — fall through to
                 # the non-persistent path which handles proxy restart.
             else:
@@ -2888,9 +3090,9 @@ def _ensure_proxy(
                     # restart logic can run. For plain recover-only calls,
                     # preserve the historical fast return.
                     if not any((memory, learn, code_graph, openai_api_url)):
-                        return None
+                        return None, port
                     if not helpers._check_proxy(port):
-                        return None
+                        return None, port
 
                     # A freshly recovered persistent proxy may not expose
                     # a full config payload yet. In feature-sensitive flows
@@ -2908,7 +3110,7 @@ def _ensure_proxy(
                             "did not expose config; restarting with requested features..."
                         )
                         if helpers._restart_persistent_proxy(manifest, port):
-                            return None
+                            return None, port
                         raise click.ClickException(
                             f"Persistent deployment '{manifest.profile}' on port {port} "
                             "could not be restarted after recovery."
@@ -2936,12 +3138,12 @@ def _ensure_proxy(
                             f"{flags_str}; restarting..."
                         )
                         if helpers._restart_persistent_proxy(manifest, port):
-                            return None
+                            return None, port
                         raise click.ClickException(
                             f"Persistent deployment '{manifest.profile}' on port {port} "
                             "could not be restarted with requested features."
                         )
-                    return None
+                    return None, port
                 elif helpers._check_proxy(port):
                     raise click.ClickException(
                         f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
@@ -2981,7 +3183,7 @@ def _ensure_proxy(
                         f"  Leaving it running because {detail} "
                         "are still attached; it will be restarted when idle."
                     )
-                    return None
+                    return None, port
 
                 click.echo(
                     f"  Proxy on port {port} is running Headroom {running_version}; "
@@ -3072,26 +3274,31 @@ def _ensure_proxy(
                                 f"  Please stop the proxy on port {port} manually "
                                 f"and rerun with {flags_str}."
                             )
-                            return None
+                            return None, port
 
             if not needs_restart:
                 click.echo(f"  Proxy already running on port {port}")
                 click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
-                return None
+                return None, port
 
         # Start (or restart) the proxy with the requested flags
-        bind_error = helpers._port_bind_error(port)
-        if bind_error is not None:
-            raise click.ClickException(
-                helpers._format_unbindable_port_error(port, bind_error, agent_type)
-            )
+        # Find an available port (port may be busy from a stale proxy).
+        try:
+            actual_port = helpers._find_available_port(port)
+        except OSError as e:
+            raise click.ClickException(f"Port {port} is unavailable: {e}") from e
+        except RuntimeError as e:
+            raise click.ClickException(str(e)) from e
 
-        click.echo(f"  Starting Headroom proxy on port {port}...")
+        if actual_port != port:
+            click.echo(f"  Port {port} is in use, using port {actual_port} instead.")
+
+        click.echo(f"  Starting Headroom proxy on port {actual_port}...")
         try:
             proc = cast(
                 subprocess.Popen[Any],
                 _live_wrap_module()._start_proxy(
-                    port,
+                    actual_port,
                     learn=learn,
                     memory=memory,
                     agent_type=agent_type,
@@ -3106,9 +3313,9 @@ def _ensure_proxy(
                     copilot_api_token=copilot_api_token,
                 ),
             )
-            click.echo(f"  Proxy ready on http://127.0.0.1:{port}")
-            click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
-            return proc
+            click.echo(f"  Proxy ready on http://127.0.0.1:{actual_port}")
+            click.echo(f"  Dashboard:    http://127.0.0.1:{actual_port}/dashboard")
+            return proc, actual_port
         except RuntimeError as e:
             click.echo(f"  Error: {e}")
             raise SystemExit(1) from e
@@ -3132,7 +3339,7 @@ def _ensure_proxy(
                     "advertise the requested Vertex target. Requests may still go "
                     "to the proxy's existing Vertex upstream."
                 )
-        return None
+        return None, port
 
 
 def _client_marker_path(port: int) -> Path:
@@ -3260,24 +3467,24 @@ def _live_proxy_clients(port: int, *, exclude_self: bool = True) -> list[int]:
     return live
 
 
-def _make_cleanup(proxy_proc_holder: list, port: int = 8787) -> Any:
+def _make_cleanup(proxy_proc_holder: list, port: int | list[int] = 8787) -> Any:
     """Create a cleanup function that terminates the proxy on exit.
 
     Only kills the proxy when no other live headroom-wrapped clients remain,
     tracked via per-PID marker files in ``paths.proxy_clients_dir(port)``.
+
+    ``port`` can be an ``int`` or a ``list[int]``.  When a port fallback occurs
+    (``_ensure_proxy`` ups the port because the requested one is busy), the
+    caller can update ``port[0]`` in-place and the closure picks it up.
     """
 
     def _other_clients_exist() -> bool:
-        # Reference-count from marker files, not argv scans. Wrapped clients
-        # carry the proxy URL in ANTHROPIC_BASE_URL/OPENAI_BASE_URL (env, not
-        # argv), so `pgrep -f` could never see them — and it matched unrelated
-        # processes by substring. Markers are exact and OS-portable.
-        return len(_live_proxy_clients(port, exclude_self=True)) > 0
+        p = port[0] if isinstance(port, list) else port
+        return len(_live_proxy_clients(p, exclude_self=True)) > 0
 
     def cleanup(signum: int | None = None, frame: Any = None) -> None:
-        # Drop our own marker first so the count reflects the post-exit state;
-        # also covers the signal path, where the `finally` block may not run.
-        _unregister_proxy_client(port)
+        p = port[0] if isinstance(port, list) else port
+        _unregister_proxy_client(p)
         proc = proxy_proc_holder[0] if proxy_proc_holder else None
         if proc and proc.poll() is None:
             if _other_clients_exist():
@@ -3319,8 +3526,8 @@ def _launch_tool(
 ) -> None:
     """Common logic: start proxy, launch tool, clean up."""
     proxy_holder: list[subprocess.Popen | None] = [None]
-    cleanup = _make_cleanup(proxy_holder, port)
-    _register_proxy_client(port)
+    port_holder: list[int] = [port]
+    cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, cleanup)
 
@@ -3332,7 +3539,8 @@ def _launch_tool(
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
 
-        proxy_holder[0] = _ensure_proxy(
+        _register_proxy_client(port)
+        proxy_holder[0], actual_port = _ensure_proxy(
             port,
             no_proxy,
             learn=learn,
@@ -3345,7 +3553,16 @@ def _launch_tool(
             openai_api_url=openai_api_url,
             copilot_api_token=copilot_api_token,
         )
-        _push_runtime_env(port, no_proxy)
+        if actual_port != port:
+            _unregister_proxy_client(port)
+            _register_proxy_client(actual_port)
+        port_holder[0] = actual_port
+        _push_runtime_env(actual_port, no_proxy)
+
+        # If port fell back, update env URLs to point at the actual port
+        if actual_port != port:
+            for k, v in dict(env).items():
+                env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
 
         if code_graph:
             _setup_code_graph(verbose=False)
@@ -3609,6 +3826,12 @@ def unwrap() -> None:
     help="Skip CLI context-tool setup",
 )
 @click.option(
+    "--context-tool",
+    "context_tool",
+    is_flag=True,
+    help="Enable CLI context-tool setup",
+)
+@click.option(
     "--no-mcp",
     is_flag=True,
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
@@ -3684,6 +3907,7 @@ def unwrap() -> None:
 def claude(
     port: int,
     no_rtk: bool,
+    context_tool: bool,
     no_mcp: bool,
     no_tokensave: bool,
     serena: bool,
@@ -3716,13 +3940,15 @@ def claude(
         headroom wrap claude                    # tokensave code graph (primary)
         headroom wrap claude --no-tokensave     # Skip tokensave; fall back to Serena
         headroom wrap claude --serena           # Also register the Serena backup
+        headroom wrap claude --context-tool     # Enable CLI context-tool setup
         headroom wrap claude --no-context-tool  # Skip CLI context-tool setup
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
         headroom wrap claude --no-serena        # Never register the Serena backup
         headroom wrap claude --1m               # Preserve the 1M context window
     """
+    setup_context_tool = context_tool and not no_rtk
     if prepare_only:
-        if not no_rtk:
+        if setup_context_tool:
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
                 _setup_lean_ctx_agent("claude", verbose=verbose)
             else:
@@ -3743,9 +3969,9 @@ def claude(
     proxy_holder: list[subprocess.Popen | None] = [None]
     _saved_base_url: list[str | None] = [None]  # previous settings.json value for restore
     _settings_foundry: list[bool] = [False]
+    port_holder: list[int] = [port]
     _settings_vertex: list[bool] = [False]
-    cleanup = _make_cleanup(proxy_holder, port)
-    _register_proxy_client(port)
+    cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, cleanup)
     if hasattr(signal, "SIGHUP"):
@@ -3825,7 +4051,8 @@ def claude(
         proxy_url = _claude_proxy_base_url(port)
         vertex_upstream = _vertex_target_api_url_from_claude_env(proxy_url) if use_vertex else None
 
-        proxy_holder[0] = _ensure_proxy(
+        _register_proxy_client(port)
+        proxy_holder[0], actual_port = _ensure_proxy(
             port,
             no_proxy,
             learn=learn,
@@ -3838,9 +4065,13 @@ def claude(
             vertex_api_url=vertex_upstream,
             clear_vertex_api_url=use_vertex and vertex_upstream is None,
         )
-        _push_runtime_env(port, no_proxy)
+        if actual_port != port:
+            _unregister_proxy_client(port)
+            _register_proxy_client(actual_port)
+        port_holder[0] = actual_port
+        _push_runtime_env(actual_port, no_proxy)
 
-        if not no_rtk:
+        if setup_context_tool:
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
                 click.echo("  Setting up lean-ctx...")
                 _setup_lean_ctx_agent("claude", verbose=verbose)
@@ -3853,8 +4084,7 @@ def claude(
         if not no_mcp:
             from headroom.mcp_registry import ClaudeRegistrar
 
-            claude_registrar = ClaudeRegistrar(scope=scope, project_dir=Path.cwd())
-            _setup_headroom_mcp(claude_registrar, port, verbose=verbose)
+            _setup_headroom_mcp(ClaudeRegistrar(), actual_port, verbose=verbose)
         elif verbose:
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
@@ -3874,6 +4104,7 @@ def claude(
         if code_graph:
             _setup_code_graph(verbose=verbose, registrar=claude_registrar)
 
+        proxy_url = _claude_proxy_base_url(actual_port)
         click.echo()
         click.echo("  Launching Claude Code (API routed through Headroom)...")
         if use_vertex:
@@ -4087,6 +4318,12 @@ def unwrap_claude(
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
+    "--proxy-url",
+    default=None,
+    envvar="HEADROOM_PROXY_URL",
+    help="Existing Headroom proxy URL for Copilot routing.",
+)
+@click.option(
     "--backend",
     default=None,
     help="API backend for the proxy: 'anthropic', 'anyllm', 'litellm-vertex', etc. (env: HEADROOM_BACKEND)",
@@ -4127,6 +4364,7 @@ def copilot(
     port: int,
     no_rtk: bool,
     no_proxy: bool,
+    proxy_url: str | None,
     backend: str | None,
     anyllm_provider: str | None,
     region: str | None,
@@ -4169,8 +4407,12 @@ def copilot(
         )
         raise SystemExit(1)
 
+    proxy_root = _normalize_copilot_proxy_root_url(proxy_url)
+    if proxy_root is not None:
+        no_proxy = True
+
     effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
-    if _check_proxy(port):
+    if proxy_root is None and _check_proxy(port):
         running_backend = _detect_running_proxy_backend(port)
         if effective_backend and running_backend and effective_backend != running_backend:
             raise click.ClickException(
@@ -4179,7 +4421,13 @@ def copilot(
             )
         effective_backend = running_backend or effective_backend
 
-    effective_provider_type = _resolve_copilot_provider_type(effective_backend, provider_type)
+    provider_env = os.environ.copy()
+    provider_env.pop("COPILOT_PROVIDER_TYPE", None)
+    effective_provider_type = _copilot_resolve_provider_type(
+        effective_backend,
+        provider_type,
+        provider_env,
+    )
     if subscription:
         if effective_backend not in (None, "", "anthropic"):
             raise click.ClickException(
@@ -4227,9 +4475,23 @@ def copilot(
         else:
             client_bearer = resolve_client_bearer_token()
         if not client_bearer:
+            classic_token = next(
+                (
+                    os.environ.get(name)
+                    for name in ("GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN")
+                    if (os.environ.get(name) or "").startswith("ghp")
+                ),
+                None,
+            )
+            if classic_token:
+                raise click.ClickException(
+                    "could not resolve a reusable Copilot bearer token: a classic GitHub PAT "
+                    "does not carry the Copilot Requests permission. Run "
+                    "`headroom copilot-auth login` to create reusable Copilot auth."
+                )
             raise click.ClickException(
-                "GitHub Copilot subscription mode requires a reusable GitHub/Copilot bearer "
-                "token, but none could be resolved. Run `headroom copilot-auth login` first, or set "
+                "could not resolve a reusable Copilot bearer token. No reusable Copilot token "
+                "was found. Run `headroom copilot-auth login` first, or set "
                 "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
             )
 
@@ -4253,16 +4515,41 @@ def copilot(
         effective_wire_api = wire_api or (
             _copilot_default_wire_api_for_model(selected_model) if subscription else "completions"
         )
+        openai_api_url = (
+            subscription_resolution.api_url
+            if subscription_resolution is not None
+            else resolve_copilot_api_url(client_bearer)
+        )
         env["COPILOT_PROVIDER_TYPE"] = "openai"
         # Per-project savings: the Copilot CLI cannot send custom headers, so
         # the project rides as a /p/<name> base-URL prefix the proxy strips.
-        env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
-            f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
+        env["COPILOT_PROVIDER_BASE_URL"] = _with_client_prefix(
+            _with_project_prefix(
+                _with_copilot_upstream_prefix(
+                    f"{proxy_root or f'http://127.0.0.1:{port}'}/v1",
+                    openai_api_url if subscription and openai_api_url != DEFAULT_API_URL else None,
+                ),
+                _project_name_from_cwd(),
+            ),
+            "copilot",
         )
         env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
         env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
         env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
         env.pop("COPILOT_PROVIDER_API_KEY", None)
+        scrubbed_token_vars = [
+            token_var
+            for token_var in ("GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN")
+            if env.get(token_var)
+        ]
+        for token_var in scrubbed_token_vars:
+            env.pop(token_var, None)
+        if scrubbed_token_vars:
+            click.echo(
+                "  Ignoring "
+                + ", ".join(scrubbed_token_vars)
+                + "; using the validated Copilot subscription token instead."
+            )
         # Hand the exact token we resolved (and, for --subscription, validated
         # against GitHub) to the proxy explicitly via copilot_proxy_token below.
         # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
@@ -4287,11 +4574,6 @@ def copilot(
         # #610. Subscription mode can use the endpoint returned by the Copilot
         # token exchange, which is how Business accounts advertise their API
         # host without requiring users to configure it manually.
-        openai_api_url = (
-            subscription_resolution.api_url
-            if subscription_resolution is not None
-            else resolve_copilot_api_url(client_bearer)
-        )
         env["GITHUB_COPILOT_API_URL"] = openai_api_url
         env["OPENAI_TARGET_API_URL"] = openai_api_url
         env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
@@ -4302,7 +4584,17 @@ def copilot(
             wire_api=wire_api,
             environ=env,
             project=_project_name_from_cwd(),
+            proxy_url=proxy_root,
         )
+        env["COPILOT_PROVIDER_BASE_URL"] = _with_client_prefix(
+            env["COPILOT_PROVIDER_BASE_URL"], "copilot"
+        )
+        env_vars_display = [
+            line
+            if not line.startswith("COPILOT_PROVIDER_BASE_URL=")
+            else f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}"
+            for line in env_vars_display
+        ]
 
         if not env.get("COPILOT_PROVIDER_API_KEY"):
             src = _copilot_provider_key_source(effective_provider_type)
@@ -4383,6 +4675,233 @@ def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
 # =============================================================================
 # OpenAI Codex CLI
 # =============================================================================
+
+
+def _prepare_codex_wrap_state(
+    *,
+    port: int,
+    no_rtk: bool,
+    no_mcp: bool,
+    no_tokensave: bool,
+    serena: bool,
+    no_serena: bool,
+    memory: bool,
+    verbose: bool,
+    proxy_url: str | None = None,
+    rtk_home: Path | None = None,
+    inject_provider: bool = True,
+) -> None:
+    """Prepare the active Codex home for a wrap or prepare-only invocation."""
+    # Snapshot Codex config.toml BEFORE any wrap-time mutation so
+    # `headroom unwrap codex` can restore the user's pre-wrap state
+    # byte-for-byte. The snapshot is a no-op if the backup already exists
+    # or if the file already has Headroom markers, so this is safe to
+    # call repeatedly. Crucially this must run before MCP install, which
+    # writes its marker block to the same file.
+    _codex_config_file, _codex_backup_file = _codex_config_paths()
+    _snapshot_codex_config_if_unwrapped(_codex_config_file, _codex_backup_file)
+
+    # Setup CLI context tool for Codex.
+    if not no_rtk:
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for Codex...")
+            _setup_lean_ctx_agent("codex", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for Codex...")
+            rtk_path = _ensure_rtk_binary(verbose=verbose)
+            if rtk_path:
+                # Keep RTK guidance local to the user's Codex configuration.
+                global_agents = (rtk_home or _codex_home_dir()) / "AGENTS.md"
+                _inject_rtk_instructions(global_agents, verbose=verbose)
+
+    # Register headroom MCP server in Codex config.toml so Codex can
+    # call headroom_retrieve on compression markers from the proxy.
+    if not no_mcp:
+        from headroom.mcp_registry import CodexRegistrar
+
+        # Codex starts a long-lived local MCP subprocess from config.toml.
+        # If a previous wrap used another port, retrieval can silently point
+        # at the wrong proxy while model traffic uses the right one.
+        _setup_headroom_mcp(
+            CodexRegistrar(),
+            port,
+            proxy_url=proxy_url,
+            verbose=verbose,
+            force=True,
+        )
+    elif verbose:
+        click.echo("  Skipping MCP retrieve tool (--no-mcp)")
+
+    # Coding-task compressor: tokensave primary, Serena backup. Codex starts
+    # long-lived MCP subprocesses from config.toml, so force re-registration.
+    from headroom.mcp_registry import CodexRegistrar
+
+    _setup_coding_compressor(
+        CodexRegistrar(),
+        serena_context="codex",
+        serena=serena,
+        no_serena=no_serena,
+        no_tokensave=no_tokensave,
+        verbose=verbose,
+        force=True,
+    )
+
+    # Setup memory MCP server for Codex (native tool integration)
+    if memory:
+        click.echo("  Setting up memory for Codex...")
+        mem_dir = Path.cwd() / ".headroom"
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        db_path = str(mem_dir / "memory.db")
+        mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
+
+        # Register MCP server in Codex config
+        _inject_memory_mcp_config(mem_user)
+
+        # Inject memory guidance into project AGENTS.md
+        agents_md = Path.cwd() / "AGENTS.md"
+        _inject_memory_agents_md(agents_md)
+
+        # Sync Claude's memories → DB so MCP search finds them
+        try:
+            import asyncio
+
+            from headroom.memory.sync import _build_sync_backend, sync_import
+            from headroom.memory.sync_adapters.claude_code import (
+                ClaudeCodeAdapter,
+                get_claude_memory_dir,
+            )
+
+            claude_memory_dir = get_claude_memory_dir()
+
+            async def _import_claude_memories() -> int:
+                backend = _build_sync_backend(db_path)
+                await backend._ensure_initialized()
+                adapter = ClaudeCodeAdapter(claude_memory_dir)
+                count = await sync_import(backend, adapter, mem_user)
+                await backend.close()
+                return count
+
+            imported = asyncio.run(_import_claude_memories())
+            if imported:
+                click.echo(f"  Memory: imported {imported} memories from Claude")
+        except Exception as e:
+            click.echo(f"  Warning: Claude memory import failed: {e}")
+
+    # Inject Headroom provider into Codex config so WebSocket traffic also
+    # routes through the proxy.  Codex ignores OPENAI_BASE_URL for its WS
+    # transport unless a custom provider declares supports_websockets = true.
+    # NOTE: this must run BEFORE _inject_memory_mcp_config because it rewrites
+    # the config file.  Re-inject MCP config after if memory is enabled.
+    if inject_provider:
+        _inject_codex_provider_config(port, proxy_url)
+    if memory:
+        _inject_memory_mcp_config(os.environ.get("USER", os.environ.get("USERNAME", "default")))
+
+
+def _run_codex_wrap(
+    *,
+    port: int,
+    no_rtk: bool,
+    no_mcp: bool,
+    no_tokensave: bool,
+    serena: bool,
+    no_serena: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    proxy_url: str | None,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    codex_args: tuple,
+) -> None:
+    """Execute the Codex wrap flow with the session overlay when launching."""
+    if prepare_only:
+        from headroom.cli import init as init_cli
+
+        codex_config_file, codex_backup_file = _codex_config_paths()
+        _snapshot_codex_config_if_unwrapped(codex_config_file, codex_backup_file)
+        normalized_proxy_url = init_cli._configure_codex_durable_setup(
+            global_scope=False,
+            profile=init_cli._runtime_profile(False),
+            port=port,
+            proxy_url=proxy_url,
+            install_headroom_mcp=not no_mcp,
+            serena=serena,
+            no_serena=no_serena,
+            no_tokensave=no_tokensave,
+            code_graph=code_graph,
+            verbose=verbose,
+        )
+        _prepare_codex_wrap_state(
+            port=port,
+            no_rtk=no_rtk,
+            no_mcp=no_mcp,
+            no_tokensave=no_tokensave,
+            serena=serena,
+            no_serena=no_serena,
+            memory=memory,
+            verbose=verbose,
+            proxy_url=normalized_proxy_url,
+            inject_provider=False,
+        )
+        return
+
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        click.echo("Error: 'codex' not found in PATH.")
+        click.echo("Install Codex CLI: npm install -g @openai/codex")
+        raise SystemExit(1)
+
+    active_codex_home = _codex_home_dir()
+    with _codex_session_home_overlay() as session_codex_home:
+        _prepare_codex_wrap_state(
+            port=port,
+            no_rtk=no_rtk,
+            no_mcp=no_mcp,
+            no_tokensave=no_tokensave,
+            serena=serena,
+            no_serena=no_serena,
+            memory=memory,
+            verbose=verbose,
+            proxy_url=proxy_url,
+            rtk_home=active_codex_home,
+        )
+
+        env, env_vars_display = _build_codex_launch_env(
+            port,
+            os.environ,
+            proxy_url=proxy_url,
+        )
+
+        # Per-project savings attribution: the injected provider config maps the
+        # X-Headroom-Project header to HEADROOM_PROJECT via env_http_headers, so
+        # Codex sends it only when this var is set.  A user-set value wins.
+        _codex_project = _project_name_from_cwd()
+        if _codex_project and "HEADROOM_PROJECT" not in env:
+            env["HEADROOM_PROJECT"] = _codex_project
+
+        env["CODEX_HOME"] = str(session_codex_home)
+
+        _launch_tool(
+            binary=codex_bin,
+            args=codex_args,
+            env=env,
+            port=port,
+            no_proxy=no_proxy,
+            tool_label="CODEX",
+            env_vars_display=env_vars_display,
+            learn=learn,
+            memory=memory,
+            agent_type="codex",
+            code_graph=code_graph,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+        )
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
@@ -4486,162 +5005,24 @@ def codex(
         headroom wrap codex --proxy-url http://10.10.10.89  # Use an existing proxy
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
-    # Snapshot Codex config.toml BEFORE any wrap-time mutation so
-    # `headroom unwrap codex` can restore the user's pre-wrap state
-    # byte-for-byte. The snapshot is a no-op if the backup already exists
-    # or if the file already has Headroom markers, so this is safe to
-    # call repeatedly. Crucially this must run before MCP install, which
-    # writes its marker block to the same file.
-    _codex_config_file, _codex_backup_file = _codex_config_paths()
-    _snapshot_codex_config_if_unwrapped(_codex_config_file, _codex_backup_file)
-    _codex_config_file.parent.mkdir(parents=True, exist_ok=True)
-
-    # Setup CLI context tool for Codex.
-    if not no_rtk:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo("  Setting up lean-ctx for Codex...")
-            _setup_lean_ctx_agent("codex", verbose=verbose)
-        else:
-            click.echo("  Setting up rtk for Codex...")
-            rtk_path = _ensure_rtk_binary(verbose=verbose)
-            if rtk_path:
-                # Keep RTK guidance local to the user's Codex configuration.
-                global_agents = _codex_home_dir() / "AGENTS.md"
-                _inject_rtk_instructions(global_agents, verbose=verbose)
-
-    if prepare_only:
-        from headroom.cli import init as init_cli
-
-        init_cli._configure_codex_durable_setup(
-            global_scope=False,
-            profile=init_cli._local_profile(),
-            port=port,
-            proxy_url=proxy_url,
-            install_hooks=True,
-            install_headroom_mcp=not no_mcp,
-            serena=serena,
-            no_serena=no_serena,
-            no_tokensave=no_tokensave,
-            code_graph=code_graph,
-            verbose=verbose,
-        )
-        return
-
-    # Register headroom MCP server in Codex config.toml so Codex can
-    # call headroom_retrieve on compression markers from the proxy.
-    if not no_mcp:
-        from headroom.mcp_registry import CodexRegistrar
-
-        # Codex starts a long-lived local MCP subprocess from config.toml.
-        # If a previous wrap used another port, retrieval can silently point
-        # at the wrong proxy while model traffic uses the right one.
-        _setup_headroom_mcp(
-            CodexRegistrar(),
-            port,
-            proxy_url=proxy_url,
-            verbose=verbose,
-            force=True,
-        )
-    elif verbose:
-        click.echo("  Skipping MCP retrieve tool (--no-mcp)")
-
-    # Coding-task compressor: tokensave primary, Serena backup. Codex starts
-    # long-lived MCP subprocesses from config.toml, so force re-registration.
-    from headroom.mcp_registry import CodexRegistrar
-
-    _setup_coding_compressor(
-        CodexRegistrar(),
-        serena_context="codex",
+    return _run_codex_wrap(
+        port=port,
+        no_rtk=no_rtk,
+        no_mcp=no_mcp,
+        no_tokensave=no_tokensave,
         serena=serena,
         no_serena=no_serena,
-        no_tokensave=no_tokensave,
-        verbose=verbose,
-        force=True,
-    )
-
-    # Setup memory MCP server for Codex (native tool integration)
-    if memory:
-        click.echo("  Setting up memory for Codex...")
-        mem_dir = Path.cwd() / ".headroom"
-        mem_dir.mkdir(parents=True, exist_ok=True)
-        db_path = str(mem_dir / "memory.db")
-        mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
-
-        # Register MCP server in Codex config
-        _inject_memory_mcp_config(mem_user)
-
-        # Inject memory guidance into project AGENTS.md
-        agents_md = Path.cwd() / "AGENTS.md"
-        _inject_memory_agents_md(agents_md)
-
-        # Sync Claude's memories → DB so MCP search finds them
-        try:
-            import asyncio
-
-            from headroom.memory.sync import _build_sync_backend, sync_import
-            from headroom.memory.sync_adapters.claude_code import (
-                ClaudeCodeAdapter,
-                get_claude_memory_dir,
-            )
-
-            claude_memory_dir = get_claude_memory_dir()
-
-            async def _import_claude_memories() -> int:
-                backend = _build_sync_backend(db_path)
-                await backend._ensure_initialized()
-                adapter = ClaudeCodeAdapter(claude_memory_dir)
-                count = await sync_import(backend, adapter, mem_user)
-                await backend.close()
-                return count
-
-            imported = asyncio.run(_import_claude_memories())
-            if imported:
-                click.echo(f"  Memory: imported {imported} memories from Claude")
-        except Exception as e:
-            click.echo(f"  Warning: Claude memory import failed: {e}")
-
-    if prepare_only:
-        return
-
-    codex_bin = shutil.which("codex")
-    if not codex_bin:
-        click.echo("Error: 'codex' not found in PATH.")
-        click.echo("Install Codex CLI: npm install -g @openai/codex")
-        raise SystemExit(1)
-
-    env, env_vars_display = _build_codex_launch_env(port, os.environ, proxy_url=proxy_url)
-
-    # Per-project savings attribution: the injected provider config maps the
-    # X-Headroom-Project header to HEADROOM_PROJECT via env_http_headers, so
-    # Codex sends it only when this var is set.  A user-set value wins.
-    _codex_project = _project_name_from_cwd()
-    if _codex_project and "HEADROOM_PROJECT" not in env:
-        env["HEADROOM_PROJECT"] = _codex_project
-
-    # Inject Headroom provider into Codex config so WebSocket traffic also
-    # routes through the proxy.  Codex ignores OPENAI_BASE_URL for its WS
-    # transport unless a custom provider declares supports_websockets = true.
-    # NOTE: this must run BEFORE _inject_memory_mcp_config because it rewrites
-    # the config file.  Re-inject MCP config after if memory is enabled.
-    _inject_codex_provider_config(port, proxy_url=proxy_url)
-    if memory:
-        _inject_memory_mcp_config(os.environ.get("USER", os.environ.get("USERNAME", "default")))
-
-    _launch_tool(
-        binary=codex_bin,
-        args=codex_args,
-        env=env,
-        port=port,
+        code_graph=code_graph,
         no_proxy=no_proxy,
-        tool_label="CODEX",
-        env_vars_display=env_vars_display,
+        proxy_url=proxy_url,
         learn=learn,
         memory=memory,
-        agent_type="codex",
-        code_graph=code_graph,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
+        verbose=verbose,
+        prepare_only=prepare_only,
+        codex_args=codex_args,
     )
 
 
@@ -4878,27 +5259,47 @@ def cursor(
         headroom wrap cursor --port 9999    # Custom proxy port
     """
     cursorrules: Path | None = Path.cwd() / ".cursorrules" if not no_rtk else None
+    cursor_hook_registered = False
     if not no_rtk:
+
+        def _register_cursor_hook(rtk_path: Path) -> None:
+            # rtk registers a native hook for Cursor (`rtk init --agent cursor`),
+            # same mechanism as Claude Code. Prefer that over injecting the
+            # RTK_INSTRUCTIONS_BLOCK text into .cursorrules — a silent hook makes
+            # the custom-rules text redundant guidance (GH #756).
+            nonlocal cursor_hook_registered
+            from headroom.rtk.installer import register_agent_hooks
+
+            # rtk may exit 0 without writing hooks.json (e.g. an rtk build that
+            # doesn't support --agent cursor), so trust the file, not the exit
+            # code: only skip the .cursorrules fallback if the native hook is
+            # actually on disk (GH #756).
+            cursor_hooks_json = Path.home() / ".cursor" / "hooks.json"
+            if register_agent_hooks(rtk_path, agent="cursor") and cursor_hooks_json.is_file():
+                cursor_hook_registered = True
+            else:
+                _inject_rtk_instructions(cast(Path, cursorrules), verbose=verbose)
+
         _setup_context_tool_for_agent(
             agent="cursor",
             agent_display="Cursor",
             marker_path=cursorrules,
-            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
-                cast(Path, cursorrules), verbose=verbose
-            ),
+            on_rtk_ready=_register_cursor_hook,
             verbose=verbose,
         )
 
     if prepare_only:
         return
 
-    def _print_cursor_setup() -> None:
-        for line in _render_cursor_setup_lines(port, project=_project_name_from_cwd()):
+    def _print_cursor_setup(actual_port: int) -> None:
+        for line in _render_cursor_setup_lines(actual_port, project=_project_name_from_cwd()):
             click.echo(line)
         if not no_rtk:
             click.echo()
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
                 click.echo("  lean-ctx configured for Cursor")
+            elif cursor_hook_registered:
+                click.echo("  rtk hook registered for Cursor")
             else:
                 click.echo("  rtk instructions injected into .cursorrules")
             click.echo("  Cursor will use token-optimized commands automatically.")
@@ -4990,9 +5391,9 @@ def cline(
     if prepare_only:
         return
 
-    def _print_cline_setup() -> None:
-        anthropic_base = _claude_proxy_base_url(port)
-        openai_base = f"http://127.0.0.1:{port}/v1"
+    def _print_cline_setup(actual_port: int) -> None:
+        anthropic_base = _claude_proxy_base_url(actual_port)
+        openai_base = f"http://127.0.0.1:{actual_port}/v1"
         click.echo("  Configure Cline in VS Code:")
         click.echo("    Settings > Cline > API Provider")
         click.echo(f"    Anthropic Base URL: {anthropic_base}")
@@ -5114,9 +5515,9 @@ def continue_dev(
     if prepare_only:
         return
 
-    def _print_continue_setup() -> None:
-        anthropic_base = _claude_proxy_base_url(port)
-        openai_base = f"http://127.0.0.1:{port}/v1"
+    def _print_continue_setup(actual_port: int) -> None:
+        anthropic_base = _claude_proxy_base_url(actual_port)
+        openai_base = f"http://127.0.0.1:{actual_port}/v1"
         click.echo("  Configure Continue in your IDE:")
         click.echo(f"    Edit {config_file} and set, per model:")
         click.echo(f'      "apiBase": "{openai_base}"          # OpenAI-compatible models')
@@ -5775,26 +6176,16 @@ def opencode(
         click.echo("Install OpenCode: https://opencode.ai")
         raise SystemExit(1)
 
-    env, env_vars_display = _build_opencode_launch_env(
-        port, os.environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
-    )
+    # Register our proxy client marker BEFORE _ensure_proxy so that another
+    # wrapper's cleanup sees us as an active client and doesn't terminate a
+    # shared proxy during the startup gap.
+    _register_proxy_client(port)
 
-    # Inject Headroom provider into OpenCode config so traffic routes through proxy.
-    inject_opencode_provider_config(port)
-    if memory:
-        mem_dir = Path.cwd() / ".headroom"
-        _inject_memory_mcp_config(
-            os.environ.get("USER", os.environ.get("USERNAME", "default")),
-        )
-
-    _launch_tool(
-        binary=opencode_bin,
-        args=opencode_args,
-        env=env,
-        port=port,
-        no_proxy=no_proxy,
-        tool_label="OPENCODE",
-        env_vars_display=env_vars_display,
+    # Resolve port before config injection so the provider block and MCP
+    # URL both point at the port the proxy will actually be on.
+    _opencode_proxy, actual_port = _ensure_proxy(
+        port,
+        no_proxy,
         learn=learn,
         memory=memory,
         agent_type="opencode",
@@ -5803,6 +6194,57 @@ def opencode(
         anyllm_provider=anyllm_provider,
         region=region,
     )
+
+    # If the proxy fell back to a different port, move our marker so
+    # cleanup tracking stays accurate and update MCP config.
+    if actual_port != port:
+        _unregister_proxy_client(port)
+        _register_proxy_client(actual_port)
+        if not no_mcp:
+            from headroom.mcp_registry import OpencodeRegistrar
+
+            _setup_headroom_mcp(OpencodeRegistrar(), actual_port, verbose=verbose, force=True)
+
+    env, env_vars_display = _build_opencode_launch_env(
+        actual_port, os.environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
+    )
+
+    # Inject Headroom provider into OpenCode config so traffic routes through proxy.
+    inject_opencode_provider_config(actual_port)
+    if memory:
+        mem_dir = Path.cwd() / ".headroom"
+        _inject_memory_mcp_config(
+            os.environ.get("USER", os.environ.get("USERNAME", "default")),
+        )
+
+    # Proxy already started by _ensure_proxy above; tell _launch_tool to
+    # skip duplicate startup.
+    try:
+        _launch_tool(
+            binary=opencode_bin,
+            args=opencode_args,
+            env=env,
+            port=actual_port,
+            no_proxy=True,
+            tool_label="OPENCODE",
+            env_vars_display=env_vars_display,
+            learn=learn,
+            memory=memory,
+            agent_type="opencode",
+            code_graph=code_graph,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+        )
+    finally:
+        if _opencode_proxy and _opencode_proxy.poll() is None:
+            _other = _live_proxy_clients(actual_port, exclude_self=True)
+            if not _other:
+                _opencode_proxy.terminate()
+                try:
+                    _opencode_proxy.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _opencode_proxy.kill()
 
 
 def _opencode_home_dir() -> Path:

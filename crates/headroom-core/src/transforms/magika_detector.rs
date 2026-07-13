@@ -29,6 +29,11 @@
 //!   only. PR5 flips the ContentRouter to call us instead of the
 //!   regex-based [`crate::transforms::content_detector`].
 
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "x86_64")
+))]
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -38,6 +43,292 @@ use thiserror::Error;
 use tracing;
 
 use crate::transforms::content_detector::ContentType;
+
+/// Check whether the CPU can run the precompiled ONNX Runtime binary
+/// that magika depends on.
+///
+/// On x86/x86_64 without AVX2, the `onnxruntime` shared library shipped
+/// by `ort-sys` can contain AVX2-family instructions that will SIGILL.
+/// We detect this up front so the magika session init can fail gracefully
+/// instead of crashing.
+///
+/// On non-x86 targets, this x86-specific AVX2 gate is not applied.
+///
+/// Delegates to the shared [`crate::onnx_cpu`] guard so magika and the
+/// embedding scorer agree on a single CPU-support source of truth.
+pub(crate) fn magika_onnx_runtime_supported_by_cpu() -> bool {
+    crate::onnx_cpu::onnx_runtime_supported_by_cpu()
+}
+
+/// Check whether this process can safely initialize Magika's ONNX session.
+///
+/// This is stricter than the CPU check. On dynamic-ORT platforms, the runtime
+/// loader must be pinned before `Session::new()` runs; otherwise Windows can
+/// resolve the OS-provided `System32\onnxruntime.dll` and hang inside ORT
+/// initialization. Python callers get the pin from `headroom._ort`; direct Rust
+/// binaries/tests need this fail-fast guard.
+pub(crate) fn magika_runtime_available_for_session_init() -> Result<(), String> {
+    if !magika_onnx_runtime_supported_by_cpu() {
+        return Err(
+            "Magika ONNX Runtime backend requires AVX2 on this platform; \
+             falling back to non-Magika detection"
+                .to_string(),
+        );
+    }
+
+    dynamic_ort_loader_ready()
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "x86_64")
+))]
+static DYNAMIC_ORT_INIT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "x86_64")
+))]
+fn dynamic_ort_loader_ready() -> Result<(), String> {
+    DYNAMIC_ORT_INIT
+        .get_or_init(initialize_dynamic_ort)
+        .as_ref()
+        .map(|_| ())
+        .map_err(Clone::clone)
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "x86_64")
+))]
+fn initialize_dynamic_ort() -> Result<PathBuf, String> {
+    let explicit = std::env::var("ORT_DYLIB_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    if let Some(path) = explicit {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err(format!(
+                "ORT_DYLIB_PATH points to a missing ONNX Runtime library: {}",
+                path.display()
+            ));
+        }
+        init_ort_from_path(&path)?;
+        return Ok(path);
+    }
+
+    let mut errors = Vec::new();
+    let candidates = discover_onnxruntime_libraries();
+    for path in &candidates {
+        match init_ort_from_path(path) {
+            Ok(()) => {
+                tracing::info!(
+                    ort_dylib_path = %path.display(),
+                    "initialized ONNX Runtime for Magika from discovered onnxruntime package"
+                );
+                return Ok(path.clone());
+            }
+            Err(error) => errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+
+    if candidates.is_empty() {
+        Err(
+            "no pip onnxruntime native library was found for Magika dynamic ONNX Runtime loading; \
+             install headroom-ai[proxy], install onnxruntime, or set ORT_DYLIB_PATH"
+                .to_string(),
+        )
+    } else {
+        Err(format!(
+            "failed to initialize ONNX Runtime for Magika from discovered libraries: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "x86_64")
+))]
+fn init_ort_from_path(path: &Path) -> Result<(), String> {
+    let builder = ort::init_from(path).map_err(|error| {
+        format!(
+            "failed to load ONNX Runtime from `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let _committed = builder.commit();
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "x86_64")
+))]
+fn discover_onnxruntime_libraries() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    for var in ["VIRTUAL_ENV", "CONDA_PREFIX"] {
+        if let Some(root) = env_path(var) {
+            roots.push(root);
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd.join(".venv"));
+        roots.push(cwd.join("venv"));
+    }
+
+    if let Some(user_profile) = env_path("USERPROFILE") {
+        roots.extend(versioned_children(
+            user_profile
+                .join(".pyenv")
+                .join("pyenv-win")
+                .join("versions"),
+        ));
+        roots.extend(versioned_children(
+            user_profile
+                .join("AppData")
+                .join("Local")
+                .join("Programs")
+                .join("Python"),
+        ));
+        roots.extend(versioned_children(
+            user_profile.join("AppData").join("Roaming").join("Python"),
+        ));
+    }
+
+    if let Some(home) = env_path("HOME") {
+        roots.extend(versioned_children(home.join(".pyenv").join("versions")));
+        roots.push(home.join(".local"));
+    }
+
+    let mut candidates = Vec::new();
+    for root in roots {
+        candidates.extend(onnxruntime_candidates_under(&root));
+    }
+    dedup_existing_files(candidates)
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "x86_64")
+))]
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "x86_64")
+))]
+fn versioned_children(root: PathBuf) -> Vec<PathBuf> {
+    let mut children = std::fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    children.sort_by(|a, b| b.cmp(a));
+    children
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "x86_64")
+))]
+fn onnxruntime_candidates_under(root: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        vec![
+            root.join("Lib")
+                .join("site-packages")
+                .join("onnxruntime")
+                .join("capi")
+                .join("onnxruntime.dll"),
+            root.join("site-packages")
+                .join("onnxruntime")
+                .join("capi")
+                .join("onnxruntime.dll"),
+        ]
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        let mut candidates = Vec::new();
+        for site_packages in python_site_packages_dirs(root) {
+            let capi = site_packages.join("onnxruntime").join("capi");
+            candidates.extend(onnxruntime_dylibs_in(&capi));
+        }
+        candidates
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn python_site_packages_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![root.join("lib").join("site-packages")];
+    let lib = root.join("lib");
+    dirs.extend(
+        std::fs::read_dir(lib)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("python"))
+            })
+            .map(|path| path.join("site-packages")),
+    );
+    dirs
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn onnxruntime_dylibs_in(capi: &Path) -> Vec<PathBuf> {
+    let mut dylibs = std::fs::read_dir(capi)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("libonnxruntime") && name.ends_with(".dylib"))
+        })
+        .collect::<Vec<_>>();
+    dylibs.sort();
+    dylibs
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "x86_64")
+))]
+fn dedup_existing_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for path in paths {
+        if path.is_file() && !out.iter().any(|seen| seen == &path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[cfg(not(any(
+    target_os = "windows",
+    all(target_os = "macos", target_arch = "x86_64")
+)))]
+fn dynamic_ort_loader_ready() -> Result<(), String> {
+    Ok(())
+}
 
 /// Errors from the magika detector. Wraps the underlying `magika::Error`
 /// so callers can match on whether init or inference broke without
@@ -102,6 +393,13 @@ fn magika_init_timeout() -> Duration {
 
 fn session() -> &'static Mutex<Result<Session, String>> {
     MAGIKA_SESSION.get_or_init(|| {
+        // Early-out if ORT is known to be unsafe or unavailable in this
+        // process. This avoids both SIGILL on unsupported CPUs and Windows
+        // deadlocks from unpinned dynamic ONNX Runtime loading.
+        if let Err(error) = magika_runtime_available_for_session_init() {
+            return Mutex::new(Err(error));
+        }
+
         let timeout = magika_init_timeout();
         let (tx, rx) = mpsc::channel();
         // Run the (potentially hanging) ONNX init on a side thread so we
@@ -234,9 +532,25 @@ mod tests {
     use super::*;
 
     fn assert_detect(content: &str, expected: ContentType, hint: &str) {
-        match magika_detect(content) {
-            Ok(got) => assert_eq!(got, expected, "{hint}: expected {expected:?}, got {got:?}"),
-            Err(e) => panic!("{hint}: detection failed: {e}"),
+        if let Err(init_reason) = magika_runtime_available_for_session_init() {
+            // On hosts where Magika cannot safely initialize, assert graceful
+            // degradation rather than panicking or hanging.
+            match magika_detect(content) {
+                Err(MagikaDetectorError::Init(msg)) => {
+                    assert!(
+                        msg == init_reason,
+                        "{hint}: expected init error {init_reason:?}, got: {msg:?}"
+                    );
+                }
+                other => panic!("{hint}: expected Magika init error, got {other:?}"),
+            }
+        } else {
+            match magika_detect(content) {
+                Ok(got) => {
+                    assert_eq!(got, expected, "{hint}: expected {expected:?}, got {got:?}")
+                }
+                Err(e) => panic!("{hint}: detection failed: {e}"),
+            }
         }
     }
 
@@ -368,15 +682,30 @@ index abc123..def456 100644
 
     #[test]
     fn singleton_session_is_reused_across_calls() {
-        // Two back-to-back calls should both succeed without re-initing
-        // the model (no panic, no error). We can't directly observe
-        // the singleton hit-rate without instrumenting the test, but
-        // wall-clock asymmetry between the first and second call is
-        // strong evidence (cold ~50 ms, warm <1 ms). For the unit
-        // suite, just prove neither call errors.
-        magika_detect("hello world").unwrap();
-        magika_detect("def f(): pass").unwrap();
-        magika_detect(r#"{"a":1}"#).unwrap();
+        // Two back-to-back calls should reuse the same session
+        // (or same cached error). When the Magika runtime is available the
+        // session is Ok and repeated calls succeed; otherwise the session is
+        // Err and repeated calls return the same Err.
+        if let Err(init_reason) = magika_runtime_available_for_session_init() {
+            let r1 = magika_detect("hello world");
+            let r2 = magika_detect("def f(): pass");
+            let r3 = magika_detect(r#"{"a":1}"#);
+            for r in [&r1, &r2, &r3] {
+                match r {
+                    Err(MagikaDetectorError::Init(msg)) => {
+                        assert_eq!(msg, &init_reason);
+                    }
+                    other => panic!("expected Magika init error, got {other:?}"),
+                }
+            }
+        } else {
+            // On available hosts the session loads once and all calls
+            // succeed. Wall-clock asymmetry (cold ~50 ms, warm
+            // <1 ms) confirms reuse.
+            magika_detect("hello world").unwrap();
+            magika_detect("def f(): pass").unwrap();
+            magika_detect(r#"{"a":1}"#).unwrap();
+        }
     }
 
     #[test]
@@ -408,5 +737,30 @@ index abc123..def456 100644
         assert_eq!(map_magika_label("markdown"), ContentType::PlainText);
         assert_eq!(map_magika_label("txt"), ContentType::PlainText);
         assert_eq!(map_magika_label("empty"), ContentType::PlainText);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_onnxruntime_candidate_matches_pip_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "headroom-ort-discovery-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dll = root
+            .join("Lib")
+            .join("site-packages")
+            .join("onnxruntime")
+            .join("capi")
+            .join("onnxruntime.dll");
+        std::fs::create_dir_all(dll.parent().unwrap()).unwrap();
+        std::fs::write(&dll, b"not a real dll").unwrap();
+
+        let candidates = dedup_existing_files(onnxruntime_candidates_under(&root));
+        assert_eq!(candidates, vec![dll]);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

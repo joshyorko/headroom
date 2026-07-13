@@ -11,6 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from headroom.pricing.litellm_model_resolution import (
+    pricing_lookup_candidates,
+    resolve_litellm_model_name,
+)
+
 # litellm calls `dotenv.load_dotenv()` during its own import, which loads
 # the project `.env` into `os.environ`. We don't want that side effect —
 # importing a pricing helper should not silently leak API keys into the
@@ -33,40 +38,6 @@ except ImportError:
     litellm = None  # type: ignore[assignment]
     LITELLM_AVAILABLE = False
 
-# Aliases for models removed from LiteLLM's cost database (retired/renamed).
-# Maps old model name -> current LiteLLM key that has equivalent pricing.
-_MODEL_ALIASES: dict[str, str] = {
-    # Claude 3.5 Sonnet retired Feb 2026, pricing same as claude-sonnet-4-20250514
-    "claude-3-5-sonnet-20241022": "claude-sonnet-4-20250514",
-    "claude-3-5-sonnet-20240620": "claude-sonnet-4-20250514",
-    # Claude 3 Sonnet retired
-    "claude-3-sonnet-20240229": "claude-3-haiku-20240307",
-    # DeepSeek keeps these compatibility names for V4 Flash modes. LiteLLM's
-    # legacy rows still carry pre-V4 prices/context, so force the current row.
-    "deepseek-chat": "deepseek/deepseek-v4-flash",
-    "deepseek-reasoner": "deepseek/deepseek-v4-flash",
-    "deepseek/deepseek-chat": "deepseek/deepseek-v4-flash",
-    "deepseek/deepseek-reasoner": "deepseek/deepseek-v4-flash",
-    # ChatGPT's Codex registry exposes this as a spark slug. LiteLLM carries a
-    # zero-priced chatgpt/* entry for subscription auth, so use the canonical
-    # Codex input rate for Headroom's estimated saved-dollar counters.
-    "gpt-5.3-codex-spark": "gpt-5.3-codex",
-    "chatgpt/gpt-5.3-codex-spark": "gpt-5.3-codex",
-}
-
-_MODEL_PREFIXES: dict[str, tuple[str, ...]] = {
-    "claude-": ("anthropic/",),
-    # Codex subscription models can be exposed as bare gpt-* slugs by the
-    # ChatGPT/Codex model registry even though LiteLLM prices them under
-    # provider-specific namespaces.
-    "gpt-": ("openai/", "chatgpt/", "github_copilot/"),
-    "o1-": ("openai/",),
-    "o3-": ("openai/",),
-    "o4-": ("openai/",),
-    "gemini-": ("google/",),
-    "deepseek-": ("deepseek/",),
-}
-
 _resolved_model_cache: dict[str, str] = {}
 
 
@@ -87,55 +58,16 @@ def _resolve_litellm_model_uncached(model: str) -> str:
     if not LITELLM_AVAILABLE:
         return model
 
-    cost_data = getattr(litellm, "model_cost", {}) or {}
+    def is_known_model(candidate: str) -> bool:
+        if candidate in getattr(litellm, "model_cost", {}):
+            return True
+        try:
+            litellm.cost_per_token(model=candidate, prompt_tokens=1, completion_tokens=0)
+            return True
+        except Exception:
+            return False
 
-    # Try as-is and static aliases first. Using the in-process pricing registry
-    # avoids provider-specific cost_per_token hooks that can initiate auth flows.
-    alias = _MODEL_ALIASES.get(model)
-    if alias and alias in cost_data:
-        return alias
-
-    if model.startswith("deepseek-"):
-        for prefix in _MODEL_PREFIXES["deepseek-"]:
-            prefixed = f"{prefix}{model}"
-            if prefixed in cost_data:
-                return prefixed
-
-    if model in cost_data:
-        return model
-
-    for pattern, prefixes in _MODEL_PREFIXES.items():
-        if model.startswith(pattern):
-            for prefix in prefixes:
-                prefixed = f"{prefix}{model}"
-                if prefixed in cost_data:
-                    return prefixed
-            break
-
-    # Try as-is through LiteLLM's resolver as a compatibility fallback.
-    try:
-        litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
-        return model
-    except Exception:
-        pass
-
-    # Try with provider prefixes. Skip provider namespaces whose pricing lookup
-    # can perform interactive auth; if they were priceable, model_cost handled
-    # them above.
-    interactive_prefixes = {"chatgpt/", "github_copilot/"}
-    for pattern, prefixes in _MODEL_PREFIXES.items():
-        if model.startswith(pattern):
-            for prefix in prefixes:
-                if prefix in interactive_prefixes:
-                    continue
-                prefixed = f"{prefix}{model}"
-                try:
-                    litellm.cost_per_token(model=prefixed, prompt_tokens=1, completion_tokens=0)
-                    return prefixed
-                except Exception:
-                    continue
-            break
-    return model
+    return resolve_litellm_model_name(model, is_known_model)
 
 
 @dataclass
@@ -180,29 +112,11 @@ def get_model_pricing(model: str) -> LiteLLMModelPricing | None:
         return None
     cost_data = litellm.model_cost
 
-    # Try retired/renamed/equivalent model aliases first. Some provider-specific
-    # subscription entries exist in LiteLLM with zero token price even though a
-    # canonical list-price entry is available.
-    alias = _MODEL_ALIASES.get(model)
-    alias_info = cost_data.get(alias) if alias else None
-
-    # Try exact match next.
-    info = alias_info or cost_data.get(model)
-
-    # Try common provider prefixes if not found
-    if info is None:
-        for prefix in [
-            "openai/",
-            "chatgpt/",
-            "github_copilot/",
-            "anthropic/",
-            "google/",
-            "mistral/",
-            "deepseek/",
-        ]:
-            if f"{prefix}{model}" in cost_data:
-                info = cost_data[f"{prefix}{model}"]
-                break
+    info = None
+    for candidate in pricing_lookup_candidates(model):
+        info = cost_data.get(candidate)
+        if info is not None:
+            break
 
     if info is None:
         return None

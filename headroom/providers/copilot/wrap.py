@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 import click
 
-from headroom.proxy.project_context import with_client_prefix, with_project_prefix
+from headroom.proxy.project_context import with_project_prefix
 
 
 def resolve_provider_type(
@@ -185,9 +185,8 @@ def build_launch_env(
 ) -> tuple[dict[str, str], list[str]]:
     """Build the Copilot BYOK environment for the selected provider type.
 
-    ``project`` (the wrap launch directory) and the Copilot client name are
-    encoded as base-URL prefixes because the Copilot CLI cannot send custom
-    headers; the proxy strips them and attributes traffic per client/project.
+    ``project`` (the wrap launch directory) is encoded as a base-URL prefix
+    because the Copilot CLI cannot send custom headers.
     """
     # Distinguish "caller passed nothing" (use os.environ) from "caller
     # explicitly passed an empty dict" (start fresh — the test/CLI is in
@@ -204,7 +203,7 @@ def build_launch_env(
             env["COPILOT_PROVIDER_API_KEY"] = key
 
     if provider_type == "anthropic":
-        base_url = with_client_prefix(with_project_prefix(proxy_root, project), "copilot")
+        base_url = with_project_prefix(proxy_root, project)
         env["COPILOT_PROVIDER_BASE_URL"] = base_url
         return env, [
             "COPILOT_PROVIDER_TYPE=anthropic",
@@ -212,7 +211,7 @@ def build_launch_env(
         ]
 
     effective_wire_api = wire_api or "completions"
-    base_url = with_client_prefix(with_project_prefix(f"{proxy_root}/v1", project), "copilot")
+    base_url = with_project_prefix(f"{proxy_root}/v1", project)
     env["COPILOT_PROVIDER_BASE_URL"] = base_url
     env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
     return env, [

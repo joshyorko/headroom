@@ -93,7 +93,7 @@ def _tool_call_args_text(raw: Any) -> str:
     if isinstance(raw, str):
         text = raw
     elif isinstance(raw, dict):
-        text = " ".join(str(v) for v in raw.values() if isinstance(v, (str, int, float, bool)))
+        text = " ".join(str(v) for v in raw.values() if isinstance(v, str | int | float | bool))
     else:
         return ""
     return " ".join(text.split())[:300]
@@ -2704,35 +2704,17 @@ class ContentRouter(Transform):
 
         # 1. ML text compressor: Kompress.
         #
-        # Eager preload is cache-only (allow_download=False): on a cold cache we
-        # must NOT trigger a network download here, because this runs on the
-        # blocking startup/lifespan path before the proxy binds its port. A slow
-        # download stalls the bind, and a hard crash in the native download/ML
-        # stack (uncatchable SIGABRT) kills the interpreter before it ever
-        # listens — the proxy then "never opens its port" and the supervisor
-        # gives up. When the model isn't cached we defer to first use instead.
+        # Native model initialization stays out of the blocking startup/lifespan
+        # path. The existing lazy request path loads Kompress on first use.
         if self.config.enable_kompress:
-            from .kompress_compressor import KompressModelNotCached
-
             compressor = self._get_kompress()
             if compressor:
                 if not hasattr(compressor, "preload"):
                     status["kompress"] = "enabled"
                     status["kompress_backend"] = "unknown"
                 else:
-                    try:
-                        backend = compressor.preload(allow_download=False)
-                    except KompressModelNotCached:
-                        logger.warning(
-                            "Kompress model not cached; compression disabled "
-                            "until model is downloaded. Ensure HuggingFace is "
-                            "accessible or pre-download with headroom-ai[ml]."
-                        )
-                        status["kompress"] = "deferred"
-                    else:
-                        logger.info("Kompress model pre-loaded at startup backend=%s", backend)
-                        status["kompress"] = "enabled"
-                        status["kompress_backend"] = str(backend)
+                    logger.info("Kompress model preload deferred until first request")
+                    status["kompress"] = "deferred"
             else:
                 status["kompress"] = "unavailable"
 

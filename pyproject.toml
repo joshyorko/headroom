@@ -66,6 +66,9 @@ dependencies = [
 proxy = [
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0,<1.0",
+    # LiteLLM provider backends (e.g. openrouter) expect orjson at runtime but
+    # litellm only declares it under its own [proxy] extra (GH #2056).
+    "orjson>=3.9.14; platform_python_implementation != 'PyPy'",
     "httpx[http2]>=0.24.0",
     "openai>=2.14.0",             # OpenAI API format support
     "mcp>=1.0.0",                 # MCP server (headroom_compress, retrieve, stats)

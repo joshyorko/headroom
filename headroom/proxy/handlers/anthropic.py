@@ -3048,8 +3048,19 @@ class AnthropicHandlerMixin:
                     if _compression_failed:
                         response_headers["x-headroom-compression-failed"] = "true"
 
-                    # Enterprise Security: scan response + de-anonymize
-                    if self.security and _security_ctx and resp_json:
+                    # Enterprise Security: scan response + de-anonymize.
+                    # Gate on a 200 upstream like the sibling CCR/cache/buffered
+                    # blocks below: without this, a non-2xx upstream (rate limit
+                    # 429, overloaded 529, 5xx) whose JSON body is scanned was
+                    # rebuilt as httpx.Response(status_code=200) and returned as
+                    # HTTP 200, so the client's retry/backoff never triggered and
+                    # an error looked like success.
+                    if (
+                        self.security
+                        and _security_ctx
+                        and resp_json
+                        and response.status_code == 200
+                    ):
                         try:
                             resp_json = self.security.scan_response(resp_json, _security_ctx)
                             response = httpx.Response(

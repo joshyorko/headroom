@@ -1540,7 +1540,14 @@ def _codex_session_home_overlay() -> Any:
     with tempfile.TemporaryDirectory(prefix="headroom-codex-home-") as tmp_dir:
         session_home = Path(tmp_dir)
         if source_home.exists():
-            shutil.copytree(source_home, session_home, dirs_exist_ok=True)
+            shutil.copytree(
+                source_home,
+                session_home,
+                dirs_exist_ok=True,
+                ignore=lambda directory, names: [
+                    name for name in names if (Path(directory) / name).is_socket()
+                ],
+            )
 
         os.environ["CODEX_HOME"] = str(session_home)
         try:
@@ -2731,7 +2738,9 @@ def _proxy_needs_version_restart(payload: dict[str, Any] | None) -> bool:
     """Return True when a running Headroom proxy uses a different package version."""
     running_version = _proxy_version(payload)
     running_release = _normalize_release_version(running_version)
-    current_release = _normalize_release_version(_HEADROOM_VERSION)
+    # -dev is a display marker for source builds; compare the base release so a
+    # dev CLI still restarts a stale proxy on a real version difference.
+    current_release = _normalize_release_version(_HEADROOM_VERSION.removesuffix("-dev"))
     return (
         running_release is not None
         and current_release is not None
@@ -6063,6 +6072,11 @@ def openclaw(
     is_flag=True,
     help="Skip CLI context-tool setup",
 )
+@click.option(
+    "--no-project-rtk",
+    is_flag=True,
+    help="Skip rtk instruction injection into the project AGENTS.md",
+)
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
 @click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
 @click.option(
@@ -6084,6 +6098,7 @@ def openclaw(
 def opencode(
     port: int,
     no_rtk: bool,
+    no_project_rtk: bool,
     no_mcp: bool,
     no_serena: bool,
     code_graph: bool,
@@ -6109,6 +6124,7 @@ def opencode(
         headroom wrap opencode                         # Start proxy + context tool + opencode
         headroom wrap opencode -- "fix the bug"        # Pass prompt to opencode
         headroom wrap opencode --no-context-tool       # Skip CLI context-tool setup
+        headroom wrap opencode --no-project-rtk        # Keep project AGENTS.md unchanged
         headroom wrap opencode --no-mcp                # Skip MCP retrieve tool registration
         headroom wrap opencode --no-serena             # Skip Serena MCP registration
         headroom wrap opencode --port 9999             # Custom proxy port
@@ -6128,9 +6144,9 @@ def opencode(
             click.echo("  Setting up rtk for OpenCode...")
             rtk_path = _ensure_rtk_binary(verbose=verbose)
             if rtk_path:
-                # Inject into project AGENTS.md
-                project_agents = Path.cwd() / "AGENTS.md"
-                _inject_rtk_instructions(project_agents, verbose=verbose)
+                if not no_project_rtk:
+                    project_agents = Path.cwd() / "AGENTS.md"
+                    _inject_rtk_instructions(project_agents, verbose=verbose)
                 # Inject into global OpenCode AGENTS.md
                 global_agents = _opencode_home_dir() / "AGENTS.md"
                 _inject_rtk_instructions(global_agents, verbose=verbose)
@@ -6330,6 +6346,17 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
             click.echo("  Removed Headroom-installed Serena MCP server from OpenCode.")
         elif serena_status == "failed":
             click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
+
+    # `wrap opencode` injects the marker-fenced rtk guidance into both the project
+    # `AGENTS.md` and the global `_opencode_home_dir() / "AGENTS.md"`; that block is
+    # durable state the config restore above does not touch. Without removing it, a
+    # plain `opencode` launch keeps following Headroom's "prefix shell commands with
+    # rtk" instruction and fails when the managed rtk binary is off PATH. Mirror what
+    # unwrap_codex / unwrap_copilot already do. Best-effort and unconditional, like
+    # the MCP cleanup above.
+    for _agents_md in (Path.cwd() / "AGENTS.md", _opencode_home_dir() / "AGENTS.md"):
+        if _remove_rtk_instructions(_agents_md):
+            click.echo(f"  Removed Headroom rtk instructions from {_agents_md}.")
 
     click.echo()
     click.echo("✓ OpenCode is no longer routed through the Headroom proxy.")

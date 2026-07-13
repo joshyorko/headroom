@@ -173,6 +173,14 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
         if hasattr(config.embedder_backend, "value")
         else str(config.embedder_backend),
         config.embedder_model or "",
+        # The Ollama backend is built with ``base_url=config.ollama_base_url``,
+        # so two configs that share a backend and model but point at different
+        # Ollama servers must NOT share a cached embedder — otherwise the second
+        # caller silently gets an embedder bound to the first server. (The
+        # ``openai_api_key`` omission is handled by the up-front validation
+        # above; ``ollama_base_url`` has no such guard and would just resolve to
+        # the wrong host.)
+        config.ollama_base_url or "",
     )
 
     with _EMBEDDER_CACHE_LOCK:

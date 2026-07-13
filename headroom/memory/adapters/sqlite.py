@@ -586,6 +586,11 @@ class SQLiteMemoryStore:
             params.append(filter.limit)
 
         if filter.offset > 0:
+            # SQLite only accepts OFFSET as part of a LIMIT clause; an OFFSET
+            # without a LIMIT is a syntax error. When the caller paginates with
+            # an offset but no limit, use SQLite's unbounded ``LIMIT -1``.
+            if filter.limit is None:
+                query += " LIMIT -1"
             query += " OFFSET ?"
             params.append(filter.offset)
 

@@ -25,8 +25,9 @@ MODEL_ALIASES: dict[str, str] = {
     # Claude 3.5 Sonnet retired Feb 2026, pricing same as claude-sonnet-4-20250514
     "claude-3-5-sonnet-20241022": "claude-sonnet-4-20250514",
     "claude-3-5-sonnet-20240620": "claude-sonnet-4-20250514",
-    # Claude 3 Sonnet retired
-    "claude-3-sonnet-20240229": "claude-3-haiku-20240307",
+    # Claude 3 Sonnet retired. It was a Sonnet-tier model ($3/$15 per 1M
+    # in/out), so keep it on equivalent Sonnet-tier pricing.
+    "claude-3-sonnet-20240229": "claude-sonnet-4-20250514",
     # ChatGPT exposes subscription variants with zero-priced rows; use the
     # canonical Codex list price for savings estimates.
     "gpt-5.3-codex-spark": "gpt-5.3-codex",

@@ -15,6 +15,8 @@ headroom_protect_reads = ENV.fetch("HEADROOM_PROTECT_READS", "1")
 headroom_memory_injection_mode = ENV.fetch("HEADROOM_MEMORY_INJECTION_MODE", "live_zone_tail")
 headroom_strip_internal_headers = ENV.fetch("HEADROOM_STRIP_INTERNAL_HEADERS", "enabled")
 headroom_output_shaper = ENV.fetch("HEADROOM_OUTPUT_SHAPER", "1")
+headroom_output_holdout = ENV.fetch("HEADROOM_OUTPUT_HOLDOUT", "0.10")
+headroom_effort_router = ENV.fetch("HEADROOM_EFFORT_ROUTER", "1")
 headroom_target_ratio = ENV.fetch("HEADROOM_TARGET_RATIO", "0.4")
 headroom_memory_top_k = ENV.fetch("HEADROOM_MEMORY_TOP_K", "5")
 headroom_min_evidence = ENV.fetch("HEADROOM_MIN_EVIDENCE", "3")
@@ -138,11 +140,12 @@ env:
     HEADROOM_NEO4J_URI: neo4j://neo4j:7687
     HEADROOM_NEO4J_USER: neo4j
     HEADROOM_OUTPUT_SHAPER: "<%= headroom_output_shaper %>"
+    HEADROOM_OUTPUT_HOLDOUT: "<%= headroom_output_holdout %>"
     HEADROOM_STRIP_INTERNAL_HEADERS: "<%= headroom_strip_internal_headers %>"
 <% unless headroom_verbosity_level.empty? %>
     HEADROOM_VERBOSITY_LEVEL: "<%= headroom_verbosity_level %>"
 <% end %>
-    HEADROOM_EFFORT_ROUTER: "0"
+    HEADROOM_EFFORT_ROUTER: "<%= headroom_effort_router %>"
     HEADROOM_MECHANICAL_EFFORT: low
     HEADROOM_LOG_MESSAGES: "0"
     HEADROOM_DEBUG_DUMP: "<%= headroom_debug_dump %>"

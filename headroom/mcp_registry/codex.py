@@ -196,7 +196,7 @@ class CodexRegistrar(MCPRegistrar):
         if not raw.strip():
             return None
         try:
-            data = tomllib.loads(fsutil.read_text(self._config_file))
+            data = tomllib.loads(raw)
         except (tomllib.TOMLDecodeError, OSError) as exc:
             return f"{self._config_file} is not valid TOML ({exc})"
         if not isinstance(data, dict):

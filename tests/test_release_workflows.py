@@ -555,6 +555,100 @@ def test_release_workflow_verifies_versions_before_build_outputs() -> None:
     assert second_sync < second_verify < build_wheels
 
 
+def test_release_workflow_uses_local_npm_asset_builder() -> None:
+    """npm tarball metadata must be built and verified by the reusable local gate."""
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    builder = (ROOT / "scripts" / "build_npm_release_assets.mjs").read_text(encoding="utf-8")
+    verifier = (ROOT / "scripts" / "verify_npm_release_assets.mjs").read_text(encoding="utf-8")
+
+    assert (
+        'node scripts/build_npm_release_assets.mjs "${{ needs.detect-version.outputs.npm_version }}" release-assets'
+        in content
+    )
+    build_start = content.index("name: Build npm release packages")
+    upload_start = content.index("name: Upload release assets artifact", build_start)
+    build_block = content[build_start:upload_start]
+    assert "npm pack" not in build_block, (
+        "release.yml must not reimplement npm packing inline; the script "
+        "regenerates OpenClaw dist metadata and runs install/import smoke checks."
+    )
+
+    assert "scripts/build_npm_release_assets.mjs" in content
+    assert "scripts/verify_npm_release_assets.mjs" in content
+    assert "scripts/verify_npm_release_assets.mjs" in builder
+    assert "registerHeadroomPlugin" in verifier
+
+
+def test_npm_release_builder_regenerates_openclaw_dist_metadata_after_rewrite() -> None:
+    """OpenClaw's packed dist/package.json must see the release dependency."""
+    builder = (ROOT / "scripts" / "build_npm_release_assets.mjs").read_text(encoding="utf-8")
+
+    rewrite = builder.index("rewriteOpenClawReleaseDependency();")
+    prepare_dist = builder.index('runNode(["prepare-dist.mjs"], openClawDir);', rewrite)
+    pack = builder.index(
+        'runNpm(["pack", "--pack-destination", assetsDir], openClawDir);', prepare_dist
+    )
+    verify = builder.index(
+        'runNode(["scripts/verify_npm_release_assets.mjs", assetsDir, version], rootDir)', pack
+    )
+
+    assert rewrite < prepare_dist < pack < verify
+
+
+def test_npm_release_builder_installs_openclaw_against_local_sdk_tarball() -> None:
+    """The OpenClaw build must not require the release SDK to exist on npm."""
+    builder = (ROOT / "scripts" / "build_npm_release_assets.mjs").read_text(encoding="utf-8")
+
+    local_dependency = builder.index("rewriteOpenClawLocalDependency(sdkTarballPath);")
+    install = builder.index(
+        '["install", "--package-lock=false", "--no-audit", "--no-fund", "--ignore-scripts"]',
+        local_dependency,
+    )
+    build = builder.index('runNpm(["run", "build"], openClawDir);', install)
+    release_dependency = builder.index("rewriteOpenClawReleaseDependency();", build)
+
+    assert local_dependency < install < build < release_dependency
+    assert 'runNpm(["ci"], openClawDir)' not in builder
+
+
+def test_openclaw_source_dependency_matches_lockfile_registry_range() -> None:
+    """The source checkout must remain npm-ci installable before a release exists."""
+    import json
+
+    package_json = json.loads((ROOT / "plugins" / "openclaw" / "package.json").read_text())
+    package_lock = json.loads((ROOT / "plugins" / "openclaw" / "package-lock.json").read_text())
+
+    source_range = package_json["dependencies"]["headroom-ai"]
+    lock_range = package_lock["packages"][""]["dependencies"]["headroom-ai"]
+
+    assert source_range == lock_range == "^0.22.3"
+
+
+def test_python_release_smoke_imports_installed_wheel_outside_source_tree() -> None:
+    """The wheel smoke must not import the checkout package by accident."""
+    script = (ROOT / "scripts" / "build_python_release_smoke.py").read_text(encoding="utf-8")
+
+    assert "cwd: Path = ROOT" in script
+    assert 'import_cwd = Path(tmp) / "import-cwd"' in script
+    assert 'run([smoke_python, "-c", smoke_code], cwd=import_cwd)' in script
+
+
+def test_publish_npm_regenerates_openclaw_dist_metadata_after_version_and_dependency() -> None:
+    """The direct npm publish path must not ship stale OpenClaw dist metadata."""
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    start = content.index("name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org")
+    end = content.index("continue-on-error: true", start)
+    block = content[start:end]
+
+    version = block.index('npm version "$version"')
+    dependency = block.index('pkg.dependencies["headroom-ai"]')
+    prepare_dist = block.index("node prepare-dist.mjs")
+    publish = block.index("npm publish --access public")
+
+    assert version < dependency < prepare_dist < publish
+
+
 def test_sdist_license_is_packaged_and_verified_before_upload() -> None:
     """STRUCTURAL INVARIANT: the sdist tarball must physically contain
     every license file PEP 639 declares in PKG-INFO, and the release

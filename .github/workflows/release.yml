@@ -50,6 +50,8 @@ on:
       - "pyproject.toml"
       - "scripts/verify-versions.py"
       - "scripts/version-sync.py"
+      - "scripts/build_npm_release_assets.mjs"
+      - "scripts/verify_npm_release_assets.mjs"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -187,20 +189,7 @@ jobs:
 
       - name: Build npm release packages
         run: |
-          mkdir -p release-assets
-
-          cd sdk/typescript
-          npm install
-          npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
-          npm pack --pack-destination ../../release-assets
-
-          cd ../../plugins/openclaw
-          npm install ../../release-assets/headroom-ai-${{ needs.detect-version.outputs.npm_version }}.tgz
-          npm install
-          npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
-          npm pack --pack-destination ../../release-assets
+          node scripts/build_npm_release_assets.mjs "${{ needs.detect-version.outputs.npm_version }}" release-assets
 
       - name: Upload release assets artifact
         uses: actions/upload-artifact@v7
@@ -833,10 +822,11 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          version="${{ needs.detect-version.outputs.npm_version }}"
           cd sdk/typescript
-          npm install
+          npm ci
           npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
+          npm version "$version" --no-git-tag-version --allow-same-version
           npm publish --access public
         continue-on-error: true
 
@@ -845,10 +835,19 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          version="${{ needs.detect-version.outputs.npm_version }}"
           cd plugins/openclaw
-          npm install
+          npm ci
           npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
+          npm version "$version" --no-git-tag-version --allow-same-version
+          HEADROOM_NPM_VERSION="$version" node <<'EOF'
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          pkg.dependencies = pkg.dependencies || {};
+          pkg.dependencies["headroom-ai"] = `^${process.env.HEADROOM_NPM_VERSION}`;
+          fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
+          EOF
+          node prepare-dist.mjs
           npm publish --access public
         continue-on-error: true
 

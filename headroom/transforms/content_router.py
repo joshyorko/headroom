@@ -51,6 +51,7 @@ from typing import Any
 
 from ..config import (
     DEFAULT_EXCLUDE_TOOLS,
+    DEFAULT_VERBATIM_EXCLUDE_TOOLS,
     ReadLifecycleConfig,
     RelevanceScorerConfig,
     TransformResult,
@@ -3567,6 +3568,12 @@ class ContentRouter(Transform):
             if role == "tool":
                 tool_call_id = message.get("tool_call_id", "")
                 if tool_call_id in excluded_tool_ids:
+                    tool_name = tool_name_map.get(tool_call_id, "")
+                    if tool_name and is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
+                        result_slots[i] = message
+                        transforms_applied.append("router:excluded:tool")
+                        route_counts["excluded_tool"] += 1
+                        continue
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
                         # output can still be losslessly compacted.
@@ -4165,6 +4172,12 @@ class ContentRouter(Transform):
 
             locs: list[tuple[int, int | None, int | None]] = []
             dblocks: list[DedupBlock] = []
+            tool_name_map = self._build_tool_name_map(messages)
+            verbatim_tool_ids = {
+                tool_id
+                for tool_id, name in tool_name_map.items()
+                if is_tool_excluded(name, DEFAULT_VERBATIM_EXCLUDE_TOOLS)
+            }
 
             def _is_user_read_observation(idx: int) -> bool:
                 # A file read can land in a plain ``role:user`` STRING (text
@@ -4191,7 +4204,11 @@ class ContentRouter(Transform):
                         if not isinstance(block, dict) or block.get("type") != "tool_result":
                             continue
                         tc = block.get("content")
-                        protected = frozen or ("cache_control" in block)
+                        protected = (
+                            frozen
+                            or ("cache_control" in block)
+                            or block.get("tool_use_id") in verbatim_tool_ids
+                        )
                         if isinstance(tc, str) and tc:
                             locs.append((i, bidx, None))
                             dblocks.append(DedupBlock(text=tc, turn=i, protected=protected))
@@ -4225,7 +4242,11 @@ class ContentRouter(Transform):
                     if role in ("tool", "function") or (
                         role == "user" and _is_user_read_observation(i)
                     ):
-                        protected = frozen or ("cache_control" in msg)
+                        protected = (
+                            frozen
+                            or ("cache_control" in msg)
+                            or msg.get("tool_call_id") in verbatim_tool_ids
+                        )
                         locs.append((i, None, None))
                         dblocks.append(DedupBlock(text=content, turn=i, protected=protected))
 
@@ -4414,6 +4435,13 @@ class ContentRouter(Transform):
                         route_counts["read_protected"] += 1
                     continue
                 if tool_use_id in excluded_tool_ids:
+                    tool_name = tool_name_map.get(tool_use_id, "") if tool_name_map else ""
+                    if tool_name and is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
+                        new_blocks.append(block)
+                        transforms_applied.append("router:excluded:tool")
+                        if route_counts is not None:
+                            route_counts["excluded_tool"] += 1
+                        continue
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
                         # output can still be losslessly compacted.

@@ -805,6 +805,7 @@ def _dedup_responses_output_items(
     items: list[dict[str, Any]],
     output_types: frozenset[str],
     count_tokens: Any = None,
+    protected_call_ids: set[str] | None = None,
 ) -> tuple[int, int]:
     """Cross-turn verbatim de-dup over Responses tool-output items (mutates in place).
 
@@ -834,7 +835,17 @@ def _dedup_responses_output_items(
         out = item.get("output")
         if isinstance(out, str) and out:
             locs.append(i)
-            blocks.append(DedupBlock(text=out, turn=i, protected=False))
+            blocks.append(
+                DedupBlock(
+                    text=out,
+                    turn=i,
+                    protected=bool(
+                        isinstance(item.get("call_id"), str)
+                        and protected_call_ids
+                        and item.get("call_id") in protected_call_ids
+                    ),
+                )
+            )
     if len(blocks) < 2:
         return 0, 0
 
@@ -1372,7 +1383,11 @@ class OpenAIHandlerMixin:
         # mirroring ContentRouter's policy. exclude_tools already contains both
         # original and lowercased name variants (see _parse_exclude_tools), but
         # we also test the lowercased name defensively for case-insensitivity.
-        from headroom.config import DEFAULT_EXCLUDE_TOOLS, is_tool_excluded
+        from headroom.config import (
+            DEFAULT_EXCLUDE_TOOLS,
+            DEFAULT_VERBATIM_EXCLUDE_TOOLS,
+            is_tool_excluded,
+        )
 
         router_exclude_tools = getattr(router.config, "exclude_tools", None)
         effective_exclude_tools = (
@@ -1382,6 +1397,11 @@ class OpenAIHandlerMixin:
             call_id
             for call_id, fn_name in function_name_by_call_id.items()
             if is_tool_excluded(fn_name, effective_exclude_tools)
+        }
+        verbatim_excluded_call_ids: set[str] = {
+            call_id
+            for call_id, fn_name in function_name_by_call_id.items()
+            if is_tool_excluded(fn_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS)
         }
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
@@ -1428,6 +1448,20 @@ class OpenAIHandlerMixin:
                         )
                     continue
                 if isinstance(call_id, str) and call_id in excluded_call_ids:
+                    if call_id in verbatim_excluded_call_ids:
+                        if debug_enabled:
+                            extraction_debug.append(
+                                {
+                                    "index": idx,
+                                    "eligible": False,
+                                    "reason": "exclude_tools_verbatim",
+                                    "item_type": item_type,
+                                    "call_id": call_id,
+                                    "tool_name": function_name_by_call_id.get(call_id),
+                                    "item": item,
+                                }
+                            )
+                        continue
                     # Protected from lossy compression — but grep/log/json output
                     # can still be losslessly compacted. Reuse the router helper
                     # so the Responses path matches the chat/Anthropic behavior.
@@ -1824,7 +1858,10 @@ class OpenAIHandlerMixin:
         # chat path (ContentRouter._cross_turn_dedup_messages runs last there too).
         if getattr(router, "_cross_turn_dedup_enabled", False):
             dd_folded, dd_saved = _dedup_responses_output_items(
-                updated_items, self.OPENAI_RESPONSES_OUTPUT_TYPES, tokenizer.count_text
+                updated_items,
+                self.OPENAI_RESPONSES_OUTPUT_TYPES,
+                tokenizer.count_text,
+                protected_call_ids=verbatim_excluded_call_ids,
             )
             if dd_folded:
                 modified = True

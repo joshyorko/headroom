@@ -364,10 +364,10 @@ _RESPONSES_EFFORT_RANK = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh
 # model — the Responses counterpart of an Anthropic ``tool_result`` block.
 _RESPONSES_TOOL_OUTPUT_TYPES = frozenset(
     {
-        "function_call_output",
         "custom_tool_call_output",
+        "function_call_output",
         "local_shell_call_output",
-        "computer_call_output",
+        "apply_patch_call_output",
     }
 )
 

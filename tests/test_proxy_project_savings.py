@@ -444,14 +444,22 @@ def test_context_tool_project_report_is_idempotent_and_durable(tmp_path, monkeyp
         base_url="http://127.0.0.1",
         client=("127.0.0.1", 12345),
     ) as client:
+        client.app.state.proxy.metrics.savings_tracker.record_request(
+            model="gpt-4o",
+            input_tokens=100,
+            tokens_saved=400,
+            project="headroom",
+        )
         assert client.post("/stats/context-tool", json=payload).status_code == 200
         assert client.post("/stats/context-tool", json=payload).status_code == 200
 
         project = client.get("/stats-lifetime").json()["projects"]["headroom"]
         assert project["requests"] == 12
         assert project["tokens_saved"] == 750
+        assert project["proxy_tokens_saved"] == 400
         assert project["rtk_commands"] == 12
         assert project["rtk_tokens_saved"] == 750
+        assert project["savings_percent"] == 75.0
 
     reloaded = SavingsTracker(path=str(savings_path)).lifetime_response()["projects"][
         "headroom"

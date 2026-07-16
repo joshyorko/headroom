@@ -1037,10 +1037,15 @@ class SavingsTracker:
             view["proxy_requests"] = entry["requests"]
             view["proxy_tokens_saved"] = proxy_tokens_saved
             view["requests"] = max(entry["requests"], _coerce_int(entry.get("rtk_commands")))
-            view["tokens_saved"] = proxy_tokens_saved + rtk_tokens_saved
-            total_before = max(
-                proxy_tokens_saved + entry["total_input_tokens"],
-                _coerce_int(entry.get("rtk_input_tokens")),
+            # RTK and proxy snapshots can cover different historical windows.
+            # Use the stronger cumulative observation for the shared headline
+            # instead of adding them and manufacturing savings above 100%.
+            view["tokens_saved"] = max(proxy_tokens_saved, rtk_tokens_saved)
+            rtk_input_tokens = _coerce_int(entry.get("rtk_input_tokens"))
+            total_before = (
+                rtk_input_tokens
+                if rtk_tokens_saved > 0 and rtk_input_tokens > 0
+                else proxy_tokens_saved + entry["total_input_tokens"]
             )
             view["savings_percent"] = round(
                 (view["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,

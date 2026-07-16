@@ -19,6 +19,8 @@ headroom wrap codex --prepare-only
 
 Supported values are `rtk` and `lean-ctx`; unset defaults to `rtk`.
 
+If Codex history disappeared after using an older wrapper, see [Recover Codex State](/docs/codex-recovery) before wrapping Codex again.
+
 The proxy reads RTK lifetime savings with global scope by default so a shared
 daemon reports savings across the operator's projects. Set
 `HEADROOM_RTK_GAIN_SCOPE=project` to query `rtk gain --project` from the
@@ -303,13 +305,45 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_STRIP_INTERNAL_HEADERS` | Python proxy: whether to strip internal `x-headroom-*` request headers (e.g. `x-headroom-bypass`, `x-headroom-mode`, `x-headroom-user-id`, `x-headroom-stack`, `x-headroom-base-url`) before every upstream forwarder call (PR-A5, fixes P5-49). `enabled` (default) stops fingerprinting / leakage. `disabled` is an explicit operator opt-in for diagnostic shadow tracing — NOT a fallback. Inbound reads of these headers (bypass gating, memory user-id resolution) are unaffected because they read `request.headers` directly. | `enabled` |
 | `HEADROOM_PROXY_STRIP_INTERNAL_HEADERS` | Rust proxy: same policy as `HEADROOM_STRIP_INTERNAL_HEADERS` but for the Rust transparent proxy. Stripping happens inside `build_forward_request_headers` so both HTTP and WebSocket upstream calls are gated by one flag. `enabled` default; `disabled` operator opt-in for diagnostic shadow tracing. Response-side `X-Headroom-*` injection (e.g. `x-headroom-tokens-saved`) is unrelated and stays. | `enabled` |
 | `HEADROOM_EMBEDDER_RUNTIME` | Set to `pytorch_mps` to run the memory embedder via the torch sentence-transformers backend on the Apple GPU (MPS). Only engages when Apple MPS is actually available; otherwise it logs a warning and uses the existing default embedder selection path. `pytorch_mps` is the only accepted value. Requires the `[pytorch-mps]` extra. See [Memory](/docs/memory#embedding-runtime--gpu-offload-apple-silicon). | default embedder selection |
-| `ORT_DYLIB_PATH` | Windows: path to the `onnxruntime.dll` loaded by the Rust core (magika detection, fastembed embeddings). Auto-pinned at `import headroom` to the DLL inside the `onnxruntime` pip package; set it yourself to override. Without a pin the bare Windows DLL search resolves to the Windows ML System32 build (1.17.x on Win11 24H2+), which deadlocks ONNX session init — see [Troubleshooting](/docs/troubleshooting#windows-ml-content-detection-hangs-or-silently-falls-back). | auto-pinned on Windows |
+| `ORT_DYLIB_PATH` | Path to the ONNX Runtime shared library loaded by the Rust core (magika detection, fastembed embeddings), which loads ORT dynamically on every platform. Auto-pinned at `import headroom` to the library inside the `onnxruntime` pip package (`onnxruntime.dll` / `libonnxruntime.so*` / `libonnxruntime*.dylib`); set it yourself to override. Without a pin, ML detection degrades to the non-ONNX tiers — and on Windows the bare DLL search can resolve to the Windows ML System32 build (1.17.x on Win11 24H2+), which deadlocks ONNX session init — see [Troubleshooting](/docs/troubleshooting#windows-ml-content-detection-hangs-or-silently-falls-back). | auto-pinned |
 | `HEADROOM_MAGIKA_INIT_TIMEOUT_SECS` | Upper bound (integer seconds, > 0) on magika's one-time ONNX session init in the Rust detection chain. On timeout the init error is cached and detection uses the non-ML fallback tiers for the rest of the process; a warning is logged. Safety net for environments where the dylib pin above does not apply. | `5` |
 | `HEADROOM_REQUEST_TIMEOUT` | Request timeout in seconds | `300` |
 | `HEADROOM_BETA_HEADER_STICKY` | Controls per-session `anthropic-beta` / `OpenAI-Beta` re-echo. `enabled` (default): the proxy unions beta tokens across turns within a session — if the client sends a token in turn N and omits it in turn N+1, the proxy re-injects it to preserve prefix-cache stability. `disabled`: the client's value is forwarded verbatim with no accumulation. Any other value raises at request time. See [Session Beta Header Tracking](/docs/configuration#session-beta-header-tracking). | `enabled` |
 | `HEADROOM_BETA_TRACKER_MAX_SESSIONS` | LRU capacity of the in-memory session beta tracker. Once full, the oldest session entry is evicted. | `1000` |
+| `HEADROOM_MODEL_ROUTER_ENABLED` | Enable cost-aware model routing. `1`/`true`/`yes`/`on`/`enabled` turns it on and requires `HEADROOM_MODEL_ROUTES`. See [Cost-aware model routing](/docs/configuration#cost-aware-model-routing). | `off` |
+| `HEADROOM_MODEL_ROUTES` | JSON array of ordered routing rules for cost-aware model routing (schema below). | -- |
 
 For provider-only proxying, prefer `HEADROOM_HTTP_PROXY` over process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or `NO_PROXY`. HTTPX reads those global variables, but Headroom also passes them through to tool executions.
+
+### Cost-aware model routing
+
+Complementary to content compression, Headroom can rewrite the upstream model per request to stretch quota and control spend, for example by sending small, tool-free requests to a cheaper model. Routing is opt-in and disabled by default, so behavior is unchanged unless you configure it.
+
+Enable it with `HEADROOM_MODEL_ROUTER_ENABLED=1` and declare ordered rules in `HEADROOM_MODEL_ROUTES` (a JSON array). The router evaluates rules top to bottom and the first rule whose conditions all match wins; every decision is logged with a reason so routing stays observable. Each rule object supports:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `to_model` | string (required) | Model to route to when the rule matches. |
+| `max_input_tokens` | integer | Match only when the estimated input size is at or below this. |
+| `min_input_tokens` | integer | Match only when the estimated input size is at or above this. |
+| `require_no_tools` | boolean | Match only when the request declares no tools (a proxy for low-risk work). |
+| `from_models` | list of strings | Restrict the rule to these source models. Omit for any source model. |
+| `name` | string | Label surfaced in the decision log. |
+
+```bash
+export HEADROOM_MODEL_ROUTER_ENABLED=1
+export HEADROOM_MODEL_ROUTES='[
+  {"name": "small-no-tools", "max_input_tokens": 4000, "require_no_tools": true,
+   "from_models": ["claude-sonnet-4-6"], "to_model": "claude-haiku-4-5"}
+]'
+```
+
+Notes:
+
+- Input size is a fast, tokenizer-free estimate over the messages, tools, and top-level `system` prompt, meant for tier selection rather than exact accounting.
+- A malformed rule fails open: it is skipped (never silently widened), and the rest of the rules still apply.
+- Routing is skipped for byte-faithful passthrough requests (`x-headroom-bypass: true` or `x-headroom-mode: passthrough`), so those are never model-rewritten.
+- Routing currently applies on the Anthropic `/v1/messages` path.
 
 ### Session Beta Header Tracking
 

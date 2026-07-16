@@ -64,7 +64,9 @@ from headroom.proxy.body_forwarding import (
 from headroom.proxy.body_forwarding import (
     prepare_outbound_body_bytes as prepare_outbound_body_bytes,  # noqa: F401 - compatibility export
 )
-from headroom.proxy.body_forwarding import serialize_body_canonical
+from headroom.proxy.body_forwarding import (
+    serialize_body_canonical as serialize_body_canonical,  # noqa: F401 - compatibility export
+)
 from headroom.proxy.ccr_golden_policy import (
     create_fresh_ccr_tool_definition,
     replay_golden_ccr_tool_definition,
@@ -87,6 +89,9 @@ from headroom.proxy.internal_header_policy import (
 from headroom.proxy.memory_golden_policy import (
     replay_golden_memory_tool_definition,
     serialize_memory_tool_definition_canonical,
+)
+from headroom.proxy.tool_definition_serialization import (
+    serialize_tool_definition_canonical as _serialize_tool_definition_canonical,
 )
 from headroom.proxy.tool_injection_config import (
     ToolInjectionStickyMode,
@@ -353,6 +358,7 @@ def log_memory_injection(
     decision: str,
     bytes_injected: int,
     query: str | None = None,
+    tags: dict[str, str] | None = None,
 ) -> None:
     """Emit a structured log line for every memory-context routing decision.
 
@@ -360,6 +366,8 @@ def log_memory_injection(
     Never log raw query content or Authorization header — only a stable
     hash of the query.
     """
+    if tags is not None and bytes_injected > 0:
+        tags["memory_injected"] = "true"
     query_hash = hash_query_for_log(query) if query else ""
     logger.info(
         "event=memory_injection request_id=%s session_id=%s decision=%s "
@@ -557,6 +565,68 @@ def get_sse_event_max_bytes() -> int:
     )
 
 
+# Well-known OpenAI-compatible upstreams, matched by host against the
+# configured ``--openai-api-url``. Used only to label the dashboard/stats
+# display provider — the internal provider key stays ``openai`` so pricing
+# and request formatting are unaffected (issue #1533).
+_OPENAI_COMPATIBLE_HOSTS: tuple[tuple[str, str], ...] = (
+    ("openrouter.ai", "OpenRouter"),
+    ("api.groq.com", "Groq"),
+    ("api.together.xyz", "Together AI"),
+    ("api.fireworks.ai", "Fireworks AI"),
+    ("api.deepseek.com", "DeepSeek"),
+    ("api.mistral.ai", "Mistral"),
+    ("api.perplexity.ai", "Perplexity"),
+    ("openai.azure.com", "Azure OpenAI"),
+    ("api.openai.com", "OpenAI"),
+)
+
+
+def classify_openai_upstream(url: str | None) -> str | None:
+    """Map a custom ``--openai-api-url`` to a well-known provider display name.
+
+    Matches the URL host against :data:`_OPENAI_COMPATIBLE_HOSTS` (exact or
+    subdomain). Returns ``None`` when no URL is set or the host is unrecognized
+    (callers then fall back to an explicit ``--provider-name`` or the raw
+    ``openai`` label).
+    """
+    if not url:
+        return None
+    from urllib.parse import urlparse
+
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except (ValueError, TypeError):
+        return None
+    if not host:
+        return None
+    for needle, name in _OPENAI_COMPATIBLE_HOSTS:
+        if host == needle or host.endswith("." + needle):
+            return name
+    return None
+
+
+def resolve_display_provider(
+    raw_provider: str | None,
+    *,
+    openai_api_url: str | None = None,
+    provider_name: str | None = None,
+) -> str:
+    """Resolve the dashboard display provider for a logged request.
+
+    Only requests whose internal provider is ``openai`` are reclassified;
+    Anthropic/Bedrock/Gemini keep their own labels. This affects the display
+    label only — pricing and request formatting still key on ``openai``.
+    Precedence: explicit ``--provider-name`` > host detection > raw provider.
+    """
+    raw = (raw_provider or "").strip()
+    if raw.lower() != "openai":
+        return raw or "unknown"
+    if provider_name:
+        return provider_name
+    return classify_openai_upstream(openai_api_url) or raw
+
+
 # Body-too-large status code (PR-A8 / P5-59). Default 413 (RFC 7231 §6.5.11).
 # Configurable via HEADROOM_PROXY_BODY_TOO_LARGE_STATUS for operators who need
 # to override (no expected production use; documentation knob).
@@ -629,6 +699,20 @@ try:
     )
 except ValueError:
     COMPRESSION_TIMEOUT_SECONDS = 30.0
+
+# Cold-start fast-pass timeout in seconds. When background compression defers
+# a cold-start-large request, the handler still runs the pipeline synchronously
+# with skip_kompress=True (everything except the ML stage) under this budget so
+# the FORWARDED — and therefore provider-cached and byte-identically frozen —
+# form carries the cheap savings instead of the raw transcript. Without the ML
+# stage the pass is bounded by routing + statistical crushers (seconds, not the
+# 30s Kompress budget). Fail-open: on timeout the request forwards as before.
+try:
+    COLD_START_FAST_PASS_TIMEOUT_SECONDS = float(
+        os.environ.get("HEADROOM_COLD_START_FAST_PASS_TIMEOUT_SECONDS", "10")
+    )
+except ValueError:
+    COLD_START_FAST_PASS_TIMEOUT_SECONDS = 10.0
 
 # Eager startup preload timeout in seconds. The preload (compressor/parser models,
 # cache-only, allow_download=False) runs off the event loop during startup; this
@@ -1210,6 +1294,10 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
             _rtk_gain_command(rtk_path, scope),
             capture_output=True,
             text=True,
+            # rtk output is UTF-8 (emoji etc.); without this, Windows decodes
+            # with cp1252 and the reader thread dies with UnicodeDecodeError.
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -1259,6 +1347,9 @@ def _read_lean_ctx_lifetime_stats() -> dict[str, Any] | None:
             [str(lean_ctx_path), "gain", "--json"],
             capture_output=True,
             text=True,
+            # UTF-8 regardless of the Windows console code page (cp1252).
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
         # Failed reads return None ("no data") — mirrors the rtk reader so
@@ -1637,6 +1728,24 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     return strip_internal_headers(headers, mode=get_strip_internal_headers_mode())
 
 
+def merge_extra_headers(headers: dict[str, str], extra: dict[str, str] | None) -> dict[str, str]:
+    """Merge configured extra headers into ``headers``, overriding same-named keys.
+
+    ``extra`` comes from ``ProxyConfig.anthropic_extra_headers``/``openai_extra_headers``
+    (settings-panel/CLI-configured, for gateways that need one extra header alongside the
+    client's own auth). Returns ``headers`` unchanged (no copy) when nothing is configured.
+    """
+    if not extra:
+        return headers
+    # HTTP header names are case-insensitive: drop any existing key that
+    # case-insensitively collides with a configured extra so the extra wins.
+    # A plain {**headers, **extra} would emit both casings upstream.
+    lowered = {k.lower() for k in extra}
+    merged = {k: v for k, v in headers.items() if k.lower() not in lowered}
+    merged.update(extra)
+    return merged
+
+
 def log_outbound_headers(
     *,
     forwarder: str,
@@ -1958,7 +2067,7 @@ def serialize_tool_definition_canonical(tool_definition: dict[str, Any]) -> byte
     follow-up turn must inject byte-equal output to keep the prefix
     cache hot.
     """
-    return serialize_body_canonical(tool_definition)
+    return _serialize_tool_definition_canonical(tool_definition)
 
 
 class SessionToolTracker(_SessionToolTracker):
@@ -2523,6 +2632,61 @@ async def _read_request_body_bytes(request: Request) -> bytes:
     return cast(bytes, raw)
 
 
+# ---------------------------------------------------------------------------
+# Output-only content blocks
+# ---------------------------------------------------------------------------
+# The Anthropic *response* schema can emit signaling blocks that the *request*
+# schema (messages[].content[]) does not accept. The primary case is the
+# server-side refusal fallback notification introduced with the
+# ``server-side-fallback-2026-06-01`` beta::
+#
+#     {"type": "fallback",
+#      "from": {"model": "claude-fable-5"},
+#      "to":   {"model": "claude-opus-4-8"}}
+#
+# The API returns it inside an assistant turn to signal that a refused request
+# was transparently re-served by the fallback model. When a client replays that
+# assistant turn on the next call, the request validator rejects it::
+#
+#     400 invalid_request_error: messages.N.content.0: Input tag 'fallback'
+#     found using 'type' does not match any of the expected tags
+#
+# These blocks are output-only and carry no state the model needs on input, so
+# they are safe to drop before forwarding.
+OUTPUT_ONLY_REQUEST_BLOCK_TYPES: frozenset[str] = frozenset({"fallback"})
+
+
+def strip_output_only_request_blocks(messages: Any) -> bool:
+    """Remove output-only content blocks from request ``messages`` in place.
+
+    Returns ``True`` if any block was removed. If stripping empties a message's
+    ``content`` list it is backfilled with a single benign text block, because
+    the API also rejects an empty ``content`` array. Idempotent.
+    """
+    if not isinstance(messages, list):
+        return False
+    changed = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        kept = [
+            block
+            for block in content
+            if not (
+                isinstance(block, dict) and block.get("type") in OUTPUT_ONLY_REQUEST_BLOCK_TYPES
+            )
+        ]
+        if len(kept) != len(content):
+            changed = True
+            if not kept:
+                kept = [{"type": "text", "text": "(model fallback)"}]
+            msg["content"] = kept
+    return changed
+
+
 async def _read_request_json(request: Request) -> dict[str, Any]:
     """Read and parse JSON from a request, handling compressed bodies.
 
@@ -2545,6 +2709,17 @@ async def _read_request_json(request: Request) -> dict[str, Any]:
     result = json.loads(text)
     if not isinstance(result, dict):
         raise ValueError("Request body must be a JSON object, not " + type(result).__name__)
+
+    # Drop output-only blocks the request schema rejects (see
+    # ``strip_output_only_request_blocks``). Callers of this bytes-less reader
+    # (e.g. the Gemini path) re-serialize ``result`` themselves.
+    if strip_output_only_request_blocks(result.get("messages")):
+        logger.warning(
+            "removed output-only content block(s) (%s) from request messages "
+            "before forwarding (not valid on the request path)",
+            ",".join(sorted(OUTPUT_ONLY_REQUEST_BLOCK_TYPES)),
+        )
+
     return result
 
 
@@ -2566,6 +2741,21 @@ async def read_request_json_with_bytes(request: Request) -> tuple[dict[str, Any]
     result = json.loads(text)
     if not isinstance(result, dict):
         raise ValueError("Request body must be a JSON object, not " + type(result).__name__)
+
+    # Drop output-only blocks (see ``strip_output_only_request_blocks``) before
+    # any downstream deepcopy / compression / 400-retry path. This is the shared
+    # reader for the Anthropic, OpenAI, and Bedrock handlers, so one guard here
+    # covers every client that routes through the proxy. When a block is removed
+    # we re-encode ``raw`` so a byte-faithful passthrough forwarder cannot leak
+    # the pre-strip body; unchanged requests keep their exact original bytes.
+    if strip_output_only_request_blocks(result.get("messages")):
+        raw = json.dumps(result, ensure_ascii=False).encode("utf-8")
+        logger.warning(
+            "removed output-only content block(s) (%s) from request messages "
+            "before forwarding (not valid on the request path)",
+            ",".join(sorted(OUTPUT_ONLY_REQUEST_BLOCK_TYPES)),
+        )
+
     return result, raw
 
 

@@ -21,6 +21,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -71,6 +72,9 @@ class _DummyMetrics:
         return None
 
     async def record_failed(self, **kwargs) -> None:
+        return None
+
+    def record_compression_failed(self, reason: str) -> None:
         return None
 
 
@@ -161,6 +165,14 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *a, **k: "sess-1",
             get_or_create=lambda *a, **k: SimpleNamespace(
+                _cached_token_count=0,
+                get_frozen_message_count=lambda: 0,
+                get_last_original_messages=lambda: [],
+                get_last_forwarded_messages=lambda: [],
+                update_from_response=lambda *a, **k: None,
+                record_request=lambda *a, **k: None,
+            ),
+            resolve_tracker=lambda *a, **k: SimpleNamespace(
                 _cached_token_count=0,
                 get_frozen_message_count=lambda: 0,
                 get_last_original_messages=lambda: [],
@@ -999,3 +1011,68 @@ def test_security_scan_still_returns_200_for_ok_upstream():
         response = anyio.run(handler.handle_anthropic_messages, request)
 
     assert response.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Response cache must key on the looked-up messages, not the mutated ones      #
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingCache:
+    """Records the messages passed to get() and set() so the test can assert the
+    response is cached under the same key it was looked up by."""
+
+    def __init__(self) -> None:
+        self.get_messages = None
+        self.set_messages = None
+
+    async def get(self, messages, model, **fields):
+        self.get_messages = copy.deepcopy(messages)
+        return None  # force a miss so the upstream response gets cached
+
+    async def set(self, messages, model, content, headers, **kwargs):
+        self.set_messages = copy.deepcopy(messages)
+
+
+class _MutatingSecurity:
+    """Stands in for an enterprise-security scanner that rewrites (anonymizes)
+    the request messages, reproducing the get -> mutate -> set hazard."""
+
+    def scan_request(self, messages, ctx):
+        mutated = [dict(m, content="MUTATED") for m in messages]
+        return mutated, {"anonymization": {}}
+
+    def scan_response(self, resp_json, ctx):
+        return resp_json
+
+
+def test_response_cache_keys_on_lookup_messages_not_mutated():
+    """The response must be cached under the same messages it was looked up by.
+
+    `messages` is reassigned after the cache.get (here by the security scan), so
+    caching under the live `messages` stores the entry under a different key than
+    it was read by -- the cache never hits and fills with unreachable entries.
+    """
+    sem = asyncio.Semaphore(2)
+    handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem)
+    cache = _RecordingCache()
+    handler.cache = cache
+    handler.security = _MutatingSecurity()
+
+    request = _build_request(
+        {
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        {"authorization": "Bearer sk-ant-api-test"},
+    )
+
+    with _tokenizer_patch():
+        anyio.run(handler.handle_anthropic_messages, request)
+
+    assert cache.get_messages is not None, "cache.get was not called"
+    assert cache.set_messages is not None, "cache.set was not called"
+    # Same messages at get and set -> same key -> the cache can actually hit.
+    assert cache.set_messages == cache.get_messages
+    # And specifically the raw lookup messages, not the scanner's rewrite.
+    assert cache.set_messages == [{"role": "user", "content": "hello"}]

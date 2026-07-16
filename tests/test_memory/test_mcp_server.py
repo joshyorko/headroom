@@ -228,3 +228,30 @@ def test_search_fails_open_when_access_tracking_fails() -> None:
     result = asyncio.run(mcp_server_mod._handle_search(backend, {"query": "preference"}, "alice"))
 
     assert "Useful preference" in result[0].kwargs["text"]
+
+
+def test_save_does_not_supersede_a_semantically_similar_memory() -> None:
+    existing = Memory(content="Use compact output by default", user_id="alice")
+    saved = Memory(content="Keep semantic compression disabled", user_id="alice")
+    backend = SimpleNamespace(
+        search_memories=AsyncMock(return_value=[SimpleNamespace(memory=existing, score=0.91)]),
+        update_memory=AsyncMock(),
+        save_memory=AsyncMock(return_value=saved),
+    )
+
+    result = asyncio.run(
+        mcp_server_mod._handle_save(
+            backend,
+            {"facts": ["Keep semantic compression disabled"], "importance": 0.9},
+            "alice",
+        )
+    )
+
+    backend.search_memories.assert_not_awaited()
+    backend.update_memory.assert_not_awaited()
+    backend.save_memory.assert_awaited_once_with(
+        content="Keep semantic compression disabled",
+        user_id="alice",
+        importance=0.9,
+    )
+    assert result[0].kwargs["text"].startswith("Saved 1 new, updated 0 existing")

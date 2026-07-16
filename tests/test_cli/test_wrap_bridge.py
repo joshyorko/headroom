@@ -97,6 +97,27 @@ def test_wrap_codex_prepare_only_updates_config(monkeypatch, tmp_path: Path) -> 
     assert 'base_url = "http://127.0.0.1:8787/v1"' in content
 
 
+def test_wrap_grok_build_uses_actual_proxy_port(monkeypatch, tmp_path: Path) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    runner = CliRunner()
+
+    def fake_watcher(**kwargs) -> None:
+        kwargs["print_setup_lines"](9999)
+
+    monkeypatch.setattr("headroom.cli.wrap._run_proxy_only_watcher", fake_watcher)
+
+    result = runner.invoke(main, ["wrap", "grok-build", "--no-context-tool", "--port", "8787"])
+
+    assert result.exit_code == 0, result.output
+    config_file = tmp_path / ".grok" / "config.toml"
+    assert config_file.exists()
+    content = config_file.read_text(encoding="utf-8")
+    assert 'base_url = "http://127.0.0.1:9999/' in content
+    assert "http://127.0.0.1:8787/" not in content
+    assert "http://127.0.0.1:9999/" in result.output
+    assert "http://127.0.0.1:8787/" not in result.output
+
+
 def test_wrap_codex_prepare_only_uses_lean_ctx_when_configured(monkeypatch, tmp_path: Path) -> None:
     _set_test_home(monkeypatch, tmp_path)
     monkeypatch.setenv("HEADROOM_CONTEXT_TOOL", "lean-ctx")

@@ -204,6 +204,62 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
     assert captured["target_ratio"] == 0.10
 
 
+def test_skip_kompress_routes_around_ml_stage(router, tokenizer, monkeypatch):
+    """skip_kompress (cold-start fast pass) must never invoke the Kompress ML
+    stage — units that would route there take the same fallback as when the
+    model isn't ready — and wins over force_kompress."""
+    calls: list[str] = []
+
+    class FakeKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def ensure_background_load(self) -> None:
+            pass
+
+        def compress(self, content, **kwargs):
+            calls.append(content)
+            compressed = " ".join(content.split()[:20]) + " Retrieve more: hash=deadbeef"
+            return SimpleNamespace(
+                compressed=compressed,
+                compressed_tokens=len(compressed.split()),
+            )
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: FakeKompress())
+    tool_content = " ".join(
+        f'{{"file":"src/module_{i}.py","line":{i},"text":"repeated search payload"}}'
+        for i in range(160)
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_search_1",
+                    "content": tool_content,
+                }
+            ],
+        }
+    ]
+
+    result = router.apply(
+        messages,
+        tokenizer,
+        force_kompress=True,
+        skip_kompress=True,
+        target_ratio=0.10,
+        compress_user_messages=True,
+        min_tokens_to_compress=10,
+        read_protection_window=0,
+    )
+
+    assert calls == []
+    assert result.transforms_applied != ["router:tool_result:kompress"]
+    # The pass still completes and returns a well-formed message list.
+    assert result.messages[0]["content"][0]["content"]
+
+
 def test_anthropic_tool_result_lossy_without_marker_stays_verbatim(router, tokenizer, monkeypatch):
     """Reversibility gate (#1307): a lossy Kompress result on a tool_result block
     with no CCR retrieval marker is unrecoverable, so the router must keep the
@@ -1048,6 +1104,60 @@ class TestExcludeTools:
         result = router.apply(messages, tokenizer, read_protection_window=2)
 
         assert "router:excluded:tool" not in result.transforms_applied
+
+    def test_protect_recent_reads_fraction_zero_overrides_runtime_window(self, tokenizer):
+        """protect_recent_reads_fraction == 0.0 (the --protect-tool-results
+        sentinel) means "protect all excluded-tool output forever". A
+        profile-derived read_protection_window kwarg must not be allowed to
+        shrink that back down -- regression test for the precedence bug
+        where the runtime kwarg unconditionally overrode this config-level
+        guarantee."""
+        config = ContentRouterConfig(
+            min_section_tokens=10,
+            min_chars_for_block_compression=10,
+            exclude_tools={"Glob"},
+            protect_recent_reads_fraction=0.0,
+        )
+        router = ContentRouter(config)
+
+        # Plain unstructured text (not grep/log/json-shaped) so
+        # _lossless_compact_excluded returns None and the router takes the
+        # bare "protect as before" branch, matching the tag this test
+        # asserts on.
+        old_tool_content = "\n".join(
+            f"line {i}: some output from a glob command that is long enough to compress"
+            for i in range(80)
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_glob_old",
+                        "name": "Glob",
+                        "input": {"pattern": "*.py"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_glob_old",
+                        "content": old_tool_content,
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": "continue"},
+            {"role": "assistant", "content": "ack"},
+        ]
+
+        result = router.apply(messages, tokenizer, read_protection_window=2)
+
+        assert "router:excluded:tool" in result.transforms_applied
 
     def test_mixed_excluded_and_non_excluded_tools(self, tokenizer):
         """Multiple tools in same conversation - only excluded ones pass through."""

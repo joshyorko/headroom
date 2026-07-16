@@ -10,6 +10,7 @@ from headroom.install.runtime import resolve_headroom_config_command
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
 from .codex import CodexRegistrar
+from .grok import GrokRegistrar
 from .opencode import OpencodeRegistrar
 
 
@@ -33,7 +34,7 @@ def get_all_registrars(
         CodexRegistrar(scope=scope, project_dir=project_dir),
     ]
     if scope == "user":
-        registrars.append(OpencodeRegistrar())
+        registrars.extend((GrokRegistrar(), OpencodeRegistrar()))
     return registrars
 
 

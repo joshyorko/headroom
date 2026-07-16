@@ -34,7 +34,7 @@ _MEMORY_TEXT_GROUP = "headroom.memory_text"
 # safely serve every per-project ``LocalBackend`` created by the
 # BackendRouter. Without this cache, opening N project DBs would load
 # the sentence-transformers / ONNX model N times.
-_EMBEDDER_CACHE: dict[tuple[str, str], Embedder] = {}
+_EMBEDDER_CACHE: dict[tuple[str, str, str], Embedder] = {}
 _EMBEDDER_CACHE_LOCK = threading.Lock()
 
 

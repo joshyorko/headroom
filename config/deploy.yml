@@ -21,6 +21,7 @@ headroom_target_ratio = ENV.fetch("HEADROOM_TARGET_RATIO", "0.4")
 headroom_memory_top_k = ENV.fetch("HEADROOM_MEMORY_TOP_K", "5")
 headroom_min_evidence = ENV.fetch("HEADROOM_MIN_EVIDENCE", "3")
 headroom_memory_context_timeout_seconds = ENV.fetch("HEADROOM_MEMORY_CONTEXT_TIMEOUT_SECONDS", "1.0")
+headroom_request_timeout = ENV.fetch("HEADROOM_REQUEST_TIMEOUT", "600")
 headroom_compression_max_workers = ENV.fetch("HEADROOM_COMPRESSION_MAX_WORKERS", "16")
 headroom_tool_output_compression_parallelism = ENV.fetch("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "8")
 headroom_lossless = ENV.fetch("HEADROOM_LOSSLESS", "1")
@@ -132,6 +133,7 @@ env:
     HEADROOM_MEMORY_TOP_K: "<%= headroom_memory_top_k %>"
     HEADROOM_MIN_EVIDENCE: "<%= headroom_min_evidence %>"
     HEADROOM_MEMORY_CONTEXT_TIMEOUT_SECONDS: "<%= headroom_memory_context_timeout_seconds %>"
+    HEADROOM_REQUEST_TIMEOUT: "<%= headroom_request_timeout %>"
     HEADROOM_MEMORY_INJECTION_MODE: "<%= headroom_memory_injection_mode %>"
     HEADROOM_COMPRESSION_MAX_WORKERS: "<%= headroom_compression_max_workers %>"
     HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM: "<%= headroom_tool_output_compression_parallelism %>"

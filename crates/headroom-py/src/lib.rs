@@ -1335,6 +1335,9 @@ impl PyLogCompressorConfig {
         enable_ccr = true,
         min_lines_for_ccr = 50,
         min_compression_ratio_for_ccr = 0.5,
+        collapse_runtime_frames = true,
+        trace_head_frames = 3,
+        trace_app_frames = 5,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1351,6 +1354,9 @@ impl PyLogCompressorConfig {
         enable_ccr: bool,
         min_lines_for_ccr: usize,
         min_compression_ratio_for_ccr: f64,
+        collapse_runtime_frames: bool,
+        trace_head_frames: usize,
+        trace_app_frames: usize,
     ) -> Self {
         Self {
             inner: RustLogConfig {
@@ -1367,6 +1373,9 @@ impl PyLogCompressorConfig {
                 enable_ccr,
                 min_lines_for_ccr,
                 min_compression_ratio_for_ccr,
+                collapse_runtime_frames,
+                trace_head_frames,
+                trace_app_frames,
             },
         }
     }

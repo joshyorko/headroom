@@ -20,6 +20,8 @@
   <a href="https://headroom-docs.vercel.app/docs"><img src="https://img.shields.io/badge/docs-online-blue.svg" alt="Docs"></a>
 </p>
 
+<!-- mcp-name: io.github.headroomlabs-ai/headroom -->
+
 <p align="center">
   <a href="https://headroom-docs.vercel.app/docs">Docs</a> ·
   <a href="#get-started-60-seconds">Install</a> ·
@@ -47,10 +49,10 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 
 - **Library** — `compress(messages)` in Python or TypeScript, inline in any app
 - **Proxy** — `headroom proxy --port 8787`, zero code changes, any language
-- **Agent wrap** — `headroom wrap claude|codex|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe` in one command; undo with `headroom unwrap <tool>`
+- **Agent wrap** — `headroom wrap claude|codex|grok|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|omp|zcode` in one command; undo with `headroom unwrap <tool>`
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client
-- **Cross-agent memory** — shared store across Claude, Codex, Gemini, auto-dedup
-- **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.local.md` (default, gitignored) or `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`
+- **Cross-agent memory** — shared store across Claude, Codex, Gemini, Grok, auto-dedup
+- **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.local.md` (default, gitignored) or `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `GROK.md`
 - **Output token reduction** — trims what the model *writes back* (not just what you send): drops ceremony/restated code and skips deep "thinking" on routine steps. See [Output token reduction](#output-token-reduction-cut-what-the-model-writes-back).
 - **Reversible (CCR)** — originals are cached for retrieval on demand
 
@@ -87,11 +89,12 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 
 ```bash
 # 1 — Install
-uv tool install "headroom-ai[all]"      # Install `headroom` CLI as a global tool in self-contained virtual env
-pip install "headroom-ai[all]"          # Python — ships the `headroom` CLI
-npm install headroom-ai                 # TypeScript SDK only — no `headroom` CLI
+uv tool install --python 3.13 "headroom-ai[all]"  # CLI as a global tool in a self-contained virtual env
+pip install "headroom-ai[all]"                    # Python — ships the `headroom` CLI
+npm install headroom-ai                           # TypeScript SDK only — no `headroom` CLI
 
 # 2 — Pick your mode  (the `headroom` commands below come from the uv or pip install)
+headroom deploy                         # turnkey local deployment + agent config
 headroom wrap claude                    # wrap a coding agent
 headroom proxy --port 8787              # drop-in proxy, zero code changes
 # or: from headroom import compress      # inline library
@@ -164,6 +167,12 @@ Headroom can trim that too, from the proxy, without you changing any code:
   (a file read, a passing test), it dials the model's thinking effort down. New
   questions and errors keep full effort.
 
+Applies to Anthropic `/v1/messages` **and** OpenAI-compatible endpoints
+(`/v1/chat/completions`, `/v1/responses`). Effort routing uses
+`reasoning_effort` on OpenAI, `thinking.budget_tokens` /
+`output_config.effort` on Anthropic — same clamp-only invariant on both
+paths, same `output_shaper:*` label vocabulary.
+
 Turn it on:
 
 ```bash
@@ -218,6 +227,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 |--------------|:---------------:|----------------------------------|
 | Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` · `--tool-search` |
 | Codex        | ✅              | shares memory with Claude        |
+| Grok CLI     | ✅              | routes via `GROK_CLI_CHAT_PROXY_BASE_URL` |
 | Cursor       | Manual setup    | starts proxy and prints base URLs for Cursor settings |
 | Aider        | ✅              | starts proxy + launches          |
 | Copilot CLI  | ✅              | starts proxy + launches          |
@@ -228,10 +238,14 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 | Goose        | ✅              | starts proxy + launches          |
 | OpenHands    | ✅              | starts proxy + launches          |
 | Mistral Vibe | ✅              | starts proxy + launches          |
+| Oh My Pi     | ✅              | injects config · starts proxy + launches |
 | Cortex Code  | Library only    | 60–65% savings (library mode; no `wrap`) |
+| Kimi CLI     | ✅              | OAuth bearer forwarded — log in once |
+| ZCode        | ✅              | starts proxy and prints base URLs for ZCode settings |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
-Undo durable wrapping with `headroom unwrap <tool>` (supports: `claude`, `copilot`, `codex`, `opencode`, `openclaw`).
+Undo durable wrapping with `headroom unwrap <tool>` (supports: `claude`, `copilot`, `codex`, `grok`, `kimi`, `omp`, `opencode`, `openclaw`, `zcode`).
+Registry authors can use the canonical [`server.json`](server.json) in the repo root instead of reconstructing the `headroom mcp serve` contract from prose.
 
 ### GitHub Copilot CLI subscription mode
 
@@ -249,12 +263,17 @@ This avoids relying on generic GitHub or Copilot CLI tokens that can read
 Copilot account metadata but may still be rejected by Copilot's token-exchange
 endpoint.
 
-For GitHub Enterprise Server or custom-domain Copilot deployments, set the
-deployment domain before launching:
+For GitHub Enterprise Server or custom-domain Copilot deployments, set one of
+these before launching:
 
 ```bash
 export GITHUB_COPILOT_ENTERPRISE_DOMAIN=ghe.example.com
+# or
+export GITHUB_COPILOT_ENTERPRISE_URL=https://ghe.example.com
 ```
+
+Both variables are supported. If both are set,
+`GITHUB_COPILOT_ENTERPRISE_URL` takes precedence.
 
 For GitHub.com Enterprise Cloud URLs such as
 `github.com/enterprises/your-enterprise`, do not set an enterprise-domain
@@ -323,7 +342,7 @@ Headroom exposes one stable request lifecycle across `compress()`, the SDK, and 
 
 Provider and tool-specific behavior lives under `headroom/providers/` so core orchestration stays focused on lifecycle, sequencing, and policy.
 
-- **CLI/tool slices**: `headroom/providers/claude`, `copilot`, `codex`, `openclaw`
+- **CLI/tool slices**: `headroom/providers/claude`, `copilot`, `codex`, `grok`, `openclaw`
 - **Provider runtime slices**: `headroom/providers/claude`, `gemini`, plus shared backend/runtime dispatch in `headroom/providers/registry.py`
 - **Core files stay orchestration-first**: `wrap.py`, `client.py`, `cli/proxy.py`, and `proxy/server.py` delegate provider-specific env shaping, API target normalization, backend selection, and transport dispatch.
 
@@ -344,14 +363,34 @@ Everything in this repo stays open source (Apache 2.0). The managed offering is 
 ## Install
 
 ```bash
-pip install "headroom-ai[all]"          # Python, everything — includes the `headroom` CLI
-npm install headroom-ai                 # TypeScript SDK (library only — no `headroom` CLI)
+uv tool install --python 3.13 "headroom-ai[all]"  # CLI, isolated app env
+pip install "headroom-ai[all]"                    # Python, everything — includes the `headroom` CLI
+npm install headroom-ai                           # TypeScript SDK (library only — no `headroom` CLI)
 docker pull ghcr.io/chopratejas/headroom:latest
 ```
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-v2-base), `[code]`, `[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in `[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
 
 > **Note**: `[all]` covers the core stack but excludes framework adapters. Install them separately: `pip install "headroom-ai[langchain]"` (also `[agno]`, `[strands]`, `[anyllm]`, `[bedrock]`).
+
+Using `uv` for the `headroom` CLI? Prefer `uv tool install` so the command lives in an isolated app environment. On macOS, pass `--python 3.13` if your default `python3` is newer than the current wheel set:
+
+```bash
+brew install python@3.13  # if Python 3.13 is not already available
+uv tool install --python 3.13 "headroom-ai[all]"
+uv tool update-shell      # if ~/.local/bin is not already on PATH
+headroom --version
+```
+
+For MCP clients such as Codex that do not inherit your interactive shell `PATH`, configure the absolute executable path returned by `command -v headroom`:
+
+```toml
+[mcp_servers.headroom]
+command = "/Users/you/.local/bin/headroom"
+args = ["mcp", "serve"]
+```
+
+Current native wheels cover macOS Apple Silicon and Linux. On Intel macOS, use Docker-native install until native wheel support lands.
 
 Using `pipx`? Choose a supported interpreter explicitly:
 
@@ -415,6 +454,28 @@ Two runtime assets are fetched over TLS; if they are blocked, trust your corpora
   `HF_HUB_OFFLINE=1`, or set `HF_ENDPOINT` to a trusted mirror.
 
 Running with compression disabled (pure gateway) requires neither asset.
+
+#### Intel macOS (x86_64-apple-darwin): no prebuilt ONNX Runtime binary (#941)
+
+`ort-sys` ships no prebuilt ONNX Runtime binary for Intel macOS, so a source
+build fails by default even outside a corporate-proxy environment. The same
+`ORT_STRATEGY=system` mechanism above fixes it — point it at a system ONNX
+Runtime instead:
+
+```bash
+brew install onnxruntime
+ORT_STRATEGY=system \
+ORT_LIB_LOCATION="$(brew --prefix onnxruntime)/lib" \
+ORT_PREFER_DYNAMIC_LINK=1 \
+  pip install "headroom-ai[all]"
+
+# ORT is dlopen'd at runtime too:
+export ORT_DYLIB_PATH="$(brew --prefix onnxruntime)/lib/libonnxruntime.dylib"
+```
+
+`ORT_LIB_LOCATION` must point at `lib/` (not the bare prefix) and
+`ORT_PREFER_DYNAMIC_LINK=1` is required, or `ORT_STRATEGY=system` still
+attempts static linking, which the Homebrew keg doesn't provide.
 
 #### "Basic Constraints of CA cert not marked critical" (Python 3.13+ strict mode)
 
@@ -492,6 +553,10 @@ Devcontainers in `.devcontainer/` (default + `memory-stack` with Qdrant & Neo4j)
 
 - **[Discord](https://discord.gg/yRmaUNpsPJ)** — questions, feedback, war stories.
 - **[Kompress-v2-base on HuggingFace](https://huggingface.co/chopratejas/kompress-v2-base)** — the model behind our text compression.
+
+### Community projects
+
+- **[Claude Code status-line indicator](https://github.com/Ship-Wright/headroom-plugin)** — a Claude Code plugin that shows live Headroom usage in your status line: idle until `headroom_compress` fires, then the running total of tokens saved.
 
 ## License
 

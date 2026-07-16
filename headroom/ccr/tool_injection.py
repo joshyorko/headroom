@@ -220,6 +220,14 @@ class CCRToolInjector:
             # `<<ccr:HASH,KIND,SIZE>>`. HASH is 12-24 hex chars, terminated by a
             # space, comma, or the closing `>>`.
             re.compile(r"<<ccr:([a-f0-9]{12,24})\b"),
+            # read_lifecycle STALE/SUPERSEDED markers:
+            # `[Read content stale/superseded: ... Retrieve original: hash=xxx]`.
+            # These carry a retrievable CCR hash but never contain the word
+            # "compressed", so the patterns above miss them -- and the retrieve
+            # tool is then not injected, leaving the model a marker it cannot
+            # redeem (silent data loss, #1006). Match the load-bearing
+            # "Retrieve original: hash=" phrase directly.
+            re.compile(r"Retrieve original: hash=([a-f0-9]{12,24})"),
         ]
     )
 
@@ -513,9 +521,7 @@ def parse_tool_call(
         input_data = tool_call.get("input", tool_call.get("args", {}))
 
     if name != CCR_TOOL_NAME:
-        if provider == "openai_responses":
-            return None
-        return None, None
+        return None
 
     # A CCR-named tool call whose decoded arguments/input are not an object
     # (a JSON array/string/number, or a non-dict Anthropic `input`) is simply
@@ -524,22 +530,22 @@ def parse_tool_call(
         return None
 
     hash_key = input_data.get("hash")
-    query = input_data.get("query")
+    if hash_key is None:
+        return None
 
     # Validate hash format. SmartCrusher emits 12-hex-char hashes while legacy
     # bracket markers / the compression_store use 24-hex-char hashes; accept
     # either real length and reject anything else as malformed.
-    if hash_key is not None:
-        if not isinstance(hash_key, str) or len(hash_key) not in (12, 24):
-            if provider == "openai_responses":
-                return None
-            return None, None
-        # Validate hex characters only
-        if not all(c in "0123456789abcdef" for c in hash_key.lower()):
-            if provider == "openai_responses":
-                return None
-            return None, None
+    if not isinstance(hash_key, str) or len(hash_key) not in (12, 24):
+        return None
+    # Validate hex characters only
+    if not all(c in "0123456789abcdef" for c in hash_key.lower()):
+        return None
 
-    if provider == "openai_responses":
-        return hash_key
-    return hash_key, query
+    # Normalise to lowercase. The compression store always keys entries by a
+    # lowercase hash (sha256 hexdigest, and `explicit_hash.lower()` on store),
+    # and `retrieve` / `get_entry_status` look up the key verbatim. The hex
+    # validation above is already case-insensitive, so a model that echoes the
+    # marker hash uppercase passed validation but then missed the store lookup,
+    # failing an otherwise-valid retrieval. Return the canonical lowercase form.
+    return hash_key.lower()

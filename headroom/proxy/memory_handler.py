@@ -831,6 +831,7 @@ class MemoryHandler:
             # Both branches below render the same `i. [id] content` shape
             # so the format is stable regardless of whether a ranker is
             # in play.
+            selected_memory_ids: list[str] = []
             if ranker is not None:
                 from headroom.proxy.memory_ranker import MemoryCandidate
 
@@ -849,6 +850,8 @@ class MemoryHandler:
                 memory_lines = []
                 for i, candidate in enumerate(ranked, 1):
                     memory_id = candidate.id or "?"
+                    if candidate.id:
+                        selected_memory_ids.append(candidate.id)
                     memory_lines.append(f"{i}. [{memory_id}] {candidate.content}")
                     if candidate.related_entities:
                         entities_str = ", ".join(candidate.related_entities[:3])
@@ -874,6 +877,8 @@ class MemoryHandler:
                 memory_lines = []
                 for i, result in enumerate(filtered_results, 1):
                     memory_id = getattr(result.memory, "id", None) or "?"
+                    if memory_id != "?":
+                        selected_memory_ids.append(memory_id)
                     memory_lines.append(f"{i}. [{memory_id}] {result.memory.content}")
                     if hasattr(result, "related_entities") and result.related_entities:
                         entities_str = ", ".join(result.related_entities[:3])
@@ -918,6 +923,25 @@ your responses, not to drive new actions."""
         # per request. The budget bounds the output without touching
         # the input query (which stays full-fidelity per MemoryQuery).
         context = effective_budget.apply_to_text(context)
+
+        # Track only memories that survived ranking, entry limits, and the
+        # final text budget. Backends without access tracking keep working,
+        # and an audit write failure must never block the upstream request.
+        accessed_memory_ids = list(
+            dict.fromkeys(
+                memory_id for memory_id in selected_memory_ids if f"[{memory_id}]" in context
+            )
+        )
+        record_access = getattr(backend, "record_access", None)
+        if accessed_memory_ids and callable(record_access):
+            try:
+                await record_access(accessed_memory_ids)
+            except Exception as e:
+                logger.debug(
+                    "Memory: Failed to record passive retrieval access for %d memories: %s",
+                    len(accessed_memory_ids),
+                    e,
+                )
 
         logger.info(
             "event=memory_inject user=%s scope=%s count=%d chars=%d budget_tokens=%d",

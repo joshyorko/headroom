@@ -632,6 +632,26 @@ pub(crate) async fn forward_http(
         let endpoint = compression::classify_compressible_path(uri.path())
             .expect("is_compressible_path guarded above");
 
+        // PR-2027: strip the `[1m]` context-window tier suffix from
+        // the request body for Anthropic messages only. The
+        // Headroom CLI appends `[1m]` to model IDs (e.g.
+        // `glm-5.2[1m]`, `claude-3-7-sonnet[1m]`) to signal 1M
+        // context to Claude Code; the upstream Anthropic API does
+        // not recognize the suffix and rejects the request. The
+        // suffix is an Anthropic/Claude Code compatibility marker,
+        // so we must not silently mutate OpenAI-compatible
+        // request model IDs. The sanitizer is gated on the
+        // already-classified `endpoint`, which is the same source
+        // of truth the dispatcher uses below — keeping the gate
+        // and the dispatch in lockstep.
+        let buffered = match endpoint {
+            compression::CompressibleEndpoint::AnthropicMessages => {
+                compression::sanitize_anthropic_model_id_in_body(buffered)
+            }
+            compression::CompressibleEndpoint::OpenAiChatCompletions
+            | compression::CompressibleEndpoint::OpenAiResponses => buffered,
+        };
+
         // PR-E5 + PR-E6: cache-stabilization observability hooks.
         // Both run READ-ONLY against the buffered body and emit
         // structured logs only — passthrough invariant from Phase A

@@ -50,6 +50,7 @@ HEADROOM_SAVINGS_PATH_ENV = "HEADROOM_SAVINGS_PATH"
 HEADROOM_SAVINGS_EVENTS_PATH_ENV = "HEADROOM_SAVINGS_EVENTS_PATH"
 HEADROOM_TOIN_PATH_ENV = "HEADROOM_TOIN_PATH"
 HEADROOM_SUBSCRIPTION_STATE_PATH_ENV = "HEADROOM_SUBSCRIPTION_STATE_PATH"
+HEADROOM_SETTINGS_PATH_ENV = "HEADROOM_SETTINGS_PATH"
 
 # ---------------------------------------------------------------------------
 # Default sub-path fragments
@@ -60,6 +61,7 @@ _CONFIG_DIR_DEFAULT_SUFFIX = "config"
 
 # Resource file/sub-dir names (kept here so nothing else has to hardcode them)
 _SAVINGS_FILE = "proxy_savings.json"
+_SETTINGS_FILE = "settings.json"
 _TOIN_FILE = "toin.json"
 _MODELS_FILE = "models.json"
 _SUBSCRIPTION_FILE = "subscription_state.json"
@@ -200,6 +202,16 @@ def savings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
         explicit,
         HEADROOM_SAVINGS_PATH_ENV,
         workspace_dir() / _SAVINGS_FILE,
+    )
+
+
+def settings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Return the path for the dashboard-managed settings JSON file."""
+
+    return _resolve(
+        explicit,
+        HEADROOM_SETTINGS_PATH_ENV,
+        workspace_dir() / _SETTINGS_FILE,
     )
 
 
@@ -363,19 +375,38 @@ def models_config_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _validate_plugin_name(plugin_name: str) -> None:
+    """Reject plugin names that would escape the ``plugins/`` sandbox.
+
+    Path separators (``/``, ``\\``) are rejected so a name cannot address a
+    subdirectory. ``.`` and ``..`` are rejected because ``plugins / ".."``
+    resolves to the plugins-parent (i.e. the whole config/workspace root),
+    handing a plugin read/write access to every other plugin's state and the
+    workspace's savings ledger, memory DB, license cache, and logs. NUL is
+    rejected because it terminates paths on POSIX APIs.
+    """
+
+    if (
+        not plugin_name
+        or plugin_name in {".", ".."}
+        or "/" in plugin_name
+        or "\\" in plugin_name
+        or "\x00" in plugin_name
+    ):
+        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+
+
 def plugin_config_dir(plugin_name: str) -> Path:
     """Return the config directory for a named plugin."""
 
-    if not plugin_name or "/" in plugin_name or "\\" in plugin_name:
-        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+    _validate_plugin_name(plugin_name)
     return config_dir() / _PLUGINS_DIR / plugin_name
 
 
 def plugin_workspace_dir(plugin_name: str) -> Path:
     """Return the workspace directory for a named plugin."""
 
-    if not plugin_name or "/" in plugin_name or "\\" in plugin_name:
-        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+    _validate_plugin_name(plugin_name)
     return workspace_dir() / _PLUGINS_DIR / plugin_name
 
 
@@ -386,6 +417,9 @@ __all__ = [
     "HEADROOM_SAVINGS_EVENTS_PATH_ENV",
     "HEADROOM_TOIN_PATH_ENV",
     "HEADROOM_SUBSCRIPTION_STATE_PATH_ENV",
+    "HEADROOM_SETTINGS_PATH_ENV",
+    "set_process_stateless",
+    "process_is_stateless",
     "config_dir",
     "workspace_dir",
     "ensure_config_dir",
@@ -398,6 +432,7 @@ __all__ = [
     "license_cache_path",
     "session_stats_path",
     "savings_events_path",
+    "settings_path",
     "sync_state_path",
     "bridge_state_path",
     "log_dir",

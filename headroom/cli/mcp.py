@@ -22,7 +22,13 @@ from .main import main
 # Default paths
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 MCP_CONFIG_PATH = CLAUDE_CONFIG_DIR / "mcp.json"
+# Servers registered via `claude mcp add` (user scope) live in ~/.claude.json,
+# NOT in ~/.claude/mcp.json. Status must check both to avoid a false negative.
+CLAUDE_JSON_PATH = Path.home() / ".claude.json"
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8788
+DEFAULT_HTTP_PATH = "/mcp"
 
 _RTK_GAIN_SCOPES = {"global", "project"}
 
@@ -61,6 +67,30 @@ def save_mcp_config(config: dict) -> None:
     with open(MCP_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
         f.write("\n")  # Trailing newline
+
+
+def find_headroom_registration() -> tuple[Path, dict[str, Any]] | None:
+    """Locate an existing 'headroom' MCP server registration.
+
+    Claude Code stores servers registered with `claude mcp add` (user scope) in
+    ~/.claude.json under "mcpServers". Headroom's own `mcp install` fallback
+    writes ~/.claude/mcp.json, and a project may define ./.mcp.json. Check all of
+    them so `status` reflects reality instead of only looking at mcp.json.
+
+    Returns (config_path, server_config) for the first match, else None.
+    """
+    for path in (CLAUDE_JSON_PATH, MCP_CONFIG_PATH, Path.cwd() / ".mcp.json"):
+        if not path.exists():
+            continue
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        servers = data.get("mcpServers", {})
+        if isinstance(servers, dict) and "headroom" in servers:
+            return path, servers["headroom"]
+    return None
 
 
 @main.group()
@@ -365,6 +395,32 @@ def mcp_status() -> None:
     help=f"Headroom proxy URL (default: {DEFAULT_PROXY_URL})",
 )
 @click.option(
+    "--transport",
+    type=click.Choice(["stdio", "http"], case_sensitive=False),
+    default="stdio",
+    show_default=True,
+    help="Transport to use for headroom mcp serve",
+)
+@click.option(
+    "--host",
+    default=DEFAULT_HTTP_HOST,
+    show_default=True,
+    help="HTTP bind host",
+)
+@click.option(
+    "--port",
+    default=DEFAULT_HTTP_PORT,
+    show_default=True,
+    type=int,
+    help="HTTP bind port",
+)
+@click.option(
+    "--path",
+    default=DEFAULT_HTTP_PATH,
+    show_default=True,
+    help="HTTP endpoint path",
+)
+@click.option(
     "--direct",
     is_flag=True,
     help="(Deprecated, ignored) Direct CompressionStore access is no longer supported",
@@ -374,16 +430,26 @@ def mcp_status() -> None:
     is_flag=True,
     help="Enable debug logging",
 )
-def mcp_serve(proxy_url: str | None, direct: bool, debug: bool) -> None:
+def mcp_serve(
+    proxy_url: str | None,
+    transport: str,
+    host: str,
+    port: int,
+    path: str,
+    direct: bool,
+    debug: bool,
+) -> None:
     """Start the MCP server (called by Claude Code).
 
     \b
     This command is typically invoked by Claude Code via the MCP config,
-    not run directly. It starts the MCP server with stdio transport.
+    not run directly. It starts the MCP server with stdio by default or
+    Streamable HTTP when requested.
 
     \b
     For manual testing:
         headroom mcp serve --debug
+        headroom mcp serve --transport http --host 127.0.0.1 --port 8788 --path /mcp
     """
     import asyncio
     import logging
@@ -408,6 +474,8 @@ def mcp_serve(proxy_url: str | None, direct: bool, debug: bool) -> None:
             format="%(levelname)s: %(message)s",
         )
 
+    transport = transport.lower()
+
     # Use default if not specified
     effective_proxy_url = proxy_url or DEFAULT_PROXY_URL
 
@@ -421,7 +489,10 @@ def mcp_serve(proxy_url: str | None, direct: bool, debug: bool) -> None:
 
     async def run() -> None:
         try:
-            await server.run_stdio()
+            if transport == "http":
+                await server.run_streamable_http(host=host, port=port, path=path, debug=debug)
+            else:
+                await server.run_stdio()
         finally:
             await server.cleanup()
 

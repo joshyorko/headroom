@@ -551,29 +551,20 @@ def test_json_file_handles_missing_empty_and_non_mapping(monkeypatch, tmp_path: 
     assert init_cli._json_file(array_payload) == {}
 
 
-def test_json_file_handles_jsonc_comments(monkeypatch, tmp_path: Path) -> None:
+def test_json_file_rejects_malformed_json(monkeypatch, tmp_path: Path) -> None:
+    # A user-owned settings file with a hand-edit typo (trailing comma) must
+    # fail with an actionable error rather than crashing init with a raw
+    # JSONDecodeError or silently overwriting the file (which the caller's
+    # subsequent _write_json would do if this returned {}).
     init_cli, _ = _load_init_module(monkeypatch)
-    comment_only = tmp_path / "comment-only.json"
-    jsonc_payload = tmp_path / "payload.json"
-    comment_only.write_text(
-        "// User settings belong in settings.json.\n// This file is managed automatically.\n",
-        encoding="utf-8",
-    )
-    jsonc_payload.write_text(
-        "{\n"
-        "  // keep URLs inside strings intact\n"
-        '  "url": "http://127.0.0.1:8787/v1",\n'
-        "  /* block comment */\n"
-        '  "hooks": {}\n'
-        "}\n",
-        encoding="utf-8",
-    )
+    malformed = tmp_path / "settings.json"
+    malformed.write_text('{"env": {"A": "B",}}\n', encoding="utf-8")
 
-    assert init_cli._json_file(comment_only) == {}
-    assert init_cli._json_file(jsonc_payload) == {
-        "url": "http://127.0.0.1:8787/v1",
-        "hooks": {},
-    }
+    with pytest.raises(click.ClickException, match="invalid JSON"):
+        init_cli._json_file(malformed)
+
+    # The file is left untouched (not overwritten).
+    assert malformed.read_text(encoding="utf-8") == '{"env": {"A": "B",}}\n'
 
 
 def test_ensure_claude_hooks_rewrites_existing_entries(monkeypatch, tmp_path: Path) -> None:
@@ -651,21 +642,40 @@ def test_ensure_copilot_hooks_replaces_existing_marker(monkeypatch, tmp_path: Pa
     assert commands == ["echo keep", "headroom init hook ensure --marker headroom-init-copilot"]
 
 
-def test_ensure_copilot_hooks_accepts_comment_only_config(monkeypatch, tmp_path: Path) -> None:
+def test_ensure_codex_hooks_preserves_user_hooks(monkeypatch, tmp_path: Path) -> None:
+    """init codex must merge into hooks.json, not overwrite it — a user's own
+    hooks (and unrelated top-level keys) must survive."""
     init_cli, _ = _load_init_module(monkeypatch)
-    config_path = tmp_path / "copilot.json"
-    config_path.write_text(
-        "// User settings belong in settings.json.\n// This file is managed automatically.\n",
+    path = tmp_path / "hooks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "notify": True,  # unrelated top-level key
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup",
+                            "hooks": [{"type": "command", "command": "echo keep"}],
+                        }
+                    ]
+                },
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
 
-    init_cli._ensure_copilot_hooks(config_path, "init-user")
+    init_cli._ensure_codex_hooks(path, "init-user")
 
-    payload = json.loads(config_path.read_text(encoding="utf-8"))
-    assert payload["hooks"]["SessionStart"][0]["command"] == (
-        "headroom init hook ensure --marker headroom-init-copilot"
-    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    # The unrelated top-level key survives.
+    assert payload["notify"] is True
+    # The user's own hook is retained and Headroom's is appended exactly once.
+    ss_commands = [
+        item["command"] for entry in payload["hooks"]["SessionStart"] for item in entry["hooks"]
+    ]
+    assert "echo keep" in ss_commands
+    assert sum(1 for c in ss_commands if "headroom-init-codex" in c) == 1
 
 
 def test_replace_marker_block_replaces_existing_block(monkeypatch) -> None:
@@ -769,6 +779,33 @@ def test_ensure_codex_provider_replaces_existing_model_provider(
     parsed = tomllib.loads(path.read_text(encoding="utf-8"))  # raises on a duplicate key
     assert parsed["model_provider"] == "headroom"
     assert parsed["features"]["hooks"] is True
+
+
+def test_ensure_codex_provider_preserves_profile_overrides(monkeypatch, tmp_path: Path) -> None:
+    """Per-profile model_provider/openai_base_url overrides must survive init.
+
+    init owns the ROOT-level keys, but the same keys inside [profiles.*] are the
+    user's per-profile routing; a broad strip silently reroutes those profiles
+    to the injected "headroom" default (config corruption).
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'model_provider = "openai"\n\n'
+        "[profiles.work]\n"
+        'model_provider = "azure"\n'
+        'openai_base_url = "https://azure.example/v1"\n',
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+    # Root is replaced by headroom (no duplicate top-level key).
+    assert parsed["model_provider"] == "headroom"
+    # The user's per-profile overrides are untouched.
+    assert parsed["profiles"]["work"]["model_provider"] == "azure"
+    assert parsed["profiles"]["work"]["openai_base_url"] == "https://azure.example/v1"
 
 
 def test_ensure_codex_provider_emits_requires_openai_auth_for_chatgpt(

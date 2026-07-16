@@ -357,11 +357,16 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # tags each request's (arm, stratum) onto ``transforms_applied``; feed the
     # observed output tokens to the recorder so it can produce an honest
     # reduction estimate. Best-effort: never let bookkeeping break a response.
+    output_tokens_saved_est = 0
     if any(str(t).startswith("output_shaper:") for t in outcome.transforms_applied):
         try:
             from headroom.proxy.output_savings import get_recorder
 
-            get_recorder().record_from_labels(outcome.transforms_applied, outcome.output_tokens)
+            _rec = get_recorder()
+            _rec.record_from_labels(outcome.transforms_applied, outcome.output_tokens)
+            output_tokens_saved_est = _rec.estimate_request_savings(
+                outcome.transforms_applied, outcome.output_tokens
+            )
         except Exception:  # pragma: no cover - defensive
             pass
 
@@ -388,6 +393,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         cache_write_1h_tokens=outcome.cache_write_1h_tokens,
         uncached_input_tokens=outcome.uncached_input_tokens,
         attempted_input_tokens=outcome.attempted_input_tokens,
+        output_tokens_saved=output_tokens_saved_est,
         project=project,
         client=outcome.client,
     )

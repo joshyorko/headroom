@@ -55,6 +55,8 @@ class ToolTarget(str, Enum):
     CODEX = "codex"
     AIDER = "aider"
     CURSOR = "cursor"
+    GROK_BUILD = "grok_build"
+    GROK = "grok"
     OPENCLAW = "openclaw"
     OPENCODE = "opencode"
 
@@ -104,7 +106,7 @@ class DeploymentManifest:
     memory_enabled: bool = False
     memory_db_path: str = ""
     telemetry_enabled: bool = True
-    image: str = "ghcr.io/chopratejas/headroom:latest"
+    image: str = "ghcr.io/headroomlabs-ai/headroom:latest"
     service_name: str = "headroom"
     container_name: str = "headroom-persistent"
     health_url: str = "http://127.0.0.1:8787/readyz"

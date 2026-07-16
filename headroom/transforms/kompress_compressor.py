@@ -27,6 +27,7 @@ from typing import Any, Literal
 
 from ..config import TransformResult
 from ..onnx_runtime import (
+    ONNX_CPU_ARENA_ENV,
     create_cpu_session_options,
     hf_hub_download_local_first,
     trim_process_heap,
@@ -94,7 +95,21 @@ KOMPRESS_ONNX_INTRA_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTRA_THREADS"
 KOMPRESS_ONNX_INTER_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTER_THREADS"
 KOMPRESS_COREML_CACHE_DIR_ENV = "HEADROOM_KOMPRESS_COREML_CACHE_DIR"
 KOMPRESS_MAX_CONCURRENT_ENV = "HEADROOM_KOMPRESS_MAX_CONCURRENT"
+KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV = "HEADROOM_KOMPRESS_EXECUTION_TIMEOUT_MS"
+KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT = 25
 KOMPRESS_BATCH_SIZE_ENV = "HEADROOM_KOMPRESS_BATCH_SIZE"
+KOMPRESS_ACQUIRE_TIMEOUT_ENV = "HEADROOM_KOMPRESS_ACQUIRE_TIMEOUT_SECONDS"
+KOMPRESS_TIME_BUDGET_ENV = "HEADROOM_KOMPRESS_TIME_BUDGET_SECONDS"
+KOMPRESS_CANARY_THRESHOLD_ENV = "HEADROOM_KOMPRESS_CANARY_SECONDS"
+
+# Both defaults sit well under the proxy's 30s compression-stage timeout so a
+# slow model gives up (passthrough) before the request is abandoned. A thread
+# abandoned by asyncio.wait_for cannot be killed; before these bounds existed,
+# one pathologically slow inference would hold the execution semaphore forever
+# and wedge every subsequent compression in the process.
+_DEFAULT_ACQUIRE_TIMEOUT_SECONDS = 5.0
+_DEFAULT_TIME_BUDGET_SECONDS = 20.0
+_DEFAULT_CANARY_THRESHOLD_SECONDS = 5.0
 
 KompressBackend = Literal["auto", "onnx", "onnx_cpu", "onnx_coreml", "pytorch", "pytorch_mps"]
 
@@ -127,6 +142,76 @@ _kompress_cache: dict[str, tuple[Any, Any, str]] = {}
 _kompress_lock = threading.Lock()
 _execution_semaphores: dict[str, threading.BoundedSemaphore] = {}
 _execution_semaphores_lock = threading.Lock()
+_execution_metrics_lock = threading.Lock()
+_execution_skip_counters: dict[str, int] = {
+    "timeout": 0,
+}
+_execution_wait_seconds_total: dict[str, float] = {
+    "timeout": 0.0,
+}
+
+
+def _execution_wait_budget_seconds() -> float:
+    raw = os.environ.get(KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV)
+    if raw is None:
+        return KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT / 1000.0
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using %dms",
+            KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV,
+            raw,
+            KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT,
+        )
+        return KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT / 1000.0
+    if parsed < 0:
+        logger.warning(
+            "Negative %s=%r; disabling timeout and using fail-open.",
+            KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV,
+            raw,
+        )
+        return 0.0
+    return parsed / 1000.0
+
+
+def _acquire_execution_slot(
+    backend: str,
+    device_type: str,
+    *,
+    timeout_seconds: float | None,
+) -> tuple[threading.BoundedSemaphore | None, float]:
+    semaphore = _execution_semaphore(backend, device_type)
+    start = time.perf_counter()
+    if timeout_seconds is None:
+        semaphore.acquire()
+        wait_ms = (time.perf_counter() - start) * 1000.0
+        return semaphore, wait_ms
+
+    acquired = semaphore.acquire(blocking=False)
+    if not acquired and timeout_seconds > 0:
+        acquired = semaphore.acquire(timeout=timeout_seconds)
+    elif not acquired and timeout_seconds == 0:
+        acquired = False
+
+    wait_ms = (time.perf_counter() - start) * 1000.0
+    if not acquired:
+        with _execution_metrics_lock:
+            _execution_skip_counters["timeout"] += 1
+            _execution_wait_seconds_total["timeout"] += wait_ms / 1000.0
+        return None, wait_ms
+
+    return semaphore, wait_ms
+
+
+def get_kompress_execution_stats() -> dict[str, int | float]:
+    """Return execution-acquire observability counters."""
+    with _execution_metrics_lock:
+        return {
+            "execution_acquire_timeout_ms": int(_execution_wait_budget_seconds() * 1000),
+            "execution_timeout_skips_total": _execution_skip_counters["timeout"],
+            "execution_wait_seconds_total": _execution_wait_seconds_total["timeout"],
+        }
 
 
 def _selected_backend() -> KompressBackend:
@@ -170,6 +255,80 @@ def _env_int(name: str) -> int | None:
         logger.warning("%s must be positive, got %r; ignoring", name, raw)
         return None
     return value
+
+
+def _env_float(name: str) -> float | None:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("%s must be a number, got %r; ignoring", name, raw)
+        return None
+
+
+def _acquire_timeout_seconds() -> float | None:
+    """Max seconds to wait for the execution semaphore. <=0 disables the bound."""
+    raw = _env_float(KOMPRESS_ACQUIRE_TIMEOUT_ENV)
+    if raw is None:
+        return _DEFAULT_ACQUIRE_TIMEOUT_SECONDS
+    return raw if raw > 0 else None
+
+
+def _time_budget_seconds() -> float | None:
+    """Wall-clock budget for one compress/compress_batch call. <=0 disables."""
+    raw = _env_float(KOMPRESS_TIME_BUDGET_ENV)
+    if raw is None:
+        return _DEFAULT_TIME_BUDGET_SECONDS
+    return raw if raw > 0 else None
+
+
+def _canary_threshold_seconds() -> float | None:
+    """Startup canary threshold; inference slower than this disables Kompress.
+
+    <=0 disables the canary entirely.
+    """
+    raw = _env_float(KOMPRESS_CANARY_THRESHOLD_ENV)
+    if raw is None:
+        return _DEFAULT_CANARY_THRESHOLD_SECONDS
+    return raw if raw > 0 else None
+
+
+_CANARY_SENTENCE = (
+    "Headroom probes model latency at startup so a degraded runtime is "
+    "detected before live traffic depends on it."
+)
+
+
+def _canary_words(target_words: int = 120) -> list[str]:
+    """Deterministic probe input sized like a small real compression chunk."""
+    words = _CANARY_SENTENCE.split()
+    reps = (target_words // len(words)) + 1
+    return (words * reps)[:target_words]
+
+
+# First give-up is a WARNING with remediation hints; repeats drop to DEBUG so a
+# persistently slow machine doesn't emit one warning per compressible message.
+_giveup_warned = False
+
+
+def _log_giveup(reason: str, *, backend: str, device_type: str, n_words: int) -> None:
+    global _giveup_warned
+    level = logging.DEBUG if _giveup_warned else logging.WARNING
+    _giveup_warned = True
+    logger.log(
+        level,
+        "Kompress giving up (%s) backend=%s device=%s words=%d — content passes "
+        "through uncompressed. If this persists, ML inference on this machine is "
+        "too slow for inline compression; tune %s / %s or disable Kompress.",
+        reason,
+        backend,
+        device_type,
+        n_words,
+        KOMPRESS_TIME_BUDGET_ENV,
+        KOMPRESS_ACQUIRE_TIMEOUT_ENV,
+    )
 
 
 def _onnx_session_options(ort: Any) -> Any:
@@ -216,6 +375,25 @@ def _execution_semaphore(backend: str, device_type: str) -> threading.BoundedSem
             semaphore = threading.BoundedSemaphore(limit)
             _execution_semaphores[key] = semaphore
         return semaphore
+
+
+def _acquire_bounded(
+    semaphore: threading.BoundedSemaphore,
+    acquire_timeout: float | None,
+    remaining_budget: float | None,
+) -> bool:
+    """Acquire ``semaphore``, waiting at most the tighter of the two bounds.
+
+    Returns False on timeout. An unbounded wait here is how one stuck
+    inference (e.g. degraded ONNX on Windows) used to wedge every other
+    compression in the process: abandoned executor threads queued forever
+    on the semaphore. With both bounds disabled (<=0) this degrades to the
+    legacy blocking acquire.
+    """
+    bounds = [b for b in (acquire_timeout, remaining_budget) if b is not None]
+    if not bounds:
+        return semaphore.acquire()
+    return semaphore.acquire(timeout=max(0.0, min(bounds)))
 
 
 def _batch_size() -> int:
@@ -761,6 +939,33 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
         thread.start()
 
 
+def warm_kompress_model(
+    model_id: str = HF_MODEL_ID,
+    device: str = "cpu",
+    *,
+    allow_download: bool = True,
+) -> bool:
+    """Synchronously load the Kompress model, blocking until it is ready.
+
+    Unlike :func:`ensure_background_download` (which loads in a daemon thread and
+    lets early requests pass through uncompressed while the download runs), this
+    blocks the caller so the *next* compression uses the model rather than
+    passing through. Intended for batch/eval contexts that must measure real
+    compression, not passthrough.
+
+    Returns ``True`` if the model is loaded and ready, ``False`` if Kompress is
+    unavailable or the load failed.
+    """
+    if not is_kompress_available():
+        return False
+    try:
+        _load_kompress(model_id, device, allow_download=allow_download)
+        return model_id in _kompress_cache
+    except Exception as exc:  # pragma: no cover - network/model load failure
+        logger.warning("Kompress: synchronous warm failed for %s: %s", model_id, exc)
+        return False
+
+
 # ── Compressor ────────────────────────────────────────────────────────
 
 
@@ -811,6 +1016,47 @@ class KompressResult:
         return (self.tokens_saved / self.original_tokens) * 100
 
 
+def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) -> str | None:
+    """Store an original->compressed mapping in the proxy-local CCR store and
+    return its retrieval hash (or None on any failure).
+
+    Module-level so both the in-process compressor and the remote client
+    (:mod:`headroom.transforms.kompress_remote`) share one CCR policy. Model-free
+    — touches only the compression store + telemetry, never the ONNX model — so
+    it works in a sandboxed proxy installed without the ``[ml]`` extra.
+    """
+    try:
+        from ..cache.compression_store import get_compression_store
+
+        signature = _kompress_content_signature(original)
+        compressed_tokens = len(compressed.split())
+        store = get_compression_store()
+        cache_key = store.store(
+            original,
+            compressed,
+            original_tokens=original_tokens,
+            compressed_tokens=compressed_tokens,
+            original_item_count=original_tokens,
+            compressed_item_count=compressed_tokens,
+            tool_signature_hash=signature.structure_hash,
+            compression_strategy="kompress",
+        )
+        with contextlib.suppress(Exception):
+            from ..telemetry import get_toin
+
+            get_toin().record_compression(
+                tool_signature=signature,
+                original_count=original_tokens,
+                compressed_count=compressed_tokens,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                strategy="kompress",
+            )
+        return cache_key
+    except Exception:
+        return None
+
+
 class KompressCompressor(Transform):
     """Kompress: ModernBERT token compressor.
 
@@ -822,6 +1068,10 @@ class KompressCompressor(Transform):
 
     def __init__(self, config: KompressConfig | None = None):
         self.config = config or KompressConfig()
+        # Set by the preload canary when inference is too slow to be useful;
+        # compress()/compress_batch() then pass content through untouched.
+        self._degraded_reason: str | None = None
+        self._canary_thread: threading.Thread | None = None
 
     def preload(self, *, allow_download: bool = True) -> str:
         """Load the backing model/tokenizer and return the selected backend.
@@ -831,12 +1081,86 @@ class KompressCompressor(Transform):
         raised so the caller can defer the download to first use. Startup eager
         preload uses this so a cold cache cannot block the proxy from binding
         its port.
+
+        On a successful load this also kicks off a timed canary inference on a
+        background thread: a machine where one small forward pass takes
+        multiple seconds (seen with degraded ONNX runtimes on Windows) can
+        never finish real compression inside the proxy's stage timeout, so
+        Kompress fail-safes to passthrough once the probe verdict lands. The
+        probe must NOT run inline — preload blocks proxy startup (the HTTP
+        server binds after it), and on slow hardware the probe itself takes
+        tens of seconds. Until the verdict, the per-call acquire/budget bounds
+        keep any slow inference from wedging requests.
         """
 
-        _model, _tokenizer, backend = _load_kompress(
+        model, tokenizer, backend = _load_kompress(
             self.config.model_id, self.config.device, allow_download=allow_download
         )
+
+        threshold = _canary_threshold_seconds()
+        if threshold is not None:
+            self._canary_thread = threading.Thread(
+                target=self._run_canary,
+                args=(model, tokenizer, backend, threshold),
+                name="kompress-canary",
+                daemon=True,
+            )
+            self._canary_thread.start()
         return backend
+
+    def _run_canary(self, model: Any, tokenizer: Any, backend: str, threshold: float) -> None:
+        try:
+            elapsed = self._timed_canary(model, tokenizer, backend)
+            if elapsed > threshold:
+                # One retry: the first Run pays one-off kernel/allocator
+                # warmup that shouldn't condemn a healthy machine.
+                elapsed = self._timed_canary(model, tokenizer, backend)
+        except Exception as e:
+            # The canary must never poison the compressor — compress() has
+            # its own error handling for whatever is wrong with the model.
+            logger.debug("Kompress canary probe skipped: %s", e)
+            return
+
+        if elapsed > threshold:
+            self._degraded_reason = (
+                f"canary inference took {elapsed:.1f}s (threshold {threshold:.1f}s)"
+            )
+            logger.warning(
+                "Kompress canary inference took %.1fs (threshold %.1fs, %d-word probe) — "
+                "ML compression DISABLED for this run; content passes through "
+                "uncompressed instead of timing out every request. On Windows ensure "
+                "the ONNX CPU arena is enabled (%s=1); tune or disable this check "
+                "via %s.",
+                elapsed,
+                threshold,
+                len(_canary_words()),
+                ONNX_CPU_ARENA_ENV,
+                KOMPRESS_CANARY_THRESHOLD_ENV,
+            )
+        else:
+            logger.debug("Kompress canary inference: %.0fms", elapsed * 1000)
+
+    def _timed_canary(self, model: Any, tokenizer: Any, backend: str) -> float:
+        """Run one small inference and return its wall-clock seconds."""
+        words = _canary_words()
+        is_onnx = backend == "onnx"
+        encoding = tokenizer(
+            words,
+            is_split_into_words=True,
+            truncation=True,
+            max_length=512,
+            padding=True,
+            return_tensors="np" if is_onnx else "pt",
+        )
+        input_ids = encoding["input_ids"]
+        attention_mask = encoding["attention_mask"]
+        if not is_onnx:
+            device = next(model.parameters()).device
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+        started = time.perf_counter()
+        model.get_keep_mask(input_ids, attention_mask)
+        return time.perf_counter() - started
 
     def is_ready(self) -> bool:
         """True if the model is loaded so :meth:`compress` won't touch the network.
@@ -862,6 +1186,7 @@ class KompressCompressor(Transform):
         target_ratio: float | None = None,
         *,
         allow_download: bool = True,
+        ccr_original: str | None = None,
     ) -> KompressResult:
         """Compress content using Kompress model.
 
@@ -878,6 +1203,10 @@ class KompressCompressor(Transform):
                 The proxy sets this False so a cold model never blocks the request
                 thread (see ``ensure_background_download``); direct callers keep
                 the historic auto-download-on-first-use behavior.
+            ccr_original: Text to store in CCR instead of ``content``. Used when
+                ``content`` is a tag-protected placeholder intermediate
+                ({{HEADROOM_TAG_N}}); passing the pre-protection original keeps a
+                later full retrieval lossless. Defaults to ``content``.
 
         Returns:
             KompressResult with compressed text.
@@ -885,7 +1214,7 @@ class KompressCompressor(Transform):
         words = content.split()
         n_words = len(words)
 
-        if n_words < 10:
+        if n_words < 10 or self._degraded_reason is not None:
             return self._passthrough(content, n_words)
 
         # Cooperative wall-clock budget (#1171): kompress ONNX inference is
@@ -921,6 +1250,7 @@ class KompressCompressor(Transform):
                     question=question,
                     target_ratio=[target_ratio],
                     batch_size=_batch_size(),
+                    ccr_originals=[ccr_original],
                 )
                 if batch_result:
                     return batch_result[0]
@@ -931,7 +1261,23 @@ class KompressCompressor(Transform):
             chunk_count = 0
             t_deadline = time.perf_counter()
 
+            acquire_timeout = _acquire_timeout_seconds()
+            budget = _time_budget_seconds()
+            deadline = time.monotonic() + budget if budget is not None else None
+
             for chunk_start in range(0, n_words, max_chunk_words):
+                remaining: float | None = None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        _log_giveup(
+                            "time budget exhausted",
+                            backend=backend,
+                            device_type=device_type,
+                            n_words=n_words,
+                        )
+                        return self._passthrough(content, n_words)
+
                 if deadline_s and (time.perf_counter() - t_deadline) > deadline_s:
                     # Keep everything from here on verbatim and stop: a partial
                     # compression that returns NOW beats a full one that leaks a
@@ -969,7 +1315,34 @@ class KompressCompressor(Transform):
                     input_ids = input_ids.to(device)
                     attention_mask = attention_mask.to(device)
 
-                with _execution_semaphore(backend, device_type):
+                acquire_bounds = [
+                    bound
+                    for bound in (
+                        _execution_wait_budget_seconds(),
+                        acquire_timeout,
+                        remaining,
+                    )
+                    if bound is not None
+                ]
+                execution_timeout = max(0.0, min(acquire_bounds)) if acquire_bounds else None
+                semaphore, _wait_ms = _acquire_execution_slot(
+                    backend,
+                    device_type,
+                    timeout_seconds=execution_timeout,
+                )
+                if semaphore is None:
+                    logger.warning(
+                        "Kompress execution saturated after %.2fms; skipping chunk=%d "
+                        "for backend=%s device=%s after deadline path",
+                        _wait_ms,
+                        chunk_start,
+                        backend,
+                        device_type,
+                    )
+                    return self._passthrough(content, n_words)
+
+                with contextlib.ExitStack() as stack:
+                    stack.callback(semaphore.release)
                     inference_started = time.perf_counter()
                     if target_ratio is not None:
                         scores = model.get_scores(input_ids, attention_mask)
@@ -1041,7 +1414,9 @@ class KompressCompressor(Transform):
 
             # CCR marker
             if self.config.enable_ccr and ratio < 0.8:
-                cache_key = self._store_in_ccr(content, compressed, n_words)
+                ccr_source = ccr_original if ccr_original is not None else content
+                ccr_source_tokens = len(ccr_source.split())
+                cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
                 if cache_key:
                     result.cache_key = cache_key
                     result.compressed += (
@@ -1082,6 +1457,8 @@ class KompressCompressor(Transform):
         question: str | None = None,
         target_ratio: float | list[float | None] | None = None,
         batch_size: int = 32,
+        *,
+        ccr_originals: list[str | None] | None = None,
     ) -> list[KompressResult]:
         """Compress multiple texts. Uses batched inference on GPU, sequential on CPU.
 
@@ -1154,6 +1531,21 @@ class KompressCompressor(Transform):
         else:
             ratios = [target_ratio] * n
 
+        # Normalize ccr_originals to a per-text list (CCR stores these instead of
+        # the possibly tag-protected ``contents`` entries; see ``compress``).
+        if ccr_originals is not None:
+            if len(ccr_originals) != n:
+                raise ValueError(
+                    f"ccr_originals list length {len(ccr_originals)} does not match "
+                    f"contents length {n}"
+                )
+            ccr_sources: list[str | None] = list(ccr_originals)
+        else:
+            ccr_sources = [None] * n
+
+        if getattr(self, "_degraded_reason", None) is not None:
+            return [self._passthrough(c, len(c.split())) for c in contents]
+
         # Fast path: on backends where batch-dim parallelism does NOT help
         # (ONNX CPU, PyTorch CPU), fall back to sequential `compress()`
         # internally. This keeps the public API consistent while avoiding the
@@ -1167,8 +1559,9 @@ class KompressCompressor(Transform):
                     content_type=content_type,
                     question=question,
                     target_ratio=r,
+                    ccr_original=ccr_source,
                 )
-                for content, r in zip(contents, ratios, strict=True)
+                for content, r, ccr_source in zip(contents, ratios, ccr_sources, strict=True)
             ]
 
         results: list[KompressResult | None] = [None] * n
@@ -1204,7 +1597,35 @@ class KompressCompressor(Transform):
         kept_ids_per_text: dict[int, set[int]] = {i: set() for i in range(n) if results[i] is None}
         inference_ms = 0.0
 
+        acquire_timeout = _acquire_timeout_seconds()
+        budget = _time_budget_seconds()
+        deadline = time.monotonic() + budget if budget is not None else None
+
+        def _bail_remaining(reason: str, batch_start: int) -> None:
+            # A text with ANY unprocessed chunk must pass through whole —
+            # compressing from partial chunk coverage would silently drop the
+            # words of the chunks that never ran.
+            _log_giveup(
+                reason,
+                backend=backend,
+                device_type=device_type,
+                n_words=sum(len(c[2]) for c in chunk_queue[batch_start:]),
+            )
+            for text_idx, _, _, _ in chunk_queue[batch_start:]:
+                if results[text_idx] is None:
+                    results[text_idx] = self._passthrough(
+                        contents[text_idx], len(word_lists[text_idx])
+                    )
+                    kept_ids_per_text.pop(text_idx, None)
+
         for batch_start in range(0, len(chunk_queue), batch_size):
+            remaining: float | None = None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _bail_remaining("time budget exhausted", batch_start)
+                    break
+
             batch = chunk_queue[batch_start : batch_start + batch_size]
             batch_word_lists = [c[2] for c in batch]
 
@@ -1228,7 +1649,32 @@ class KompressCompressor(Transform):
                     attention_mask = attention_mask.to(device)
 
                 # Single forward pass for all chunks in this batch.
-                with _execution_semaphore(backend, device_type):
+                acquire_bounds = [
+                    bound
+                    for bound in (
+                        _execution_wait_budget_seconds(),
+                        acquire_timeout,
+                        remaining,
+                    )
+                    if bound is not None
+                ]
+                execution_timeout = max(0.0, min(acquire_bounds)) if acquire_bounds else None
+                semaphore, wait_ms = _acquire_execution_slot(
+                    backend,
+                    device_type,
+                    timeout_seconds=execution_timeout,
+                )
+                if semaphore is None:
+                    logger.warning(
+                        "Kompress execution saturated at batch start after %.2fms; "
+                        "passing through remaining batch inputs",
+                        wait_ms,
+                    )
+                    _bail_remaining("model busy (semaphore acquire timed out)", batch_start)
+                    break
+
+                with contextlib.ExitStack() as stack:
+                    stack.callback(semaphore.release)
                     inference_started = time.perf_counter()
                     scores = model.get_scores(input_ids, attention_mask)
                     inference_ms += (time.perf_counter() - inference_started) * 1000
@@ -1305,7 +1751,11 @@ class KompressCompressor(Transform):
             )
 
             if self.config.enable_ccr and comp_ratio < 0.8:
-                cache_key = self._store_in_ccr(content, compressed, n_words)
+                ccr_source = ccr_sources[text_idx]
+                if ccr_source is None:
+                    ccr_source = content
+                ccr_source_tokens = len(ccr_source.split())
+                cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
                 if cache_key:
                     result.cache_key = cache_key
                     result.compressed += (
@@ -1433,33 +1883,4 @@ class KompressCompressor(Transform):
         )
 
     def _store_in_ccr(self, original: str, compressed: str, original_tokens: int) -> str | None:
-        try:
-            from ..cache.compression_store import get_compression_store
-
-            signature = _kompress_content_signature(original)
-            compressed_tokens = len(compressed.split())
-            store = get_compression_store()
-            cache_key = store.store(
-                original,
-                compressed,
-                original_tokens=original_tokens,
-                compressed_tokens=compressed_tokens,
-                original_item_count=original_tokens,
-                compressed_item_count=compressed_tokens,
-                tool_signature_hash=signature.structure_hash,
-                compression_strategy="kompress",
-            )
-            with contextlib.suppress(Exception):
-                from ..telemetry import get_toin
-
-                get_toin().record_compression(
-                    tool_signature=signature,
-                    original_count=original_tokens,
-                    compressed_count=compressed_tokens,
-                    original_tokens=original_tokens,
-                    compressed_tokens=compressed_tokens,
-                    strategy="kompress",
-                )
-            return cache_key
-        except Exception:
-            return None
+        return store_kompress_in_ccr(original, compressed, original_tokens)

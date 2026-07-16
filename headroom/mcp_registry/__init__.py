@@ -17,6 +17,7 @@ from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
 from .codex import CodexRegistrar
 from .display import any_succeeded, format_result, format_results
+from .grok import GrokRegistrar
 from .install import (
     DEFAULT_PROXY_URL,
     build_headroom_spec,
@@ -26,11 +27,13 @@ from .install import (
     install_everywhere,
 )
 from .opencode import OpencodeRegistrar
+from .server_json import build_server_json, render_server_json
 
 __all__ = [
     "DEFAULT_PROXY_URL",
     "ClaudeRegistrar",
     "CodexRegistrar",
+    "GrokRegistrar",
     "MCPRegistrar",
     "OpencodeRegistrar",
     "RegisterResult",
@@ -39,9 +42,11 @@ __all__ = [
     "any_succeeded",
     "build_headroom_spec",
     "build_serena_spec",
+    "build_server_json",
     "build_tokensave_spec",
     "format_result",
     "format_results",
     "get_all_registrars",
     "install_everywhere",
+    "render_server_json",
 ]

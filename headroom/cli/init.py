@@ -209,11 +209,16 @@ def _json_file(path: Path) -> dict[str, Any]:
         return {}
     try:
         payload = json.loads(content)
-    except json.JSONDecodeError:
-        content = _strip_json_comments(content).strip()
-        if not content:
-            return {}
-        payload = json.loads(content)
+    except json.JSONDecodeError as e:
+        # This is a user-owned file (e.g. ~/.claude/settings.json or Codex's
+        # hooks.json) that the callers read-merge-write. Returning {} would make
+        # the following _write_json overwrite it, silently discarding the user's
+        # settings; letting the raw JSONDecodeError propagate crashes `headroom
+        # init` with a traceback. Abort with an actionable message so the user
+        # can fix the JSON (or move it aside) without losing it.
+        raise click.ClickException(
+            f"{path} contains invalid JSON ({e}); fix it and re-run, or move it aside."
+        ) from e
     return payload if isinstance(payload, dict) else {}
 
 
@@ -502,12 +507,19 @@ def _ensure_codex_provider(path: Path, provider_url: str | int) -> None:
         f'env_http_headers = {{ "{_PROJECT_HEADER_NAME}" = "HEADROOM_PROJECT" }}\n'
         f"{_CODEX_PROVIDER_MARKER_END}"
     )
-    content = _strip_all_codex_headroom_provider_tables(content)
-    # init owns model_provider/openai_base_url: drop any prior assignment (any
-    # value, including one an older version mis-scoped under a table) so we
-    # replace it instead of emitting a duplicate top-level key (#260).
-    content = re.sub(r"(?m)^[ \t]*model_provider[ \t]*=.*\r?\n", "", content)
-    content = re.sub(r"(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n", "", content)
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    # init owns the ROOT-level model_provider/openai_base_url: drop any prior
+    # root assignment so we replace it instead of emitting a duplicate top-level
+    # key (#260). Scope the strip to the document root (everything before the
+    # first table header) -- these keys also appear legitimately inside
+    # [profiles.*] tables as per-profile overrides, and stripping them there
+    # silently reroutes the user's profiles to the injected "headroom" default.
+    _first_table = re.search(r"(?m)^[ \t]*\[", content)
+    _split = _first_table.start() if _first_table else len(content)
+    root, rest = content[:_split], content[_split:]
+    root = re.sub(r"(?m)^[ \t]*model_provider[ \t]*=.*\r?\n", "", root)
+    root = re.sub(r"(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n", "", root)
+    content = root + rest
     # The provider block carries top-level keys (model_provider, openai_base_url),
     # so it must land at the document root rather than after a trailing table (#260).
     content = _replace_marker_block(
@@ -654,49 +666,66 @@ def _ensure_codex_hooks(path: Path, profile: str, proxy_url: str) -> None:
         if _proxy_url_uses_local_runtime(proxy_url)
         else None
     )
-    rtk_report_command = _codex_rtk_report_command(proxy_url)
     session_hooks = [
         {
             "type": "command",
-            "command": rtk_report_command,
+            "command": _codex_rtk_report_command(proxy_url),
             "timeout": 15,
         }
     ]
     if ensure_command:
         session_hooks.insert(0, {"type": "command", "command": ensure_command, "timeout": 15})
-    payload = {
-        "hooks": {
-            "SessionStart": [
-                {
-                    "matcher": "startup|resume",
-                    "hooks": session_hooks,
-                }
-            ],
-        }
+    desired_hooks: dict[str, tuple[str, list[dict[str, Any]]] | None] = {
+        "SessionStart": ("startup|resume", session_hooks),
+        "PreToolUse": (
+            "Bash",
+            [{"type": "command", "command": ensure_command, "timeout": 15}],
+        )
+        if ensure_command
+        else None,
     }
-    if ensure_command:
-        payload["hooks"]["PreToolUse"] = [
-            {
-                "matcher": "Bash",
-                "hooks": [{"type": "command", "command": ensure_command, "timeout": 15}],
-            }
-        ]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    rendered = json.dumps(payload, indent=2) + "\n"
-    if path.exists() and path.read_text(encoding="utf-8") == rendered:
-        return
-    path.write_text(rendered, encoding="utf-8")
+    # Read-merge-write rather than overwrite: the previous version wrote a fresh
+    # payload wholesale, destroying any user-managed hooks (and other top-level
+    # keys) in codex hooks.json. Merge per event and dedup on the Headroom
+    # marker, matching _ensure_claude_hooks / _ensure_copilot_hooks.
+    payload = _json_file(path)
+    hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
+    for event, desired in desired_hooks.items():
+        entries = list(hooks.get(event) or []) if isinstance(hooks.get(event), list) else []
+        retained: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                retained.append(entry)
+                continue
+            hook_items = entry.get("hooks")
+            if not isinstance(hook_items, list):
+                retained.append(entry)
+                continue
+            has_headroom = any(
+                isinstance(item, dict)
+                and item.get("command")
+                and (
+                    _CODEX_HOOK_MARKER in str(item.get("command"))
+                    or _CODEX_RTK_REPORT_MARKER in str(item.get("command"))
+                )
+                for item in hook_items
+            )
+            if not has_headroom:
+                retained.append(entry)
+        if desired is not None:
+            matcher, hook_items = desired
+            retained.append({"matcher": matcher, "hooks": hook_items})
+        if retained:
+            hooks[event] = retained
+        else:
+            hooks.pop(event, None)
+    payload["hooks"] = hooks
+    _write_json(path, payload)
     _prune_codex_hook_trust(path)
 
 
 def _prune_codex_hook_trust(hooks_path: Path) -> None:
-    """Drop stale Codex trust hashes for a hooks file we just rewrote.
-
-    Codex keys hook trust by hooks.json path and event/index. If Headroom changes
-    the command text from a checkout-local path to the portable ``headroom``
-    executable, the old trusted hashes no longer describe the hook file. Remove
-    only entries for this hooks path so Codex can re-approve the current hooks.
-    """
+    """Drop stale Codex trust hashes for a hooks file we just rewrote."""
 
     config_path = codex_config_path()
     if not config_path.exists():
@@ -760,7 +789,7 @@ def _ensure_runtime_manifest(
         proxy_mode="token",
         memory_enabled=memory,
         telemetry_enabled=True,
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
     )
     manifest.supervisor_kind = SupervisorKind.NONE.value
     manifest.artifacts = []
@@ -796,7 +825,7 @@ def _env_manifest(values: dict[str, str]) -> Any:
         proxy_mode="token",
         memory_enabled=False,
         telemetry_enabled=True,
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
     )
 
 

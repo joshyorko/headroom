@@ -31,6 +31,7 @@ class FakeBackend:
         self.saved: list[dict[str, object]] = []
         self.updated: list[dict[str, object]] = []
         self.deleted: list[str] = []
+        self.accessed: list[list[str]] = []
         self.raise_on: str | None = None
 
     async def search_memories(self, **kwargs):  # noqa: ANN003
@@ -55,6 +56,12 @@ class FakeBackend:
             raise RuntimeError("delete failed")
         self.deleted.append(memory_id)
         return True
+
+    async def record_access(self, memory_ids: list[str]) -> int:
+        if self.raise_on == "record_access":
+            raise RuntimeError("access tracking failed")
+        self.accessed.append(memory_ids)
+        return len(memory_ids)
 
 
 def make_result(
@@ -968,12 +975,21 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
     # tripping through memory_search.
     assert "1. [m1] Alice likes pizza" in context
     assert "(Related: Alice, pizza)" in context
+    assert backend.accessed == [["m1"]]
 
     backend.raise_on = "search"
     assert (
         await handler.search_and_format_context("u1", [{"role": "user", "content": "Question"}])
         is None
     )
+    backend.raise_on = None
+
+    backend.raise_on = "record_access"
+    context = await handler.search_and_format_context(
+        "u1",
+        [{"role": "user", "content": "What food does Alice like?"}],
+    )
+    assert "1. [m1] Alice likes pizza" in context
     backend.raise_on = None
 
     async def fake_ensure_initialized() -> None:
@@ -1061,6 +1077,38 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
         "openai",
     )
     assert skipped == []
+
+
+@pytest.mark.asyncio
+async def test_search_records_only_memories_left_by_final_text_budget(
+    handler: MemoryHandler,
+) -> None:
+    backend = FakeBackend()
+    handler._backend = backend
+    handler._initialized = True
+    backend.search_results = [
+        make_result("m1", "First preference"),
+        make_result("m2", "Second preference"),
+    ]
+
+    class FirstEntryBudget:
+        max_entries = 2
+        min_similarity = 0.3
+        max_tokens = 1024
+
+        @staticmethod
+        def apply_to_text(text: str) -> str:
+            return text.split("2. [m2]", maxsplit=1)[0]
+
+    context = await handler.search_and_format_context(
+        "u1",
+        [{"role": "user", "content": "What are my preferences?"}],
+        budget=FirstEntryBudget(),
+    )
+
+    assert "[m1]" in context
+    assert "[m2]" not in context
+    assert backend.accessed == [["m1"]]
 
 
 @pytest.mark.asyncio

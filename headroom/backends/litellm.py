@@ -24,6 +24,28 @@ from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
 
+_OPENAI_STANDARD_PARAMS = (
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "stop",
+    "tools",
+    "tool_choice",
+    "response_format",
+    "seed",
+    "n",
+)
+
+_OPENAI_CONSUMED_BODY_KEYS = frozenset(
+    {
+        "model",
+        "messages",
+        "stream",
+        "stream_options",
+        *_OPENAI_STANDARD_PARAMS,
+    }
+)
+
 # litellm calls `dotenv.load_dotenv()` during its own import, which loads
 # the project `.env` into `os.environ`. We don't want that side effect —
 # importing a backend module should not silently leak API keys into the
@@ -137,7 +159,20 @@ def _build_bedrock_fallback_map(region: str) -> dict[str, str]:
     return {name: f"bedrock/{prefix}.{model_id}" for name, model_id in _CLAUDE_MODELS}
 
 
-def _fetch_bedrock_inference_profiles(region: str | None) -> dict[str, str]:
+def _build_openai_extra_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Return unconsumed top-level OpenAI request fields for vendor passthrough."""
+    return {
+        key: value
+        for key, value in body.items()
+        if key not in _OPENAI_CONSUMED_BODY_KEYS
+        and not key.startswith("x-headroom-")
+        and not key.startswith("x_headroom_")
+    }
+
+
+def _fetch_bedrock_inference_profiles(
+    region: str | None, profile_name: str | None = None
+) -> dict[str, str]:
     """Fetch available Bedrock inference profiles from AWS API.
 
     Uses boto3 list_inference_profiles() to get all available profiles
@@ -634,13 +669,20 @@ class LiteLLMBackend(Backend):
                             tr_content = "\n".join(
                                 b.get("text", "") for b in tr_content if b.get("type") == "text"
                             )
-                        converted.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tr["tool_use_id"],
-                                "content": str(tr_content),
-                            }
-                        )
+                        tool_msg: dict[str, Any] = {
+                            "role": "tool",
+                            "tool_call_id": tr["tool_use_id"],
+                            "content": str(tr_content),
+                        }
+                        # Claude Code's moving cache breakpoint usually lands on the
+                        # tail tool_result, not just the system prompt. Carry
+                        # cache_control through so LiteLLM's Bedrock Converse
+                        # transformation can inject a cachePoint here too (#1390
+                        # covers the system-prompt/text-block case; this is the
+                        # tool_result case, out of scope there).
+                        if "cache_control" in tr:
+                            tool_msg["cache_control"] = tr["cache_control"]
+                        converted.append(tool_msg)
                     continue
 
                 # tool_use blocks → OpenAI assistant message with tool_calls
@@ -671,6 +713,39 @@ class LiteLLMBackend(Backend):
                     converted.append({"role": role, "content": ""})
 
         return converted
+
+    def _system_field_to_message(self, system: Any) -> dict[str, Any]:
+        """Convert Anthropic's top-level `system` field to an OpenAI-style message.
+
+        `system` can be a plain string or a list of content blocks, each of
+        which may carry its own `cache_control` breakpoint (Claude Code puts
+        the prompt-caching marker on the last system block). Flattening the
+        list to a joined string, as this code used to do, drops that
+        `cache_control` entirely: litellm's Bedrock Converse transformation
+        only emits a `cachePoint` when it sees content blocks with
+        `cache_control` on them, never for a plain string. That silently
+        broke prompt caching of the system prefix. #1390 covers the analogous
+        case for tool_result blocks in `_convert_messages_for_litellm` above;
+        this handles the top-level `system` field, which was out of scope
+        there. Preserve block structure and cache_control so the breakpoint
+        survives into the litellm call.
+        """
+        if isinstance(system, str):
+            return {"role": "system", "content": system}
+        if isinstance(system, list):
+            blocks: list[dict[str, Any]] = []
+            for s in system:
+                if isinstance(s, dict):
+                    block: dict[str, Any] = {"type": "text", "text": s.get("text", "")}
+                    if "cache_control" in s:
+                        block["cache_control"] = s["cache_control"]
+                else:
+                    block = {"type": "text", "text": str(s)}
+                blocks.append(block)
+            return {"role": "system", "content": blocks}
+        # Shouldn't happen in practice (None is filtered out via "system" in
+        # body), but stay defensive rather than raising.
+        return {"role": "system", "content": str(system)}
 
     def _to_anthropic_response(
         self,
@@ -755,21 +830,20 @@ class LiteLLMBackend(Backend):
 
             # Tools (convert Anthropic format to OpenAI format)
             if "tools" in body:
-                kwargs["tools"] = [_convert_anthropic_tool(t) for t in body["tools"]]
+                tools_in = body["tools"]
+                # Bedrock Converse API hard-rejects tool names over 64 chars.
+                # Claude Code injects every globally-added claude.ai MCP connector
+                # tool into every request, even disabled ones; a single oversized
+                # name 401s the whole call. Drop them before conversion instead.
+                if self.provider == "bedrock":
+                    tools_in = [t for t in tools_in if len(t.get("name", "")) <= 64]
+                kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
             if "tool_choice" in body:
                 kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
 
             # System prompt (Anthropic puts it in body, OpenAI in messages)
             if "system" in body:
-                system = body["system"]
-                if isinstance(system, str):
-                    kwargs["messages"].insert(0, {"role": "system", "content": system})
-                elif isinstance(system, list):
-                    # Anthropic list format
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
-                    )
-                    kwargs["messages"].insert(0, {"role": "system", "content": system_text})
+                kwargs["messages"].insert(0, self._system_field_to_message(body["system"]))
 
             # Provider-specific region config
             if self.region:
@@ -864,18 +938,16 @@ class LiteLLMBackend(Backend):
             if "stop_sequences" in body:
                 kwargs["stop"] = body["stop_sequences"]
             if "tools" in body:
-                kwargs["tools"] = [_convert_anthropic_tool(t) for t in body["tools"]]
+                tools_in = body["tools"]
+                # Bedrock Converse API hard-rejects tool names over 64 chars.
+                # See send_message for the full rationale; same filter here.
+                if self.provider == "bedrock":
+                    tools_in = [t for t in tools_in if len(t.get("name", "")) <= 64]
+                kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
             if "tool_choice" in body:
                 kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
             if "system" in body:
-                system = body["system"]
-                if isinstance(system, str):
-                    kwargs["messages"].insert(0, {"role": "system", "content": system})
-                elif isinstance(system, list):
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
-                    )
-                    kwargs["messages"].insert(0, {"role": "system", "content": system_text})
+                kwargs["messages"].insert(0, self._system_field_to_message(body["system"]))
 
             # Provider-specific region config
             if self.region:
@@ -917,6 +989,13 @@ class LiteLLMBackend(Backend):
                 },
             )
 
+            # Request usage in the final streaming chunk so cache metrics
+            # (cache_read_input_tokens / cache_creation_input_tokens) come back at
+            # all. Without this, LiteLLM/Bedrock never emits a usage chunk over SSE
+            # and the caller's cache stats always read 0, even when caching is
+            # working server-side.
+            kwargs["stream_options"] = {"include_usage": True}
+
             # Stream content — blocks emitted dynamically based on response
             response = await acompletion(**kwargs)
             output_tokens = 0
@@ -924,8 +1003,25 @@ class LiteLLMBackend(Backend):
             active_block_type: str | None = None  # "text" or "tool_use"
             tool_block_map: dict[int, int] = {}  # litellm tc.index → SSE block index
             stop_reason = "end_turn"
+            # Populated from the final usage chunk (stream_options.include_usage=True
+            # above). The message_start emitted before this loop always carries
+            # input_tokens=0 and no cache fields because LiteLLM/Bedrock only reports
+            # usage on the trailing chunk. Carry the final cache stats on the terminal
+            # message_delta instead of emitting a second protocol-invalid
+            # message_start after content has already streamed.
+            final_input_tokens = 0
+            final_cache_read_tokens = 0
+            final_cache_write_tokens = 0
 
             async for chunk in response:
+                if hasattr(chunk, "usage") and chunk.usage:
+                    cu = chunk.usage
+                    final_input_tokens = int(getattr(cu, "prompt_tokens", 0) or 0)
+                    final_cache_read_tokens = int(getattr(cu, "cache_read_input_tokens", 0) or 0)
+                    final_cache_write_tokens = int(
+                        getattr(cu, "cache_creation_input_tokens", 0) or 0
+                    )
+
                 if not hasattr(chunk, "choices") or not chunk.choices:
                     continue
 
@@ -1031,13 +1127,21 @@ class LiteLLMBackend(Backend):
                     data={"type": "content_block_stop", "index": current_block_index},
                 )
 
+            delta_usage: dict[str, Any] = {"output_tokens": output_tokens}
+            if final_input_tokens or final_cache_read_tokens or final_cache_write_tokens:
+                delta_usage["input_tokens"] = final_input_tokens
+                if final_cache_read_tokens:
+                    delta_usage["cache_read_input_tokens"] = final_cache_read_tokens
+                if final_cache_write_tokens:
+                    delta_usage["cache_creation_input_tokens"] = final_cache_write_tokens
+
             # Emit message_delta with correct stop reason
             yield StreamEvent(
                 event_type="message_delta",
                 data={
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": {"output_tokens": output_tokens},
+                    "usage": delta_usage,
                 },
             )
 
@@ -1089,19 +1193,13 @@ class LiteLLMBackend(Backend):
             }
 
             # Pass through OpenAI parameters
-            for param in [
-                "max_tokens",
-                "temperature",
-                "top_p",
-                "stop",
-                "tools",
-                "tool_choice",
-                "response_format",
-                "seed",
-                "n",
-            ]:
+            for param in _OPENAI_STANDARD_PARAMS:
                 if param in body:
                     kwargs[param] = body[param]
+
+            extra_body = _build_openai_extra_body(body)
+            if extra_body:
+                kwargs["extra_body"] = extra_body
 
             # Provider-specific region config
             if self.region:
@@ -1261,22 +1359,16 @@ class LiteLLMBackend(Backend):
                 "stream": True,
             }
 
-            for param in [
-                "max_tokens",
-                "temperature",
-                "top_p",
-                "stop",
-                "tools",
-                "tool_choice",
-                "response_format",
-                "seed",
-                "n",
-            ]:
+            for param in _OPENAI_STANDARD_PARAMS:
                 if param in body:
                     kwargs[param] = body[param]
 
             if "stream_options" in body:
                 kwargs["stream_options"] = body["stream_options"]
+
+            extra_body = _build_openai_extra_body(body)
+            if extra_body:
+                kwargs["extra_body"] = extra_body
 
             # Provider-specific region config
             if self.region:

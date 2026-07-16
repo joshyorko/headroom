@@ -30,7 +30,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from headroom.pipeline import PipelineStage
-from headroom.proxy import runtime_env
 from headroom.proxy.body_forwarding import (
     BodyMutationTracker,
     OutboundBody,
@@ -51,12 +50,10 @@ pytest.importorskip("fastapi")
 
 
 @pytest.fixture(autouse=True)
-def _isolate_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for knob in runtime_env.RUNTIME_ENV_KNOBS:
-        monkeypatch.delenv(knob.env, raising=False)
-    runtime_env.clear_overrides()
-    yield
-    runtime_env.clear_overrides()
+def _disable_output_shaper(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Isolate this suite from the opt-in HEADROOM_OUTPUT_SHAPER a developer shell
+    # may export, which otherwise perturbs the byte-faithful assertions.
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
 
 
 # ---------------------------------------------------------------------------

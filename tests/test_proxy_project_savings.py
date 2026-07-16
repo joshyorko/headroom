@@ -423,6 +423,43 @@ def test_stats_merges_multiple_reported_rtk_projects_with_persistent_savings(tmp
         assert per_project["codex-desktop-linux"]["rtk_tokens_saved"] == 222
 
 
+def test_context_tool_project_report_is_idempotent_and_durable(tmp_path, monkeypatch):
+    savings_path = tmp_path / "savings.json"
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
+    config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
+    payload = {
+        "tool": "rtk",
+        "scope": "project",
+        "cwd": "/work/headroom",
+        "summary": {
+            "total_commands": 12,
+            "total_input": 1000,
+            "total_output": 250,
+            "total_saved": 750,
+        },
+    }
+
+    with TestClient(
+        create_app(config),
+        base_url="http://127.0.0.1",
+        client=("127.0.0.1", 12345),
+    ) as client:
+        assert client.post("/stats/context-tool", json=payload).status_code == 200
+        assert client.post("/stats/context-tool", json=payload).status_code == 200
+
+        project = client.get("/stats-lifetime").json()["projects"]["headroom"]
+        assert project["requests"] == 12
+        assert project["tokens_saved"] == 750
+        assert project["rtk_commands"] == 12
+        assert project["rtk_tokens_saved"] == 750
+
+    reloaded = SavingsTracker(path=str(savings_path)).lifetime_response()["projects"][
+        "headroom"
+    ]
+    assert reloaded["requests"] == 12
+    assert reloaded["tokens_saved"] == 750
+
+
 # ---------------------------------------------------------------------------
 # Regression: pre-feature behavior must be unchanged
 # ---------------------------------------------------------------------------

@@ -4134,6 +4134,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        if stats_payload.get("scope") == "project" and stats_payload.get("project"):
+            proxy.metrics.savings_tracker.upsert_context_tool_project_snapshot(
+                str(stats_payload["project"]),
+                commands=int(stats_payload.get("total_commands", 0) or 0),
+                tokens_saved=int(stats_payload.get("tokens_saved", 0) or 0),
+                input_tokens=int(stats_payload.get("input_tokens", 0) or 0),
+                timestamp=datetime.fromtimestamp(
+                    float(stats_payload.get("reported_at", 0) or 0), tz=timezone.utc
+                ),
+            )
+
         async with _stats_snapshot_lock:
             _stats_snapshot["value"] = None
             _stats_snapshot["expires_at"] = 0.0

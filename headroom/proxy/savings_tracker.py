@@ -435,6 +435,9 @@ def _empty_project_entry() -> dict[str, Any]:
         "compression_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        "rtk_commands": 0,
+        "rtk_tokens_saved": 0,
+        "rtk_input_tokens": 0,
         "last_activity_at": None,
     }
 
@@ -457,6 +460,9 @@ def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
         normalized["total_input_cost_usd"] = round(
             _coerce_float(entry.get("total_input_cost_usd")), 6
         )
+        normalized["rtk_commands"] = _coerce_int(entry.get("rtk_commands"))
+        normalized["rtk_tokens_saved"] = _coerce_int(entry.get("rtk_tokens_saved"))
+        normalized["rtk_input_tokens"] = _coerce_int(entry.get("rtk_input_tokens"))
         last_activity = _parse_timestamp(entry.get("last_activity_at"))
         normalized["last_activity_at"] = _to_utc_iso(last_activity) if last_activity else None
         projects[cleaned_name] = normalized
@@ -941,6 +947,52 @@ class SavingsTracker:
             )
             del projects[evict]
 
+    def upsert_context_tool_project_snapshot(
+        self,
+        project: str | None,
+        *,
+        commands: int,
+        tokens_saved: int,
+        input_tokens: int,
+        timestamp: datetime | str | None = None,
+    ) -> bool:
+        """Persist cumulative RTK project counters without double-counting reports."""
+        name = sanitize_project_name(project)
+        if name is None:
+            return False
+        timestamp_dt = (
+            _parse_timestamp(timestamp)
+            if isinstance(timestamp, str)
+            else timestamp.astimezone(timezone.utc)
+            if isinstance(timestamp, datetime)
+            else _utc_now()
+        ) or _utc_now()
+
+        with self._lock:
+            projects: dict[str, dict[str, Any]] = self._state.setdefault("projects", {})
+            entry = projects.setdefault(name, _empty_project_entry())
+            before = (
+                entry.get("rtk_commands", 0),
+                entry.get("rtk_tokens_saved", 0),
+                entry.get("rtk_input_tokens", 0),
+            )
+            entry["rtk_commands"] = max(_coerce_int(entry.get("rtk_commands")), commands)
+            entry["rtk_tokens_saved"] = max(
+                _coerce_int(entry.get("rtk_tokens_saved")), tokens_saved
+            )
+            entry["rtk_input_tokens"] = max(
+                _coerce_int(entry.get("rtk_input_tokens")), input_tokens
+            )
+            changed = before != (
+                entry["rtk_commands"],
+                entry["rtk_tokens_saved"],
+                entry["rtk_input_tokens"],
+            )
+            if changed:
+                entry["last_activity_at"] = _to_utc_iso(timestamp_dt)
+                self._save_locked()
+            return changed
+
     def _record_by_model_locked(
         self,
         model: str,
@@ -980,9 +1032,18 @@ class SavingsTracker:
         result: dict[str, dict[str, Any]] = {}
         for name, entry in ranked:
             view = dict(entry)
-            total_before = entry["tokens_saved"] + entry["total_input_tokens"]
+            proxy_tokens_saved = entry["tokens_saved"]
+            rtk_tokens_saved = _coerce_int(entry.get("rtk_tokens_saved"))
+            view["proxy_requests"] = entry["requests"]
+            view["proxy_tokens_saved"] = proxy_tokens_saved
+            view["requests"] = max(entry["requests"], _coerce_int(entry.get("rtk_commands")))
+            view["tokens_saved"] = proxy_tokens_saved + rtk_tokens_saved
+            total_before = max(
+                proxy_tokens_saved + entry["total_input_tokens"],
+                _coerce_int(entry.get("rtk_input_tokens")),
+            )
             view["savings_percent"] = round(
-                (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
+                (view["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
                 2,
             )
             result[name] = view

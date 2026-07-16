@@ -60,6 +60,20 @@ def network_client(workspace):
     return TestClient(_make_app())
 
 
+@pytest.fixture
+def trusted_dashboard_client(workspace, monkeypatch):
+    """LAN dashboard client explicitly authorized by the operator."""
+    monkeypatch.setenv(
+        "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS",
+        "100.90.0.5/32",
+    )
+    return TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+
+
 class TestSchemaAndRead:
     def test_schema_returns_grouped_fields(self, client):
         resp = client.get("/settings/schema")
@@ -144,6 +158,49 @@ class TestLoopbackGating:
 
     def test_settings_page_rejected_off_loopback(self, network_client):
         assert network_client.get("/dashboard/settings").status_code == 404
+
+    @pytest.mark.parametrize(
+        "path",
+        ("/dashboard/settings", "/settings/schema", "/settings"),
+    )
+    def test_trusted_dashboard_client_can_read_settings(self, trusted_dashboard_client, path):
+        resp = trusted_dashboard_client.get(path)
+        assert resp.status_code == 200, resp.text
+
+    def test_trusted_dashboard_same_origin_write_allowed(self, trusted_dashboard_client, workspace):
+        resp = trusted_dashboard_client.post(
+            "/settings",
+            json={"values": {"target_ratio": 0.4}},
+            headers={"Origin": "http://100.82.0.2:8787"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert settings_store.load() == {"target_ratio": 0.4}
+
+    def test_trusted_dashboard_foreign_origin_write_rejected(
+        self, trusted_dashboard_client, workspace
+    ):
+        resp = trusted_dashboard_client.post(
+            "/settings",
+            json={"values": {"target_ratio": 0.4}},
+            headers={"Origin": "https://evil.example"},
+        )
+        assert resp.status_code == 403, resp.text
+        assert settings_store.load() == {}
+
+    def test_trusted_dashboard_same_origin_apply_allowed(
+        self, trusted_dashboard_client, monkeypatch
+    ):
+        from headroom.install import runtime as rt
+
+        monkeypatch.setattr(
+            rt, "restart_current_deployment", lambda: {"restarted": False, "mode": "foreground"}
+        )
+        resp = trusted_dashboard_client.post(
+            "/settings/apply",
+            json={},
+            headers={"Origin": "http://100.82.0.2:8787"},
+        )
+        assert resp.status_code == 200, resp.text
 
 
 class TestSameOriginGuard:

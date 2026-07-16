@@ -75,6 +75,7 @@ proxy:
   app_port: <%= headroom_port %>
   ssl: false
   forward_headers: true
+  response_timeout: <%= headroom_request_timeout %>
   healthcheck:
     path: /readyz
     interval: 3

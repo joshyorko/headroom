@@ -1924,7 +1924,7 @@ requires-dist = [
     { name = "anthropic", marker = "extra == 'dev'", specifier = ">=0.18.0" },
     { name = "anthropic", marker = "extra == 'evals'", specifier = ">=0.18.0" },
     { name = "any-llm-sdk", marker = "python_full_version >= '3.11' and extra == 'anyllm'", specifier = ">=1.0.0" },
-    { name = "ast-grep-cli", specifier = ">=0.30.0" },
+    { name = "ast-grep-cli", specifier = ">=0.30.0,!=0.44.1" },
     { name = "autogen-agentchat", marker = "extra == 'autogen'", specifier = ">=0.7" },
     { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.41.0" },
     { name = "botocore", extras = ["crt"], marker = "extra == 'bedrock'", specifier = ">=1.41.0" },

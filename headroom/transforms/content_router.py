@@ -44,6 +44,7 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -203,40 +204,210 @@ _BUILTIN_COMPRESSOR_DESCRIPTORS: tuple[CompressorDescriptor, ...] = (
 )
 
 
-class _BuiltinCompressorEntry:
-    """Registry adapter exposing a built-in's metadata under the Compressor protocol.
+# ── Built-in Compressor adapters (registry delegation, additive) ──────────────
+# Each built-in registry entry delegates ``compress`` to the SAME underlying
+# built-in method the content router invokes in ``_apply_strategy_to_content`` —
+# reached through the router's own ``_get_*`` getter so config flows through
+# identically. The adapters are ADDITIVE: the router still dispatches built-ins
+# via its existing if/elif and never routes a request through the registry, so
+# they change no routing. Each invoker takes the owning router plus the pure-data
+# :class:`CompressInput` and returns the compressed string, or ``None`` when the
+# built-in is unavailable / not applicable to this str input (→ passthrough).
+_BuiltinInvoke = Callable[["ContentRouter", CompressInput], "str | None"]
 
-    The router dispatches built-ins through its own if/elif — never through the
-    registry — so ``compress`` is a guard that must not run. This type exists only
-    so the built-ins are name-addressable in the shared :class:`CompressorRegistry`
-    inventory next to discovered third-party compressors.
+
+def _adapter_bias(inp: CompressInput) -> float:
+    """Compression bias for a built-in call — the router's dispatch default (1.0).
+
+    Callers may override via ``budget['bias']`` (the router passes ``bias`` on the
+    request path); anything non-numeric falls back to the 1.0 default.
+    """
+    try:
+        return float(inp.budget.get("bias", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _invoke_smart_crusher(router: ContentRouter, inp: CompressInput) -> str | None:
+    crusher = router._get_smart_crusher()
+    if crusher is None:
+        return None
+    # ``_get_*`` getters are typed ``Any``; pin the result to the contract type.
+    compressed: str = crusher.crush(
+        inp.content, query=inp.query, bias=_adapter_bias(inp)
+    ).compressed
+    return compressed
+
+
+def _invoke_code_aware(router: ContentRouter, inp: CompressInput) -> str | None:
+    compressor = router._get_code_compressor()
+    if compressor is None:
+        return None
+    language = inp.config.get("language")
+    result = compressor.compress(inp.content, language=language, context=inp.query)
+    compressed: str = result.compressed
+    return compressed
+
+
+def _invoke_search(router: ContentRouter, inp: CompressInput) -> str | None:
+    compressor = router._get_search_compressor()
+    if compressor is None:
+        return None
+    result = compressor.compress(inp.content, context=inp.query, bias=_adapter_bias(inp))
+    compressed: str = result.compressed
+    return compressed
+
+
+def _invoke_log(router: ContentRouter, inp: CompressInput) -> str | None:
+    compressor = router._get_log_compressor()
+    if compressor is None:
+        return None
+    compressed: str = compressor.compress(inp.content, bias=_adapter_bias(inp)).compressed
+    return compressed
+
+
+def _invoke_tabular(router: ContentRouter, inp: CompressInput) -> str | None:
+    compressor = router._get_tabular_compressor()
+    if compressor is None:
+        return None
+    result = compressor.compress(inp.content, context=inp.query, bias=_adapter_bias(inp))
+    compressed: str = result.compressed
+    return compressed
+
+
+def _invoke_config(router: ContentRouter, inp: CompressInput) -> str | None:
+    compressor = router._get_config_compressor()
+    if compressor is None:
+        return None
+    result = compressor.compress(inp.content, context=inp.query, bias=_adapter_bias(inp))
+    compressed: str = result.compressed
+    return compressed
+
+
+def _invoke_html(router: ContentRouter, inp: CompressInput) -> str | None:
+    extractor = router._get_html_extractor()
+    if extractor is None:
+        return None
+    # ``.extracted`` may be None/empty when nothing extracts; the caller maps
+    # that to passthrough, matching the router's HTML branch.
+    extracted: str | None = extractor.extract(inp.content).extracted
+    return extracted
+
+
+def _invoke_kompress(router: ContentRouter, inp: CompressInput) -> str | None:
+    # The router dispatches KOMPRESS through ``_try_ml_compressor`` (size gate,
+    # tag protection, background load, marker policy), so the adapter delegates
+    # to the SAME method to stay byte-identical to the router's kompress path.
+    compressed, _tokens = router._try_ml_compressor(inp.content, inp.query, None)
+    return compressed
+
+
+def _invoke_image(router: ContentRouter, inp: CompressInput) -> str | None:
+    # The image built-in (``ImageCompressor``) compresses image blocks inside
+    # message dicts via ``ImageCompressor.compress(messages)`` /
+    # ``optimize_images_in_messages`` — it is NOT dispatched through
+    # ``_apply_strategy_to_content`` and never operates on str content. The
+    # str-based CompressInput/CompressOutput contract has no faithful image
+    # delegation (str content is never image data), so this is a documented
+    # passthrough rather than a fabricated compression.
+    return None
+
+
+def _invoke_passthrough(router: ContentRouter, inp: CompressInput) -> str | None:
+    # Defensive default for a descriptor without a registered invoker.
+    return None
+
+
+#: Built-in descriptor name → the invoker that runs it via the router's getter.
+_BUILTIN_COMPRESSOR_INVOKERS: dict[str, _BuiltinInvoke] = {
+    "smart_crusher": _invoke_smart_crusher,
+    "kompress": _invoke_kompress,
+    "code_aware": _invoke_code_aware,
+    "search": _invoke_search,
+    "log": _invoke_log,
+    "tabular": _invoke_tabular,
+    "config": _invoke_config,
+    "html": _invoke_html,
+    "image": _invoke_image,
+}
+
+
+class _BuiltinCompressorEntry:
+    """Registry adapter running a built-in via the router's existing dispatch path.
+
+    ``compress`` delegates to the SAME underlying built-in method the content
+    router invokes in ``_apply_strategy_to_content`` (obtained through the
+    router's ``_get_*`` getter so config flows through), then maps the built-in's
+    native result onto the pure-data :class:`CompressOutput` contract.
+
+    ADDITIVE by construction: the router still dispatches built-ins through its
+    own if/elif and never routes a request through the registry, so these entries
+    change no routing. ``_resolve_active_external_compressors`` filters them out
+    of the opt-in external-dispatch path *by type*, so the class name is load-
+    bearing. Constructed lazily/cheaply — it stores only the descriptor, the
+    owning router, and the invoke callable; no built-in is instantiated until
+    ``compress`` runs.
+
+    ``recoverable`` is always ``{}``: the built-ins embed CCR retrieval markers
+    in the compressed content and mirror ``hash -> original`` into the CCR store
+    as a side effect of their own ``compress`` call (which this adapter invokes),
+    rather than returning a recovery map on their result object.
     """
 
-    def __init__(self, descriptor: CompressorDescriptor) -> None:
+    def __init__(
+        self,
+        descriptor: CompressorDescriptor,
+        router: ContentRouter | None = None,
+        invoke: _BuiltinInvoke | None = None,
+    ) -> None:
         self._descriptor = descriptor
+        self._router = router
+        self._invoke = (
+            invoke
+            if invoke is not None
+            else _BUILTIN_COMPRESSOR_INVOKERS.get(descriptor.name, _invoke_passthrough)
+        )
 
     @property
     def descriptor(self) -> CompressorDescriptor:
         return self._descriptor
 
-    def compress(self, inp: CompressInput) -> CompressOutput:  # pragma: no cover - guard
-        raise NotImplementedError(
-            f"built-in compressor {self._descriptor.name!r} is dispatched by the "
-            "content router's built-in path, not through the registry"
+    def compress(self, inp: CompressInput) -> CompressOutput:
+        tokens_before = _estimate_tokens(inp.content)
+        compressed: str | None = None
+        if self._router is not None:
+            compressed = self._invoke(self._router, inp)
+        if compressed is None:
+            # Built-in unavailable, no bound router, or not applicable to this
+            # str input → passthrough (never blank out or expand a block).
+            compressed = inp.content
+        return CompressOutput(
+            content=compressed,
+            tokens_before=tokens_before,
+            tokens_after=_estimate_tokens(compressed),
+            lossless=self._descriptor.lossless,
+            markers=[],
+            recoverable={},
+            warnings=[],
         )
 
 
-def _build_compressor_registry() -> CompressorRegistry:
-    """Build the router's compressor registry: built-in inventory + discovery.
+def _build_compressor_registry(router: ContentRouter | None = None) -> CompressorRegistry:
+    """Build the router's compressor registry: built-in adapters + discovery.
 
-    Registers a metadata-only entry for each built-in, then runs opt-in
-    discovery of ``headroom.compressor`` entry points. Discovery never invokes
-    ``compress`` and is fail-open (a broken third-party package is logged and
-    skipped), so constructing this registry cannot change request handling.
+    Registers a delegating adapter for each built-in (bound to ``router`` so
+    ``compress`` runs the built-in through the router's own getter), then runs
+    opt-in discovery of ``headroom.compressor`` entry points. Discovery never
+    invokes ``compress`` and is fail-open (a broken third-party package is logged
+    and skipped). Building the registry has no side effects: adapters instantiate
+    nothing until ``compress`` is called, and the router still dispatches built-
+    ins via its own if/elif, so constructing this registry cannot change request
+    handling. When ``router`` is ``None`` the adapters have nothing to delegate to
+    and ``compress`` is an inert passthrough.
     """
     registry = CompressorRegistry()
     for descriptor in _BUILTIN_COMPRESSOR_DESCRIPTORS:
-        registry.register(_BuiltinCompressorEntry(descriptor))
+        registry.register(_BuiltinCompressorEntry(descriptor, router))
     # External compressors register under distinct names; a name collision with
     # a built-in is skipped fail-open (replace=False) so a third-party package
     # can never shadow a built-in's inventory entry.
@@ -1541,7 +1712,7 @@ class ContentRouter(Transform):
         # follow-up. Failure to build it must never break the router, so it is
         # fail-open to an empty registry.
         try:
-            self.compressor_registry: CompressorRegistry = _build_compressor_registry()
+            self.compressor_registry: CompressorRegistry = _build_compressor_registry(self)
         except Exception as exc:  # noqa: BLE001 - inventory is non-critical
             logger.debug("compressor registry unavailable: %s", exc)
             self.compressor_registry = CompressorRegistry()

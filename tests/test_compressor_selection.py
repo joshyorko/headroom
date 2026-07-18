@@ -229,12 +229,28 @@ def test_registry_inventory_does_not_enable_selection() -> None:
     assert registry.active(None) == []
 
 
-def test_builtin_entry_compress_is_a_guard() -> None:
+def test_builtin_entry_compress_delegates_via_router() -> None:
+    # The built-in entries now expose a WORKING (non-raising) compress that
+    # delegates to the router's own dispatch path. kompress with ML disabled is a
+    # passthrough (no model load), proving the entry runs without raising.
+    router = ContentRouter(ContentRouterConfig(enable_kompress=False))
+    entry = router.compressor_registry.get("kompress")
+    assert entry is not None
+    out = entry.compress(CompressInput(content="hello world", content_type="text/plain"))
+    assert isinstance(out, CompressOutput)
+    assert out.content == "hello world"  # ML disabled → passthrough, never raises
+
+
+def test_builtin_entry_without_router_is_inert_passthrough() -> None:
+    # A registry built with no bound router (module-level inventory use) has
+    # nothing to delegate to, so compress is an inert passthrough — still working
+    # (non-raising), never a fabricated result.
     registry = _build_compressor_registry()
     entry = registry.get("kompress")
     assert entry is not None
-    with pytest.raises(NotImplementedError):
-        entry.compress(CompressInput(content="x", content_type="text/plain"))
+    out = entry.compress(CompressInput(content="x", content_type="text/plain"))
+    assert isinstance(out, CompressOutput)
+    assert out.content == "x"
 
 
 def test_discovery_merges_external_compressor(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -23,15 +23,30 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 
-if ! command -v dagger >/dev/null 2>&1; then
-  echo "dagger CLI is required to rebuild Headroom in the repo-local Dagger module." >&2
-  exit 127
-fi
+ensure_brew_tool() {
+  local command_name="$1"
+  local formula="$2"
 
-if ! command -v uv >/dev/null 2>&1; then
-  echo "uv is required on the host to install the Dagger-built Headroom wheel." >&2
-  exit 127
-fi
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return
+  fi
+
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "Homebrew is required to install missing tool $command_name; install Homebrew and rerun this script." >&2
+    exit 127
+  fi
+
+  echo "$command_name is missing; installing Homebrew formula $formula..." >&2
+  brew install "$formula"
+
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    echo "Homebrew installed $formula, but $command_name is still unavailable on PATH." >&2
+    exit 127
+  fi
+}
+
+ensure_brew_tool dagger dagger
+ensure_brew_tool uv uv
 
 rm -rf dist/headroom-dev
 dagger call dev-install-script export --path dist/headroom-dev

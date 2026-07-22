@@ -497,6 +497,55 @@ class TestInjectAndRestoreRoundTrip:
         assert status == "restored"
         assert config_file.read_text(encoding="utf-8") == malformed
 
+    def test_unwrap_removes_rtk_block_from_global_agents(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """`wrap codex` injects the rtk block into the Codex global AGENTS.md;
+        `unwrap codex` must take it back out (regression for #1421)."""
+        _set_test_home(monkeypatch, tmp_path)
+        monkeypatch.setenv("HEADROOM_RTK", "1")
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        agents = codex_home / "AGENTS.md"
+        wrap_mod._inject_rtk_instructions(agents)
+        assert wrap_mod._RTK_MARKER in agents.read_text(encoding="utf-8")
+
+        wrap_mod.unwrap_codex.callback(port=8787, no_stop_proxy=True)
+
+        remaining = agents.read_text(encoding="utf-8") if agents.exists() else ""
+        assert wrap_mod._RTK_MARKER not in remaining
+
+    def test_unwrap_preserves_user_content_in_global_agents(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Only the marker-fenced rtk block is removed; the user's own AGENTS.md
+        prose survives the unwrap."""
+        _set_test_home(monkeypatch, tmp_path)
+        monkeypatch.setenv("HEADROOM_RTK", "1")
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        agents = codex_home / "AGENTS.md"
+        agents.write_text("# My project rules\n\nAlways write tests.\n", encoding="utf-8")
+        wrap_mod._inject_rtk_instructions(agents)
+        assert wrap_mod._RTK_MARKER in agents.read_text(encoding="utf-8")
+
+        wrap_mod.unwrap_codex.callback(port=8787, no_stop_proxy=True)
+
+        remaining = agents.read_text(encoding="utf-8")
+        assert wrap_mod._RTK_MARKER not in remaining
+        assert "# My project rules" in remaining
+        assert "Always write tests." in remaining
+
+    def test_unwrap_is_safe_when_no_global_agents(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """No Codex AGENTS.md → unwrap is a clean no-op, not a crash."""
+        _set_test_home(monkeypatch, tmp_path)
+
+        wrap_mod.unwrap_codex.callback(port=8787, no_stop_proxy=True)
+
+        assert not (tmp_path / ".codex" / "AGENTS.md").exists()
+
 
 # ---------------------------------------------------------------------------
 # Thread retag: wrap pulls native threads into the headroom menu, unwrap hands
@@ -1180,9 +1229,37 @@ def test_codex_session_launch_settings_preserve_custom_provider_identity(
     )
 
     assert "model_provider=headroom" not in " ".join(args)
-    assert '"model_providers"."company"."base_url"="http://127.0.0.1:9898/v1"' in args
+    # Bare dotted keys — Codex (0.144.x) silently ignores quoted segments (#2358).
+    assert 'model_providers.company.base_url="http://127.0.0.1:9898/v1"' in args
+    assert "model_providers.company.supports_websockets=true" in args
+    assert (
+        "model_providers.company.env_http_headers.X-Headroom-Base-Url"
+        '="HEADROOM_CODEX_UPSTREAM_BASE_URL"'
+    ) in args
     assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "https://api.example.test/v1"
     assert config_file.read_text(encoding="utf-8") == original_config
+
+
+def test_codex_dotted_key_emits_bare_segments_when_safe() -> None:
+    """#2358: quoted segments are silently ignored by Codex's --config parser."""
+    assert (
+        wrap_mod._codex_dotted_key("model_providers", "litellm_prod", "base_url")
+        == "model_providers.litellm_prod.base_url"
+    )
+    # Hyphens are valid in bare keys (header names under env_http_headers).
+    assert (
+        wrap_mod._codex_dotted_key("env_http_headers", "X-Headroom-Base-Url")
+        == "env_http_headers.X-Headroom-Base-Url"
+    )
+
+
+def test_codex_dotted_key_quotes_only_unsafe_segments() -> None:
+    # A provider name that would corrupt the dotted path if emitted bare keeps
+    # its quotes; every safe neighbor stays bare.
+    assert (
+        wrap_mod._codex_dotted_key("model_providers", "my.provider", "base_url")
+        == 'model_providers."my.provider".base_url'
+    )
 
 
 def test_wrap_codex_rejects_custom_provider_without_upstream_base_url(
@@ -1285,6 +1362,7 @@ def test_wrap_codex_injects_rtk_globally_without_changing_project_agents(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HEADROOM_RTK", "1")
     project_dir = tmp_path / "project"
     project_dir.mkdir()
     project_agents = project_dir / "AGENTS.md"
@@ -1318,6 +1396,7 @@ def test_wrap_codex_launch_injects_rtk_globally_without_changing_project_agents(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HEADROOM_RTK", "1")
     project_dir = tmp_path / "project"
     project_dir.mkdir()
     project_agents = project_dir / "AGENTS.md"
@@ -1697,6 +1776,7 @@ def test_init_and_wrap_prepare_only_are_idempotent_full_setup(
             "--proxy-url",
             "http://10.10.10.89",
             "codex",
+            "--code-graph",
         ],
         "wrap": [
             "wrap",
@@ -1704,6 +1784,8 @@ def test_init_and_wrap_prepare_only_are_idempotent_full_setup(
             "--prepare-only",
             "--proxy-url",
             "http://10.10.10.89",
+            "--code-memory",
+            "tokensave",
         ],
     }
 
@@ -2122,6 +2204,7 @@ class TestCodexLaunchExportsCustomUpstream:
             no_serena=True,
             code_graph=False,
             no_proxy=True,
+            proxy_url=None,
             learn=False,
             memory=False,
             backend=None,

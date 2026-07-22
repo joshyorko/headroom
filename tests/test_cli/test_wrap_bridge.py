@@ -167,6 +167,7 @@ def test_wrap_codex_prepare_only_accepts_no_context_tool_alias(monkeypatch, tmp_
 
 def test_wrap_aider_prepare_only_injects_conventions(monkeypatch, tmp_path: Path) -> None:
     _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HEADROOM_RTK", "1")  # RTK is opt-in; exercise the RTK-on path
     runner = CliRunner()
 
     with runner.isolated_filesystem(temp_dir=str(tmp_path)):
@@ -183,6 +184,7 @@ def test_wrap_cursor_prepare_only_registers_native_hook(monkeypatch, tmp_path: P
     # GH #756: when rtk's own `--agent cursor` hook registers successfully,
     # headroom must not also inject RTK_INSTRUCTIONS_BLOCK into .cursorrules.
     _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HEADROOM_RTK", "1")  # RTK is opt-in; exercise the RTK-on path
     runner = CliRunner()
 
     # headroom trusts the on-disk hook, not rtk's exit code, so simulate rtk
@@ -209,6 +211,7 @@ def test_wrap_cursor_prepare_only_falls_back_to_cursorrules_when_hook_fails(
     monkeypatch, tmp_path: Path
 ) -> None:
     _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HEADROOM_RTK", "1")  # RTK is opt-in; exercise the RTK-on path
     runner = CliRunner()
 
     with runner.isolated_filesystem(temp_dir=str(tmp_path)):

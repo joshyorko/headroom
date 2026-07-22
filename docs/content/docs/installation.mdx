@@ -61,7 +61,7 @@ args = ["mcp", "serve"]
 ```
 
 Native Intel macOS installs are currently tracked in
-[chopratejas/headroom#525](https://github.com/chopratejas/headroom/issues/525).
+[headroomlabs-ai/headroom#525](https://github.com/headroomlabs-ai/headroom/issues/525).
 Use [Docker-Native Install](/docs/docker-install) on Intel Macs until native
 wheel support lands.
 
@@ -139,7 +139,7 @@ To install the prerequisites:
 
 If you'd rather avoid the native toolchain entirely, run Headroom
 through Docker — see the [Docker](#docker) section below. Native
-Windows wheels are tracked in [#636](https://github.com/chopratejas/headroom/issues/636).
+Windows wheels are tracked in [#636](https://github.com/headroomlabs-ai/headroom/issues/636).
 
 ### pipx
 
@@ -217,8 +217,8 @@ node -e "const h = require('headroom-ai'); console.log('headroom-ai loaded')"
 Pre-built images are published to GitHub Container Registry on every release.
 
 ```bash
-docker pull ghcr.io/chopratejas/headroom:latest
-docker run -p 8787:8787 ghcr.io/chopratejas/headroom:latest
+docker pull ghcr.io/headroomlabs-ai/headroom:latest
+docker run -p 8787:8787 ghcr.io/headroomlabs-ai/headroom:latest
 ```
 
 <Callout type="info" title="Running Headroom without installing Python or Node?">
@@ -267,6 +267,12 @@ These variables configure Headroom at runtime. Set them in your shell, `.env` fi
 | `ANTHROPIC_API_KEY` | Anthropic API key (used when proxying to Anthropic) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | AWS credentials for Bedrock backend |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Google Cloud credentials for Vertex AI backend |
+| `VERTEXAI_PROJECT` | GCP project id for the Vertex AI backend (LiteLLM-specific — distinct from `GOOGLE_CLOUD_PROJECT`; set it explicitly to avoid silently billing your ADC default quota project) |
+| `VERTEXAI_LOCATION` | GCP region for the Vertex AI backend (LiteLLM-specific — distinct from `GOOGLE_CLOUD_LOCATION`) |
+
+The Vertex AI backend also requires `google-cloud-aiplatform>=1.38`, which is not
+included in any extra or Docker image — see
+[Google Vertex AI](/docs/proxy#google-vertex-ai) for setup details.
 
 ### Proxy configuration
 
@@ -274,8 +280,8 @@ These variables configure Headroom at runtime. Set them in your shell, `.env` fi
 |---|---|---|
 | `HEADROOM_PORT` | `8787` | Port the proxy listens on |
 | `HEADROOM_HOST` | `127.0.0.1` | Host the proxy binds to |
-| `HEADROOM_MODE` | `token` | Default optimization mode: `token` or `cache` |
-| `HEADROOM_TELEMETRY` | `off` (opt-in) | Set to `on` to opt in to anonymous telemetry |
+| `HEADROOM_MODE` | `cache` | Default optimization mode: `token` or `cache` |
+| `HEADROOM_TELEMETRY` | `off` | Set to `on` for local-only usage stats (nothing is sent externally) |
 | `HEADROOM_REQUEST_TIMEOUT` | `300` | Request timeout in seconds |
 
 ### TypeScript SDK

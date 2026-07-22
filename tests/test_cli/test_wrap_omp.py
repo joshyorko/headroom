@@ -241,6 +241,7 @@ def test_wrap_omp_rtk_injects_into_cwd_agents_md(
     runner: CliRunner, omp_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HEADROOM_CONTEXT_TOOL", "rtk")
+    monkeypatch.setenv("HEADROOM_RTK", "1")
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="omp"),
         patch("headroom.cli.wrap._launch_tool"),
@@ -260,8 +261,9 @@ def test_wrap_omp_rtk_injects_into_cwd_agents_md(
 
 
 def test_unwrap_omp_restored_and_cleans_agents_md(
-    runner: CliRunner, omp_home: Path, tmp_path: Path
+    runner: CliRunner, omp_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("HEADROOM_RTK", "1")
     original = "providers:\n  anthropic:\n    apiKey: sk-user-secret\n"
     omp_home.write_bytes(original.encode("utf-8"))
     inject_models_override(8787, "proj")

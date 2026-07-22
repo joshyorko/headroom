@@ -311,6 +311,12 @@ class TestParseToolCall:
         assert hash_key == "def456abc123def456abc123"
         assert query is None
 
+    def test_parse_null_function_returns_none_without_crashing(self):
+        """A tool call with an explicit {"function": null} / {"functionCall": null}
+        must return None, not raise AttributeError."""
+        assert parse_tool_call({"id": "c1", "function": None}, "openai") is None
+        assert parse_tool_call({"functionCall": None}, "google") is None
+
     def test_parse_normalises_uppercase_hash_to_lowercase(self):
         """An uppercase hash echoed by the model must be lowercased so it
         matches the store (which keys entries by a lowercase hash)."""

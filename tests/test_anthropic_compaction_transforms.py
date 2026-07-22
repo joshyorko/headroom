@@ -114,13 +114,18 @@ class TestAnthropicToolDescCompactionTransforms:
     ``anthropic:tool_desc_compaction`` must appear in ``transforms_applied``."""
 
     def test_l2_appends_transform_label(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import headroom.proxy.tool_schema_compaction as _mod
         from headroom.proxy.tool_schema_compaction import (
             compact_tool_descriptions,
             tool_desc_max_chars,
         )
 
-        # Opt-in with a very short max so truncation triggers.
+        # Opt-in with a very short max so truncation triggers. Reset the
+        # per-process cache first: an earlier test in the shard may have read
+        # the (unset) env and pinned max_chars to 0, which would swallow our
+        # setenv below.
         monkeypatch.setenv("HEADROOM_TOOL_DESC_MAX_CHARS", "20")
+        _mod._TOOL_DESC_MAX_CHARS = None
 
         payload = _make_anthropic_payload_with_tools()
         max_chars = tool_desc_max_chars()
@@ -129,6 +134,8 @@ class TestAnthropicToolDescCompactionTransforms:
         body, modified, before, after = compact_tool_descriptions(payload, max_chars)
         assert modified is True
         assert before > after
+        # Don't leak the cached 20 into later tests in this shard.
+        _mod._TOOL_DESC_MAX_CHARS = None
 
     def test_l2_skips_label_when_disabled(self) -> None:
         import headroom.proxy.tool_schema_compaction as _mod

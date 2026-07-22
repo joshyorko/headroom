@@ -143,6 +143,30 @@ class AnyLLMBackend(Backend):
         """Convert any-llm/OpenAI response to Anthropic format."""
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
+        # A non-streaming upstream response can be HTTP 200 with an empty
+        # ``choices`` list (e.g. Azure OpenAI content filtering, or any
+        # OpenAI-compatible gateway on a usage-only / filtered turn). The
+        # streaming sibling already skips this (`if ... and chunk.choices`);
+        # indexing ``choices[0]`` here would instead raise IndexError and 500
+        # the request. Return a valid empty assistant turn.
+        if not getattr(response, "choices", None):
+            usage = {"input_tokens": 0, "output_tokens": 0}
+            if getattr(response, "usage", None):
+                usage = {
+                    "input_tokens": getattr(response.usage, "prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(response.usage, "completion_tokens", 0) or 0,
+                }
+            return {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": original_model,
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": usage,
+            }
+
         choice = response.choices[0]
         message = choice.message
 

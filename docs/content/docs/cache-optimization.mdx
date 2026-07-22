@@ -5,6 +5,10 @@ description: Stabilize message prefixes for provider KV cache hits and configure
 
 LLM providers cache prompt prefixes to avoid reprocessing identical input on repeated calls. Headroom's **CacheAligner** is detector-only, so it surfaces prefix drift, reports observability data, and leaves message assembly to the caller.
 
+<Callout type="info" title="CacheAligner is opt-in and detector-only">
+CacheAligner is **disabled by default** and hard-disabled inside the proxy — it never runs on your traffic unless you explicitly enable it, and even then it only *reports* metrics; it never repairs a prefix. In proxy mode, prefix-cache stability comes from **cache mode** (`--mode cache`, the default), which compresses only the newest delta and forwards prior turns byte-faithfully. See [Savings Profiles](/docs/proxy#savings-profiles).
+</Callout>
+
 ## What CacheAligner reports
 
 System prompts often contain dynamic content, such as dates, session IDs, and timestamps, that changes between requests. Even a single character difference at the start of a prompt invalidates the entire provider cache.

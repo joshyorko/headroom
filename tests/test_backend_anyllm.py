@@ -242,6 +242,26 @@ def test_to_anthropic_response_maps_tool_calls_and_usage(monkeypatch: pytest.Mon
     assert converted["content"][2]["input"] == {"query": "python"}
 
 
+def test_to_anthropic_response_empty_choices_returns_empty_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A content-filtered / usage-only upstream response can be 200 with an empty
+    # choices list (e.g. Azure OpenAI content filtering). Indexing choices[0]
+    # would raise IndexError; the converter must return a valid empty turn, the
+    # way the streaming path already skips empty-choice chunks.
+    backend, _instance = make_backend(monkeypatch)
+    response = make_response(usage=SimpleNamespace(prompt_tokens=9, completion_tokens=0))
+
+    converted = backend._to_anthropic_response(response, "claude-sonnet")
+
+    assert converted["type"] == "message"
+    assert converted["role"] == "assistant"
+    assert converted["model"] == "claude-sonnet"
+    assert converted["content"] == []
+    assert converted["stop_reason"] == "end_turn"
+    assert converted["usage"] == {"input_tokens": 9, "output_tokens": 0}
+
+
 @pytest.mark.asyncio
 async def test_send_message_builds_anthropic_response(monkeypatch: pytest.MonkeyPatch) -> None:
     backend, instance = make_backend(monkeypatch)

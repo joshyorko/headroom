@@ -69,6 +69,16 @@ class RequestLog:
     cache_hit: bool
     transforms_applied: list[str]
 
+    # Provider-side cache economics (Anthropic prompt caching, #2438).
+    # ``cache_hit`` alone is ambiguous: a call billed cache-*creation* (write)
+    # cannot be told apart from a real cache-*read* hit. These raw deltas —
+    # already carried on RequestOutcome from the upstream response usage —
+    # let the JSONL telemetry reflect true economics (uncached input +
+    # cache_creation), not just the proxy's boolean.
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    uncached_input_tokens: int = 0
+
     # Waste signals detected in original messages
     waste_signals: dict[str, int] | None = None
 
@@ -319,6 +329,17 @@ class ProxyConfig:
     # wildcard. Empty/None means no extensions run, even if installed.
     # CLI: --proxy-extension <name1,name2>; env: HEADROOM_PROXY_EXTENSIONS.
     proxy_extensions: list[str] | None = None
+
+    # Compressor selection (opt-in narrowing of the built-in compressor set).
+    # None (the default) leaves EVERY built-in compressor enabled — byte-
+    # identical to today. When a set is given, only the named recognized
+    # built-ins {smart_crusher, kompress, code_aware, search, log, tabular,
+    # config, html, image} stay enabled and the rest are disabled at the
+    # ContentRouterConfig `enable_*` seam; `"*"` enables all. Names that are
+    # not recognized built-ins are ignored here (reserved for the
+    # `headroom.compressor` registry). CLI: --compressor <name1,name2>
+    # (repeatable); env: HEADROOM_COMPRESSORS.
+    compressors: set[str] | None = None
 
     # Fallback
     fallback_enabled: bool = False

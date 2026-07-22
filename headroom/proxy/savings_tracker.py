@@ -165,10 +165,28 @@ def _normalize_model(value: Any) -> str:
 
 
 def _resolve_litellm_model(model: str) -> str:
-    """Resolve model name to one LiteLLM recognizes."""
+    """Resolve model name to one LiteLLM recognizes.
+
+    Delegates to the shared alias-map-aware resolver in
+    ``headroom.pricing.litellm_pricing`` so the persisted /stats-history funnel
+    (PROXY $ SAVED tile + Historical Checkpoints) prices gateway aliases like
+    "claude-opus" identically to the live /stats path. Uses the shared result
+    only when it maps to a priced model_cost key; otherwise falls through to the
+    bare-prefix logic below. Fail-soft: pricing never breaks bookkeeping.
+    """
     litellm = _get_litellm_module()
     if litellm is None:
         return model
+
+    try:
+        from headroom.pricing.litellm_pricing import resolve_litellm_model
+
+        resolved = resolve_litellm_model(model)
+        info = litellm.model_cost.get(resolved)
+        if info and info.get("input_cost_per_token") is not None:
+            return resolved
+    except Exception:
+        pass
 
     try:
         litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
@@ -238,7 +256,12 @@ def _estimate_output_savings_usd(model: str, tokens_saved: int) -> float:
         resolved = _resolve_litellm_model(model)
         info = litellm.model_cost.get(resolved, {})
         output_cost_per_token = info.get("output_cost_per_token")
-        if not output_cost_per_token:
+        # Distinguish "price unknown" (missing key -> fall back to the estimate)
+        # from a model that is legitimately free (output_cost_per_token == 0.0).
+        # `if not ...` treated a real 0.0 as unavailable and billed the fallback
+        # rate -> phantom output savings for a model that costs nothing. Mirrors
+        # the fix already applied to `_estimate_compression_savings_usd`.
+        if output_cost_per_token is None:
             raise RuntimeError("output cost unavailable")
         return float(tokens_saved) * float(output_cost_per_token)
     except Exception:

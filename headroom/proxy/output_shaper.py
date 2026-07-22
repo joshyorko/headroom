@@ -58,6 +58,7 @@ from headroom.proxy.output_effort_policy import (
     lower_text_verbosity_value,
 )
 from headroom.proxy.output_steering import (
+    apply_openai_chat_verbosity_steering,
     apply_openai_responses_verbosity_steering,
     apply_verbosity_steering,
     replace_or_append_steering_block,
@@ -76,6 +77,7 @@ __all__ = [
     "OutputShaperSettings",
     "ShapeResult",
     "TurnKind",
+    "apply_openai_chat_verbosity_steering",
     "apply_openai_responses_verbosity_steering",
     "apply_verbosity_steering",
     "classify_openai_responses_input",
@@ -84,15 +86,13 @@ __all__ = [
     "route_effort",
     "route_openai_reasoning_effort",
     "route_openai_text_verbosity",
-    "shape_openai_responses_request",
     "shape_openai_chat_request",
+    "shape_openai_responses_request",
     "shape_request",
     "steering_text",
 ]
 
 _replace_or_append_steering_block = replace_or_append_steering_block
-
-_OPENAI_INSTRUCTION_ROLES = frozenset({"system", "developer"})
 
 
 @dataclass(frozen=True)
@@ -320,76 +320,6 @@ def shape_openai_responses_request(
     return result
 
 
-def _shape_openai_chat_content(content: Any, text: str) -> tuple[Any, bool]:
-    if isinstance(content, str):
-        return replace_or_append_steering_block(content, text)
-    if isinstance(content, list):
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            part_text = part.get("text")
-            if isinstance(part_text, str) and "<headroom_output_shaping>" in part_text:
-                updated, changed = replace_or_append_steering_block(part_text, text)
-                part["text"] = updated
-                return content, changed
-        content.append({"type": "text", "text": text})
-        return content, True
-    return content, False
-
-
-def shape_openai_chat_request(
-    body: dict[str, Any],
-    settings: OutputShaperSettings | None = None,
-) -> ShapeResult:
-    """Apply output shaping to an OpenAI Chat Completions request in place."""
-    if settings is None:
-        settings = OutputShaperSettings.from_env()
-    result = ShapeResult()
-    if not settings.enabled:
-        return result
-
-    level, _source = resolve_verbosity_level(settings)
-    text = steering_text(level)
-    messages = body.get("messages")
-    if text is not None and isinstance(messages, list):
-        target: dict[str, Any] | None = None
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            if "<headroom_output_shaping>" in str(message.get("content")):
-                target = message
-                break
-            if message.get("role") in _OPENAI_INSTRUCTION_ROLES:
-                target = message
-            elif target is not None:
-                break
-        if target is None:
-            messages.insert(0, {"role": "system", "content": text})
-            result.changed = True
-        else:
-            updated, changed = _shape_openai_chat_content(target.get("content", ""), text)
-            target["content"] = updated
-            result.changed = changed
-        if result.changed:
-            assert result.labels is not None
-            result.labels.append(f"output_shaper:verbosity:L{level}")
-
-    if settings.effort_router_enabled and isinstance(messages, list):
-        kind = classify_turn(messages)
-        labels = route_openai_reasoning_effort(body, kind, settings)
-        if kind is TurnKind.MECHANICAL_CONTINUATION:
-            effort = body.get("reasoning_effort")
-            lowered = lower_effort_value(effort, settings.mechanical_effort)
-            if lowered is not None:
-                body["reasoning_effort"] = lowered
-                labels.append(f"output_shaper:reasoning_effort:{effort}->{lowered}")
-        if labels:
-            result.changed = True
-            assert result.labels is not None
-            result.labels.extend(labels)
-    return result
-
-
 def shape_request(
     body: dict[str, Any],
     settings: OutputShaperSettings | None = None,
@@ -421,6 +351,48 @@ def shape_request(
             result.changed = True
             result.labels.extend(labels)
         logger.debug("OutputShaper: turn=%s mutations=%s", kind.value, labels)
+
+    return result
+
+
+def shape_openai_chat_request(
+    body: dict[str, Any],
+    settings: OutputShaperSettings | None = None,
+    level_override: int | None = None,
+) -> ShapeResult:
+    """Apply output-shaping levers to an OpenAI chat/completions body in place.
+
+    The chat counterpart of :func:`shape_request`. Chat carries the system
+    prompt as a ``role: "system"`` message, so verbosity steering uses the
+    chat-specific injector. On mechanical continuations, explicitly supplied
+    OpenAI reasoning-effort fields are lowered but never injected.
+    """
+    if settings is None:
+        settings = OutputShaperSettings.from_env()
+    result = ShapeResult()
+    if not settings.enabled:
+        return result
+
+    assert result.labels is not None  # __post_init__ guarantees this
+
+    level = settings.verbosity_level if level_override is None else level_override
+    if level > 0 and apply_openai_chat_verbosity_steering(body, level):
+        result.changed = True
+        result.labels.append(f"output_shaper:verbosity:L{level}")
+
+    messages = body.get("messages")
+    if settings.effort_router_enabled and isinstance(messages, list):
+        kind = classify_turn(messages)
+        labels = route_openai_reasoning_effort(body, kind, settings)
+        if kind is TurnKind.MECHANICAL_CONTINUATION:
+            effort = body.get("reasoning_effort")
+            lowered = lower_effort_value(effort, settings.mechanical_effort)
+            if lowered is not None:
+                body["reasoning_effort"] = lowered
+                labels.append(f"output_shaper:reasoning_effort:{effort}->{lowered}")
+        if labels:
+            result.changed = True
+            result.labels.extend(labels)
 
     return result
 

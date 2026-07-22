@@ -431,7 +431,12 @@ def _anthropic_usage_from_litellm(litellm_usage: Any) -> dict[str, Any]:
     prompt_tokens = int(getattr(litellm_usage, "prompt_tokens", 0) or 0)
     usage: dict[str, Any] = {
         "input_tokens": max(prompt_tokens - cache_read - cache_write, 0),
-        "output_tokens": getattr(litellm_usage, "completion_tokens", 0),
+        # None-guard like the other fields: LiteLLM's Usage always carries the
+        # completion_tokens attribute, so the getattr default never fires, but a
+        # provider can leave it None. Emitting output_tokens=None would break the
+        # RequestOutcome int contract downstream (e.g. prometheus does
+        # tokens_output_total += output_tokens -> TypeError).
+        "output_tokens": int(getattr(litellm_usage, "completion_tokens", 0) or 0),
     }
     if cache_read or cache_write:
         usage["cache_read_input_tokens"] = cache_read
@@ -754,6 +759,24 @@ class LiteLLMBackend(Backend):
     ) -> dict[str, Any]:
         """Convert LiteLLM/OpenAI response to Anthropic format."""
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+        # A non-streaming upstream response can be HTTP 200 with an empty
+        # ``choices`` list (e.g. Azure OpenAI content filtering, or any
+        # OpenAI-compatible gateway on a usage-only / filtered turn). The
+        # streaming sibling already `continue`s past this (`if not
+        # chunk.choices`); indexing ``choices[0]`` here would instead raise
+        # IndexError and 500 the request. Return a valid empty assistant turn.
+        if not getattr(litellm_response, "choices", None):
+            return {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": original_model,
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": _anthropic_usage_from_litellm(getattr(litellm_response, "usage", None)),
+            }
 
         # Extract content from OpenAI format
         choice = litellm_response.choices[0]

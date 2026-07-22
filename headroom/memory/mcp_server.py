@@ -161,34 +161,75 @@ def create_memory_server(db_path: str, user_id: str = "default") -> Server:
 
     server = Server("headroom-memory")
     _backend: LocalBackend | None = None
-    _init_task: asyncio.Task | None = None
+    _init_task: asyncio.Task[LocalBackend] | None = None
 
     async def _init_backend() -> LocalBackend:
         """Initialize backend with ONNX embedder (fast, no PyTorch)."""
-        nonlocal _backend
+        nonlocal _backend, _init_task
         config = LocalBackendConfig(db_path=db_path, embedder_backend="onnx")
-        _backend = LocalBackend(config)
-        await _warm_up_backend(_backend, user_id)
+        backend = LocalBackend(config)
+        init_task = asyncio.current_task()
+        try:
+            await _warm_up_backend(backend, user_id)
+        except (Exception, asyncio.CancelledError):
+            try:
+                await backend.close()
+            except Exception as cleanup_error:
+                logger.warning("Memory MCP: failed backend cleanup: %s", cleanup_error)
+            finally:
+                if _init_task is init_task:
+                    _init_task = None
+            raise
+
+        _backend = backend
+        if _init_task is init_task:
+            _init_task = None
         logger.info(f"Memory MCP: ready (db={db_path}, user={user_id})")
-        return _backend
+        return backend
+
+    def _handle_backend_init_done(init_task: asyncio.Task[LocalBackend]) -> None:
+        """Clear and log failed background initialization tasks."""
+        nonlocal _init_task
+        if init_task.cancelled():
+            if _init_task is init_task:
+                _init_task = None
+            return
+        error = init_task.exception()
+        if error is not None:
+            if _init_task is init_task:
+                _init_task = None
+            logger.warning("Memory MCP: backend initialization failed: %s", error)
+
+    def _start_backend_init() -> asyncio.Task[LocalBackend]:
+        """Start backend initialization once for all concurrent callers."""
+        nonlocal _init_task
+        if _init_task is None:
+            _init_task = asyncio.create_task(_init_backend())
+            _init_task.add_done_callback(_handle_backend_init_done)
+        return _init_task
 
     async def _get_backend() -> LocalBackend:
         nonlocal _backend, _init_task
         if _backend is not None:
             return _backend
-        # Wait for background init if it's running
-        if _init_task is not None:
-            await _init_task
-            return _backend  # type: ignore[return-value]
-        # Fallback: init inline (shouldn't normally happen)
-        return await _init_backend()
+
+        init_task = _start_backend_init()
+        try:
+            return await asyncio.shield(init_task)
+        except asyncio.CancelledError:
+            if init_task.done() and _init_task is init_task:
+                _init_task = None
+            raise
+        except Exception:
+            if _init_task is init_task:
+                _init_task = None
+            raise
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
         # Kick off background init on first list_tools (called at MCP handshake)
-        nonlocal _init_task
-        if _backend is None and _init_task is None:
-            _init_task = asyncio.create_task(_init_backend())
+        if _backend is None:
+            _start_backend_init()
         return _TOOLS
 
     @server.call_tool()

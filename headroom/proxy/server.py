@@ -491,6 +491,15 @@ class LoopHealthState(TypedDict):
     last_known_failure: LoopFailureDetails | None
 
 
+class CompressionQuarantinedError(asyncio.TimeoutError):
+    """Compression was skipped while a timed-out worker was still running.
+
+    Inherit from ``asyncio.TimeoutError`` rather than the builtin directly so
+    Python 3.10 callers classify quarantine bypasses exactly like executor
+    timeouts. The two exception classes only became aliases in Python 3.11.
+    """
+
+
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
 
 # Env var that opts out of the Rust core deployment smoke test (Hotfix-A0).
@@ -650,6 +659,93 @@ def _provider_httpx_client_options(
     return config.http2 and not config.http_proxy, client_kwargs
 
 
+# Recognized built-in compressor names → the `ContentRouterConfig` `enable_*`
+# flag that gates each one. This is the whole selection surface: a `--compressor`
+# selection is mapped onto these existing flags with ZERO new dispatch logic, so
+# the router's if/elif built-in dispatch stays byte-identical. Names outside this
+# map (e.g. a third-party `headroom.compressor` entry point) are intentionally
+# ignored here — they belong to the registry, not the built-in enable_* seam.
+BUILTIN_COMPRESSOR_FLAGS: dict[str, str] = {
+    "smart_crusher": "enable_smart_crusher",
+    "kompress": "enable_kompress",
+    "code_aware": "enable_code_aware",
+    "search": "enable_search_compressor",
+    "log": "enable_log_compressor",
+    "tabular": "enable_tabular_compressor",
+    "config": "enable_config_compressor",
+    "html": "enable_html_extractor",
+    "image": "enable_image_optimizer",
+}
+
+
+def _apply_compressor_selection(
+    router_config: ContentRouterConfig,
+    compressors: set[str] | None,
+) -> None:
+    """Narrow the built-in compressor set on ``router_config`` in place.
+
+    ``compressors is None`` (the default) is a no-op: every ``enable_*`` flag
+    keeps its dataclass default, so behavior is byte-identical to today. When a
+    selection is given, each recognized built-in in :data:`BUILTIN_COMPRESSOR_FLAGS`
+    is enabled iff it (or the wildcard ``"*"``) was selected, and disabled
+    otherwise. Unrecognized names select no flag (reserved for the compressor
+    registry) but are surfaced with a warning, because a typo'd selection is
+    otherwise indistinguishable from "compress nothing" (#2384). This maps a
+    selection onto the existing flags without adding any dispatch logic.
+    """
+    if compressors is None:
+        return
+    selected = {name.strip() for name in compressors if name.strip()}
+    if not selected:
+        return
+    select_all = "*" in selected
+    unmatched = sorted(selected - set(BUILTIN_COMPRESSOR_FLAGS) - {"*"})
+    if unmatched:
+        if select_all or selected & set(BUILTIN_COMPRESSOR_FLAGS):
+            logger.warning(
+                "compressor selection: %s match no built-in compressor "
+                "(assumed registry names); built-ins: %s",
+                ", ".join(unmatched),
+                ", ".join(sorted(BUILTIN_COMPRESSOR_FLAGS)),
+            )
+        else:
+            logger.warning(
+                "compressor selection %s matches no built-in compressor — every "
+                "built-in compressor is now disabled. If this is a typo, valid "
+                "names are: %s (or '*' for all).",
+                ", ".join(unmatched),
+                ", ".join(sorted(BUILTIN_COMPRESSOR_FLAGS)),
+            )
+    for name, flag in BUILTIN_COMPRESSOR_FLAGS.items():
+        setattr(router_config, flag, select_all or name in selected)
+
+
+def _external_compressor_selection(compressors: set[str] | None) -> list[str] | None:
+    """Return the selected EXTERNAL (non-built-in) compressor names, or ``None``.
+
+    The built-in selection (:func:`_apply_compressor_selection`) consumes only
+    the names in :data:`BUILTIN_COMPRESSOR_FLAGS`; every OTHER selected name is a
+    third-party ``headroom.compressor`` entry point. This threads those to the
+    router (via ``ContentRouterConfig.active_external_compressors``) so it can
+    route matching blocks through them.
+
+    Returns ``None`` — the router's external-dispatch branch stays inert, so the
+    request path is byte-identical to today — when the selection is empty or
+    contains only recognized built-in names. ``"*"`` is preserved so the router
+    activates every discovered external compressor (mirroring the wildcard's
+    "select everything" meaning on the built-in side).
+    """
+    if not compressors:
+        return None
+    selected = {name.strip() for name in compressors if name.strip()}
+    if not selected:
+        return None
+    if "*" in selected:
+        return ["*"]
+    external = sorted(selected - set(BUILTIN_COMPRESSOR_FLAGS))
+    return external or None
+
+
 class HeadroomProxy(
     StreamingMixin,
     AnthropicHandlerMixin,
@@ -748,6 +844,19 @@ class HeadroomProxy(
             ccr_inject_marker=config.ccr_inject_marker,
             force_kompress_all=config.force_kompress_all,
             lossless=config.lossless,
+        )
+        # Compressor selection (opt-in). None keeps every built-in enabled
+        # (default, byte-identical to today); a selection maps the recognized
+        # built-in names onto the `enable_*` flags just constructed above.
+        # Runs BEFORE the disable_kompress override below so that flag stays
+        # authoritative for turning Kompress off.
+        _apply_compressor_selection(router_config, config.compressors)
+        # External (non-built-in) `headroom.compressor` selections are ignored by
+        # `_apply_compressor_selection` (they have no enable_* flag). Thread them
+        # to the router here so it can route matching blocks through them; None
+        # (no external selected) keeps the external-dispatch branch inert.
+        router_config.active_external_compressors = _external_compressor_selection(
+            config.compressors
         )
         # No-CCR lossless mode: compress tool outputs with format-native
         # lossless compaction and marker-free SmartCrusher, and suppress every
@@ -1016,6 +1125,16 @@ class HeadroomProxy(
         # Counter: threads that finished AFTER their asyncio future hit the
         # timeout. Stuck-thread leak indicator.
         self._compression_leaked_threads: int = 0
+        # Timeout-debt quarantine. Python cannot preempt a worker after its
+        # asyncio waiter times out, so accepting more compression while that
+        # worker is still running can multiply one slow call into a saturated
+        # executor. New work raises immediately until every known post-timeout
+        # worker has genuinely exited, then follows the caller's existing
+        # compression-failure policy.
+        self._compression_timed_out_in_flight: int = 0
+        self._compression_timed_out_in_flight_max: int = 0
+        self._compression_quarantine_activations: int = 0
+        self._compression_quarantine_skips: int = 0
         self._compression_metrics_lock = threading.Lock()
 
         # Backend for Anthropic API (direct, LiteLLM, or any-llm)
@@ -1245,10 +1364,14 @@ class HeadroomProxy(
         worker keeps running to completion, ignored. We detect this by
         marking the call timed out on the asyncio side and incrementing
         ``_compression_leaked_threads`` from the worker's ``finally``
-        block after it eventually finishes. Jobs that time out before a
-        worker starts are removed from the queued gauge instead. Operators
-        can see leaked-thread rate and queue pressure climbing in
-        ``/stats`` before the pool fills up.
+        block after it eventually finishes. While any such worker remains,
+        new calls raise :class:`CompressionQuarantinedError` immediately so
+        callers apply the existing compression-failure policy instead of
+        filling the rest of the pool with the same timeout debt. Jobs that are
+        successfully cancelled before a worker starts are removed from the
+        queued gauge and do not activate the quarantine. If cancellation races
+        with worker startup, the now-running job is tracked as timeout debt and
+        does activate it.
 
         Args:
             fn: A no-arg sync callable that runs the compression. Must not
@@ -1265,20 +1388,71 @@ class HeadroomProxy(
         Raises:
             ``asyncio.TimeoutError`` if the callable doesn't return within
             ``timeout``. Any exception raised by ``fn`` propagates
-            unchanged.
+            unchanged. :class:`CompressionQuarantinedError` (an
+            ``asyncio.TimeoutError`` subclass) if a prior timed-out worker is
+            still running.
         """
+        with self._compression_metrics_lock:
+            timed_out_in_flight = self._compression_timed_out_in_flight
+            if timed_out_in_flight > 0:
+                self._compression_quarantine_skips += 1
+
+        if timed_out_in_flight > 0:
+            self.metrics.record_compression_quarantine("skipped")
+            raise CompressionQuarantinedError(
+                f"compression quarantined: {timed_out_in_flight} timed-out worker(s) still running"
+            )
+
         loop = asyncio.get_running_loop()
         queued_at = time.monotonic()
-        state = {"queued": True, "timed_out": False}
+        state = {
+            "queued": True,
+            "started": False,
+            "finished": False,
+            "timed_out": False,
+            "timeout_debt_recorded": False,
+        }
         with self._compression_metrics_lock:
             self._compression_queued += 1
             if self._compression_queued > self._compression_queued_max:
                 self._compression_queued_max = self._compression_queued
 
+        def _record_timeout_debt_locked() -> bool:
+            """Record a still-running post-timeout worker; lock must be held.
+
+            Returns ``True`` only when this worker transitions the executor
+            from clear to quarantined.
+            """
+            if (
+                not state["timed_out"]
+                or not state["started"]
+                or state["finished"]
+                or state["timeout_debt_recorded"]
+            ):
+                return False
+            was_clear = self._compression_timed_out_in_flight == 0
+            self._compression_timed_out_in_flight += 1
+            self._compression_timed_out_in_flight_max = max(
+                self._compression_timed_out_in_flight_max,
+                self._compression_timed_out_in_flight,
+            )
+            state["timeout_debt_recorded"] = True
+            if was_clear:
+                self._compression_quarantine_activations += 1
+            return was_clear
+
+        def _announce_quarantine() -> None:
+            self.metrics.record_compression_quarantine("activated")
+            logger.warning(
+                "Compression worker exceeded its request deadline and is still running; "
+                "new compression is quarantined until timed-out workers exit"
+            )
+
         def _wrapped():  # noqa: ANN202
             started_at = time.monotonic()
             queue_wait = started_at - queued_at
             with self._compression_metrics_lock:
+                state["started"] = True
                 if state["queued"]:
                     self._compression_queued -= 1
                     state["queued"] = False
@@ -1288,17 +1462,29 @@ class HeadroomProxy(
                 self._compression_in_flight += 1
                 if self._compression_in_flight > self._compression_in_flight_max:
                     self._compression_in_flight_max = self._compression_in_flight
+                quarantine_activated = _record_timeout_debt_locked()
+            if quarantine_activated:
+                _announce_quarantine()
             try:
                 return fn()
             finally:
                 elapsed = time.monotonic() - started_at
                 with self._compression_metrics_lock:
+                    state["finished"] = True
                     self._compression_in_flight -= 1
                     self._compression_run_seconds_total += elapsed
                     if elapsed > self._compression_run_seconds_max:
                         self._compression_run_seconds_max = elapsed
                     if state["timed_out"]:
                         self._compression_leaked_threads += 1
+                    if state["timeout_debt_recorded"]:
+                        self._compression_timed_out_in_flight -= 1
+                        state["timeout_debt_recorded"] = False
+                        quarantine_cleared = self._compression_timed_out_in_flight == 0
+                    else:
+                        quarantine_cleared = False
+                if quarantine_cleared:
+                    logger.info("Compression quarantine cleared after all timed-out workers exited")
 
         future = loop.run_in_executor(self._compression_executor, _wrapped)
         try:
@@ -1310,6 +1496,9 @@ class HeadroomProxy(
                     self._compression_queued -= 1
                     state["queued"] = False
                     self._compression_queue_timeouts += 1
+                quarantine_activated = _record_timeout_debt_locked()
+            if quarantine_activated:
+                _announce_quarantine()
             raise
 
     async def _run_compression_background(self, fn):  # noqa: ANN001, ANN201
@@ -1752,7 +1941,18 @@ class HeadroomProxy(
         """
         from headroom.proxy.outcome import emit_request_outcome
 
-        await emit_request_outcome(self, outcome)
+        # Shielded because four call sites are `finally:` blocks inside streaming
+        # async generators (streaming.py:1611, :1859, :2069, openai.py:8614). A
+        # client disconnect cancels that task, and the funnel now suspends partway
+        # through: `record_request` commits the Prometheus counters, then awaits
+        # the ledger append in a worker thread. A cancellation landing on that
+        # await leaves the request counted in Prometheus but missing from the cost
+        # tracker, the request log, and the PERF line `headroom perf` reads.
+        #
+        # The shield does not swallow the cancellation — the await below still
+        # raises CancelledError, so generator teardown propagates exactly as
+        # before. It only keeps the bookkeeping from being torn in half.
+        await asyncio.shield(emit_request_outcome(self, outcome))
 
     async def _next_request_id(self) -> str:
         """Generate unique request ID."""
@@ -2406,7 +2606,47 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             **details,
         }
 
+    def _kompress_health_routers() -> list[ContentRouter]:
+        routers: list[ContentRouter] = []
+        for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
+            for transform in getattr(pipeline, "transforms", ()):
+                if (
+                    isinstance(transform, ContentRouter)
+                    and transform.config.enable_kompress
+                    and all(transform is not item for item in routers)
+                ):
+                    routers.append(transform)
+        return routers
+
+    def _reconcile_kompress_health() -> bool:
+        routers = _kompress_health_routers()
+        if not routers:
+            return False
+
+        compressors: list[Any] = []
+        for router in routers:
+            for name in ("_kompress", "_kompress_remote"):
+                compressor = getattr(router, name, None)
+                if compressor is not None and all(compressor is not item for item in compressors):
+                    compressors.append(compressor)
+
+        for compressor in compressors:
+            try:
+                if not compressor.is_ready():
+                    continue
+                backend = compressor.ready_backend()
+                if not backend:
+                    continue
+            except Exception:
+                continue
+            if proxy.warmup.kompress.status == "loaded":
+                return True
+            proxy.warmup.kompress.mark_loaded(handle=compressor, backend=backend)
+            return True
+        return True
+
     def _health_checks() -> dict[str, dict[str, Any]]:
+        kompress_enabled = _reconcile_kompress_health()
         memory_status = (
             proxy.memory_handler.health_status()
             if proxy.memory_handler
@@ -2453,7 +2693,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 error=_upstream_check_cache["error"],
             ),
             "kompress": _component_health(
-                enabled=not config.disable_kompress,
+                enabled=kompress_enabled,
                 ready=proxy.warmup.kompress.status == "loaded",
                 backend=proxy.warmup.kompress.info.get("backend", None),
             ),
@@ -2478,6 +2718,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _comp_run_total = proxy._compression_run_seconds_total
             _comp_run_max = proxy._compression_run_seconds_max
             _comp_leaked = proxy._compression_leaked_threads
+            _comp_timed_out_in_flight = proxy._compression_timed_out_in_flight
+            _comp_timed_out_in_flight_max = proxy._compression_timed_out_in_flight_max
+            _comp_quarantine_activations = proxy._compression_quarantine_activations
+            _comp_quarantine_skips = proxy._compression_quarantine_skips
         return {
             "anthropic_pre_upstream": {
                 "enabled": proxy.anthropic_pre_upstream_sem is not None,
@@ -2505,6 +2749,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "run_seconds_total": _comp_run_total,
                 "run_seconds_max": _comp_run_max,
                 "leaked_threads_total": _comp_leaked,
+                "quarantine_active": _comp_timed_out_in_flight > 0,
+                "timed_out_workers": _comp_timed_out_in_flight,
+                "timed_out_workers_max": _comp_timed_out_in_flight_max,
+                "quarantine_activations_total": _comp_quarantine_activations,
+                "quarantine_skips_total": _comp_quarantine_skips,
                 "source": ("auto" if config.compression_max_workers is None else "explicit"),
             },
             "websocket_sessions": {
@@ -3900,6 +4149,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             else {},
             "compressions_by_strategy": dict(m.compressions_by_strategy),
             "tokens_saved_by_strategy": dict(m.tokens_saved_by_strategy),
+            "extension_savings": dict(m.extension_savings),
             "codex_ws": {
                 "units_total": m.codex_ws_units_total,
                 "units_modified_total": m.codex_ws_units_modified_total,
@@ -4853,8 +5103,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "data": retrieval_data,
         }
 
-    # Compression-only endpoint (for TypeScript SDK and other HTTP clients)
-    @app.post("/v1/compress", dependencies=[Depends(_require_loopback)])
+    # Compression-only endpoint (for TypeScript SDK and other HTTP clients).
+    # Loopback-only by default (guard added in #1537). An operator can opt in to
+    # network access for an authorized in-network sidecar/gateway (e.g. Kong,
+    # LiteLLM) on a trusted network by setting HEADROOM_COMPRESS_ALLOW_REMOTE=1,
+    # which drops ONLY this route's loopback dependency. Inbound auth
+    # (HEADROOM_PROXY_TOKEN via _security_gate) and network scoping still apply;
+    # all other _require_loopback routes are unaffected. Unset/false preserves
+    # today's loopback-only behavior.
+    _compress_dependencies = (
+        []
+        if _get_env_bool("HEADROOM_COMPRESS_ALLOW_REMOTE", False)
+        else [Depends(_require_loopback)]
+    )
+
+    @app.post("/v1/compress", dependencies=_compress_dependencies)
     async def compress_messages(request: Request):
         return await proxy.handle_compress(request)
 

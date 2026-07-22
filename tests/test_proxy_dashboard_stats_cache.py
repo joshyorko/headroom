@@ -719,9 +719,9 @@ def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     assert "Output tokens" in html
     assert "Before Compression" not in html
     assert "After Compression (sent)" not in html
-    assert "cliFilteringLabel + ' filtered this session'" in html
-    assert "cliFilteringLabel + ' filtered'" in html
-    assert "cliFilteringLabel + ' lifetime'" in html
+    assert "cliFilteringLabel + ' Filtered (this session)'" in html
+    # Lifetime CLI-filtering savings remain available in the history tab.
+    assert "cliFilteringLabel) + ' Lifetime Saved'" in html
     assert "session delta unavailable" in html
     assert "session_delta_available" in html
     assert "showCliFilteringLifetimeLine" in html

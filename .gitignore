@@ -17,6 +17,7 @@ scripts/*
 !scripts/sync-plugin-versions.py
 !scripts/changelog-gen.py
 !scripts/verify-versions.py
+!scripts/verify-ruff-version.py
 !scripts/pr-governance.py
 !scripts/bootstrap-windows-dev.ps1
 !scripts/build_npm_release_assets.mjs

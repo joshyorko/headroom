@@ -755,11 +755,73 @@ def test_openai_responses_adapter_losslessly_folds_excluded_output_content_parts
     assert modified is True
     assert saved >= 0
     assert "router:excluded:lossless" in transforms
-    folded_output = new_payload["input"][1]["output"]
-    assert isinstance(folded_output, list)
-    folded = folded_output[0]["text"]
-    assert len(folded) < len(grep_out)
-    assert search_unheading(folded) == grep_out
+    folded = new_payload["input"][1]["output"]
+    # Output must remain a list (content-part array) — not replaced with a string
+    assert isinstance(folded, list), f"expected list, got {type(folded).__name__}"
+    assert len(folded) == 1
+    assert isinstance(folded[0], dict) and folded[0].get("type") == "output_text"
+    assert len(folded[0]["text"]) < len(grep_out)
+    assert search_unheading(folded[0]["text"]) == grep_out
+
+
+def test_openai_responses_adapter_losslessly_folds_excluded_grep_output_content_parts_with_non_text():
+    """Excluded tool output with content-part array preserves non-text parts.
+
+    When output is a content-part array that includes non-text parts (images,
+    refusals), the lossless fold should only update output_text/input_text parts
+    and leave everything else intact.
+    """
+    from headroom.transforms.lossless_compaction import search_unheading
+
+    router = ContentRouter()
+    router.config.exclude_tools = {"grep"}
+    handler = _handler_with_router(router)
+    grep_out = "".join(
+        f"src/part_{f}.py:{ln}:matching content in a content part\n"
+        for f in range(8)
+        for ln in range(6)
+    )
+
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": "grep", "arguments": "{}"},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {"type": "output_text", "text": grep_out},
+                    {"type": "input_image", "image_url": "https://example.com/img.png"},
+                    {"type": "refusal", "refusal": "I cannot process this request"},
+                ],
+            },
+        ],
+    }
+
+    new_payload, modified, saved, transforms, _units, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_content_part_non_text",
+        )
+    )
+
+    assert modified is True
+    assert saved >= 0
+    assert "router:excluded:lossless" in transforms
+    folded_list = new_payload["input"][1]["output"]
+    # Structure preserved: list with same length and part types
+    assert isinstance(folded_list, list), f"expected list, got {type(folded_list).__name__}"
+    assert len(folded_list) == 3
+    # output_text part was compressed
+    assert folded_list[0]["type"] == "output_text"
+    assert len(folded_list[0]["text"]) < len(grep_out)
+    assert search_unheading(folded_list[0]["text"]) == grep_out
+    # Non-text parts are byte-identical
+    assert folded_list[1]["type"] == "input_image"
+    assert folded_list[1]["image_url"] == "https://example.com/img.png"
+    assert folded_list[2]["type"] == "refusal"
+    assert folded_list[2]["refusal"] == "I cannot process this request"
 
 
 def test_openai_responses_adapter_excludes_tool_case_insensitively_with_debug(monkeypatch):

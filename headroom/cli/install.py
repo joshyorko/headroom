@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -315,6 +317,40 @@ def _build_deployment_manifest(
     return manifest
 
 
+# Upstream-routing overrides the interactive `headroom proxy` reads from the
+# environment (via resolve_api_overrides), but a supervised runner starts from a
+# bare environment, so these never reach the persistent proxy unless captured
+# into the manifest. Without this, `install apply` with e.g.
+# ANTHROPIC_TARGET_API_URL exported silently routes to the default provider
+# endpoint instead of the user's gateway (#2240). Only URL overrides are
+# captured; the *_TARGET_API_HEADERS vars can carry bearer tokens and are left
+# to explicit `--env` so a secret is never persisted to the manifest implicitly.
+_PASSTHROUGH_URL_ENV_VARS = (
+    "ANTHROPIC_TARGET_API_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "OPENAI_TARGET_API_URL",
+    "GEMINI_TARGET_API_URL",
+    "CLOUDCODE_TARGET_API_URL",
+    "VERTEX_TARGET_API_URL",
+    "BEDROCK_TARGET_API_URL",
+)
+
+
+def _capture_passthrough_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """Return the upstream-routing overrides present in ``environ``.
+
+    An empty or unset value is skipped so it cannot shadow an auto-derived
+    default. Explicit ``--env`` values are meant to win over these, so callers
+    should merge the returned dict *under* the parsed ``--env`` map.
+    """
+    captured: dict[str, str] = {}
+    for name in _PASSTHROUGH_URL_ENV_VARS:
+        value = environ.get(name)
+        if value:
+            captured[name] = value
+    return captured
+
+
 def _apply_manifest(manifest: DeploymentManifest) -> None:
     try:
         existing = load_manifest(manifest.profile)
@@ -525,6 +561,11 @@ def install_apply(
         key, _, value = item.partition("=")
         parsed_env[key] = value
 
+    # Auto-carry upstream-routing overrides from the current environment so a
+    # supervised runner forwards to the same gateway the interactive proxy would
+    # (#2240). Explicit --env wins, so merge the captured vars underneath.
+    combined_env = {**_capture_passthrough_env(os.environ), **parsed_env}
+
     manifest = _build_deployment_manifest(
         profile=profile,
         preset=preset,
@@ -546,7 +587,7 @@ def install_apply(
         intercept_tool_results=intercept_tool_results,
         protect_tool_results=protect_tool_results,
         bedrock_profile=bedrock_profile,
-        extra_env=parsed_env,
+        extra_env=combined_env,
     )
 
     _apply_manifest(manifest)
@@ -608,7 +649,7 @@ def install_apply(
 )
 @click.option(
     "--image",
-    default="ghcr.io/chopratejas/headroom:latest",
+    default="ghcr.io/headroomlabs-ai/headroom:latest",
     show_default=True,
     help="Docker image to use when Docker is selected.",
 )

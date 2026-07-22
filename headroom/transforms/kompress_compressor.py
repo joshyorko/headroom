@@ -96,11 +96,12 @@ KOMPRESS_ONNX_INTER_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTER_THREADS"
 KOMPRESS_COREML_CACHE_DIR_ENV = "HEADROOM_KOMPRESS_COREML_CACHE_DIR"
 KOMPRESS_MAX_CONCURRENT_ENV = "HEADROOM_KOMPRESS_MAX_CONCURRENT"
 KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV = "HEADROOM_KOMPRESS_EXECUTION_TIMEOUT_MS"
-KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT = 25
+KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT = 3000
 KOMPRESS_BATCH_SIZE_ENV = "HEADROOM_KOMPRESS_BATCH_SIZE"
 KOMPRESS_ACQUIRE_TIMEOUT_ENV = "HEADROOM_KOMPRESS_ACQUIRE_TIMEOUT_SECONDS"
 KOMPRESS_TIME_BUDGET_ENV = "HEADROOM_KOMPRESS_TIME_BUDGET_SECONDS"
 KOMPRESS_CANARY_THRESHOLD_ENV = "HEADROOM_KOMPRESS_CANARY_SECONDS"
+KOMPRESS_REQUEST_DEADLINE_ENV = "HEADROOM_COMPRESSION_DEADLINE_MS"
 
 # Both defaults sit well under the proxy's 30s compression-stage timeout so a
 # slow model gives up (passthrough) before the request is abandoned. A thread
@@ -173,6 +174,13 @@ def _execution_wait_budget_seconds() -> float:
         )
         return 0.0
     return parsed / 1000.0
+
+
+def _request_deadline_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get(KOMPRESS_REQUEST_DEADLINE_ENV, "20000")) / 1000.0)
+    except ValueError:
+        return 20.0
 
 
 def _acquire_execution_slot(
@@ -1143,7 +1151,7 @@ class KompressCompressor(Transform):
     def _timed_canary(self, model: Any, tokenizer: Any, backend: str) -> float:
         """Run one small inference and return its wall-clock seconds."""
         words = _canary_words()
-        is_onnx = backend == "onnx"
+        is_onnx = backend.startswith("onnx")
         encoding = tokenizer(
             words,
             is_split_into_words=True,
@@ -1170,6 +1178,11 @@ class KompressCompressor(Transform):
         """
         return self.config.model_id in _kompress_cache
 
+    def ready_backend(self) -> str | None:
+        """Return the cached backend without triggering a load."""
+        entry = _kompress_cache.get(self.config.model_id)
+        return entry[2] if entry is not None else None
+
     def ensure_background_load(self) -> None:
         """Kick off a one-shot, non-blocking background download of the model.
 
@@ -1187,6 +1200,7 @@ class KompressCompressor(Transform):
         *,
         allow_download: bool = True,
         ccr_original: str | None = None,
+        _deadline_started_at: float | None = None,
     ) -> KompressResult:
         """Compress content using Kompress model.
 
@@ -1211,6 +1225,7 @@ class KompressCompressor(Transform):
         Returns:
             KompressResult with compressed text.
         """
+        t_deadline = time.perf_counter() if _deadline_started_at is None else _deadline_started_at
         words = content.split()
         n_words = len(words)
 
@@ -1226,20 +1241,14 @@ class KompressCompressor(Transform):
         # Cached per instance: operator config, read once -- not per compress() call.
         deadline_s = getattr(self, "_deadline_s", None)
         if deadline_s is None:
-            try:
-                deadline_s = max(
-                    0.0,
-                    float(os.environ.get("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")) / 1000.0,
-                )
-            except ValueError:
-                deadline_s = 20.0
+            deadline_s = _request_deadline_seconds()
             self._deadline_s = deadline_s
 
         try:
             model, tokenizer, backend = _load_kompress(
                 self.config.model_id, self.config.device, allow_download=allow_download
             )
-            is_onnx = backend == "onnx"
+            is_onnx = backend.startswith("onnx")
             device_type = _model_device_type(model, backend)
 
             if self._should_batch_single_content(model, backend):
@@ -1251,6 +1260,7 @@ class KompressCompressor(Transform):
                     target_ratio=[target_ratio],
                     batch_size=_batch_size(),
                     ccr_originals=[ccr_original],
+                    _deadline_started_at=t_deadline,
                 )
                 if batch_result:
                     return batch_result[0]
@@ -1259,7 +1269,6 @@ class KompressCompressor(Transform):
             kept_ids: set[int] = set()
             inference_ms = 0.0
             chunk_count = 0
-            t_deadline = time.perf_counter()
 
             acquire_timeout = _acquire_timeout_seconds()
             budget = _time_budget_seconds()
@@ -1315,12 +1324,29 @@ class KompressCompressor(Transform):
                     input_ids = input_ids.to(device)
                     attention_mask = attention_mask.to(device)
 
+                request_remaining: float | None = None
+                if deadline_s:
+                    request_remaining = deadline_s - (time.perf_counter() - t_deadline)
+                    if request_remaining <= 0:
+                        kept_ids.update(range(chunk_start, n_words))
+                        logger.warning(
+                            "Kompress hit %.1fs deadline before acquire after %d/%d words "
+                            "(%d chunks done); kept remainder verbatim to free the request "
+                            "thread (#1171)",
+                            deadline_s,
+                            chunk_start,
+                            n_words,
+                            chunk_count,
+                        )
+                        break
+
                 acquire_bounds = [
                     bound
                     for bound in (
                         _execution_wait_budget_seconds(),
                         acquire_timeout,
                         remaining,
+                        request_remaining,
                     )
                     if bound is not None
                 ]
@@ -1459,6 +1485,7 @@ class KompressCompressor(Transform):
         batch_size: int = 32,
         *,
         ccr_originals: list[str | None] | None = None,
+        _deadline_started_at: float | None = None,
     ) -> list[KompressResult]:
         """Compress multiple texts. Uses batched inference on GPU, sequential on CPU.
 
@@ -1519,6 +1546,7 @@ class KompressCompressor(Transform):
         n = len(contents)
         if n == 0:
             return []
+        t_deadline = time.perf_counter() if _deadline_started_at is None else _deadline_started_at
 
         # Normalize target_ratio to a per-text list
         if isinstance(target_ratio, list):
@@ -1560,6 +1588,7 @@ class KompressCompressor(Transform):
                     question=question,
                     target_ratio=r,
                     ccr_original=ccr_source,
+                    _deadline_started_at=t_deadline,
                 )
                 for content, r, ccr_source in zip(contents, ratios, ccr_sources, strict=True)
             ]
@@ -1592,10 +1621,14 @@ class KompressCompressor(Transform):
                     results[i] = self._passthrough(contents[i], len(word_lists[i]))
             return [r for r in results if r is not None]
 
-        is_onnx = backend == "onnx"
+        is_onnx = backend.startswith("onnx")
         device_type = _model_device_type(model, backend)
         kept_ids_per_text: dict[int, set[int]] = {i: set() for i in range(n) if results[i] is None}
         inference_ms = 0.0
+        deadline_s = getattr(self, "_deadline_s", None)
+        if deadline_s is None:
+            deadline_s = _request_deadline_seconds()
+            self._deadline_s = deadline_s
 
         acquire_timeout = _acquire_timeout_seconds()
         budget = _time_budget_seconds()
@@ -1625,6 +1658,9 @@ class KompressCompressor(Transform):
                 if remaining <= 0:
                     _bail_remaining("time budget exhausted", batch_start)
                     break
+            if deadline_s and (deadline_s - (time.perf_counter() - t_deadline)) <= 0:
+                _bail_remaining("request deadline exhausted", batch_start)
+                break
 
             batch = chunk_queue[batch_start : batch_start + batch_size]
             batch_word_lists = [c[2] for c in batch]
@@ -1648,6 +1684,13 @@ class KompressCompressor(Transform):
                     input_ids = input_ids.to(device)
                     attention_mask = attention_mask.to(device)
 
+                request_remaining: float | None = None
+                if deadline_s:
+                    request_remaining = deadline_s - (time.perf_counter() - t_deadline)
+                    if request_remaining <= 0:
+                        _bail_remaining("request deadline exhausted", batch_start)
+                        break
+
                 # Single forward pass for all chunks in this batch.
                 acquire_bounds = [
                     bound
@@ -1655,6 +1698,7 @@ class KompressCompressor(Transform):
                         _execution_wait_budget_seconds(),
                         acquire_timeout,
                         remaining,
+                        request_remaining,
                     )
                     if bound is not None
                 ]
@@ -1818,8 +1862,8 @@ class KompressCompressor(Transform):
 
         model, _tokenizer, backend = _kompress_cache[model_id]
 
-        if backend == "onnx":
-            return True  # ONNX CPU provider doesn't parallelize batch dim
+        if backend.startswith("onnx"):
+            return True  # ONNX EPs don't parallelize the batch dim
         if backend == "pytorch":
             try:
                 import torch

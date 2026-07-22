@@ -355,6 +355,16 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Disable (false) or force-enable (true) Kompress for the OpenAI/Codex pipeline only. Unset = inherit.",
         tier="advanced",
     ),
+    SettingField(
+        "HEADROOM_COMPRESSORS",
+        "compressors",
+        "Enabled compressors",
+        "Compression",
+        "csv-list",
+        default=None,
+        help="Comma-separated opt-in built-in compressor names ('*' enables all built-ins).",
+        tier="advanced",
+    ),
     # --- CCR (experimental read-maturation) ---
     SettingField(
         "HEADROOM_READ_MATURATION",

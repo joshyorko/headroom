@@ -31,7 +31,11 @@ _EXISTING = "Be in “happy places” — really.\n".encode() + b"legacy \x9d by
 
 
 @pytest.mark.parametrize("inject, marker", INJECTORS)
-def test_inject_appends_into_file_with_non_ascii_and_stray_byte(inject, marker, tmp_path: Path):
+def test_inject_appends_into_file_with_non_ascii_and_stray_byte(
+    inject, marker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    if marker == _RTK_MARKER:
+        monkeypatch.setenv("HEADROOM_RTK", "1")
     target = tmp_path / "AGENTS.md"
     target.write_bytes(_EXISTING)
 
@@ -45,7 +49,11 @@ def test_inject_appends_into_file_with_non_ascii_and_stray_byte(inject, marker, 
 
 
 @pytest.mark.parametrize("inject, marker", INJECTORS)
-def test_inject_creates_file_when_absent(inject, marker, tmp_path: Path):
+def test_inject_creates_file_when_absent(
+    inject, marker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    if marker == _RTK_MARKER:
+        monkeypatch.setenv("HEADROOM_RTK", "1")
     target = tmp_path / "nested" / "AGENTS.md"
 
     assert inject(target) is True
@@ -53,7 +61,9 @@ def test_inject_creates_file_when_absent(inject, marker, tmp_path: Path):
 
 
 @pytest.mark.parametrize("inject, marker", INJECTORS)
-def test_inject_is_idempotent(inject, marker, tmp_path: Path):
+def test_inject_is_idempotent(inject, marker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    if marker == _RTK_MARKER:
+        monkeypatch.setenv("HEADROOM_RTK", "1")
     target = tmp_path / "AGENTS.md"
     target.write_bytes(_EXISTING)
 

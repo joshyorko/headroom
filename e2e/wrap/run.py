@@ -953,6 +953,9 @@ def main() -> None:
                 "PATH": f"{shim_dir}{os.pathsep}{base_env['PATH']}",
                 "HEADROOM_E2E_LOG_DIR": str(log_dir),
                 "OPENAI_TARGET_API_URL": "http://127.0.0.1:19001/v1",
+                # RTK is opt-in (off by default). These wrap smoke tests assert
+                # RTK-instruction injection, so exercise the RTK-on path.
+                "HEADROOM_RTK": "1",
             }
         )
 

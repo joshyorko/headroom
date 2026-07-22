@@ -11,6 +11,7 @@ No ML dependencies — the model/tokenizer are fakes injected via
 ``_load_kompress``.
 """
 
+import threading
 import time
 
 import pytest
@@ -19,6 +20,8 @@ import headroom.transforms.kompress_compressor as kc
 from headroom.transforms.kompress_compressor import (
     KOMPRESS_ACQUIRE_TIMEOUT_ENV,
     KOMPRESS_CANARY_THRESHOLD_ENV,
+    KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV,
+    KOMPRESS_REQUEST_DEADLINE_ENV,
     KOMPRESS_TIME_BUDGET_ENV,
     KompressCompressor,
     KompressConfig,
@@ -81,6 +84,8 @@ def _reset_module_state(monkeypatch):
         KOMPRESS_ACQUIRE_TIMEOUT_ENV,
         KOMPRESS_TIME_BUDGET_ENV,
         KOMPRESS_CANARY_THRESHOLD_ENV,
+        KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV,
+        KOMPRESS_REQUEST_DEADLINE_ENV,
     ):
         monkeypatch.delenv(env, raising=False)
     yield
@@ -96,6 +101,31 @@ def _make_compressor(monkeypatch, model: FakeModel, **config_kwargs) -> Kompress
         lambda model_id, device="auto", **kwargs: (model, FakeTokenizer(), "onnx"),
     )
     return compressor
+
+
+def _make_block_tracking_semaphore(monkeypatch):
+    blocked = threading.Event()
+
+    class TrackingSemaphore:
+        def __init__(self):
+            self._inner = threading.BoundedSemaphore(1)
+
+        def acquire(self, blocking=True, timeout=None):
+            if not blocking:
+                return self._inner.acquire(blocking=False)
+            if not self._inner.acquire(blocking=False):
+                blocked.set()
+                if timeout is None:
+                    return self._inner.acquire()
+                return self._inner.acquire(timeout=timeout)
+            return True
+
+        def release(self):
+            self._inner.release()
+
+    semaphore = TrackingSemaphore()
+    monkeypatch.setattr(kc, "_execution_semaphore", lambda *_args, **_kwargs: semaphore)
+    return semaphore, blocked
 
 
 CONTENT_40_WORDS = " ".join(f"word{i}" for i in range(40))
@@ -177,6 +207,163 @@ def test_stuck_semaphore_batch_passes_through(monkeypatch):
         stuck.release()
 
     assert [r.compressed for r in results] == contents  # all passthrough, no data loss
+
+
+def test_default_wait_allows_queued_single(monkeypatch):
+    compressor = _make_compressor(monkeypatch, FakeModel())
+    stuck, blocked = _make_block_tracking_semaphore(monkeypatch)
+    assert stuck.acquire(timeout=0)
+    finished = threading.Event()
+    result_holder = {}
+
+    def _run():
+        result_holder["result"] = compressor.compress(CONTENT_40_WORDS)
+        finished.set()
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    released = False
+    try:
+        assert blocked.wait(timeout=1)
+        assert not finished.wait(timeout=0.05)
+        stuck.release()
+        released = True
+        assert finished.wait(timeout=1)
+    finally:
+        if not released:
+            stuck.release()
+        worker.join(timeout=1)
+    assert not worker.is_alive()
+
+    result = result_holder["result"]
+    assert result.compressed != CONTENT_40_WORDS
+    assert result.compressed_tokens == 20
+
+
+def test_default_wait_allows_queued_batch(monkeypatch):
+    compressor = _make_compressor(monkeypatch, FakeModel())
+    monkeypatch.setattr(KompressCompressor, "_should_use_sequential_fallback", lambda self: False)
+    stuck, blocked = _make_block_tracking_semaphore(monkeypatch)
+    assert stuck.acquire(timeout=0)
+    finished = threading.Event()
+    result_holder = {}
+    contents = [CONTENT_40_WORDS, " ".join(f"x{i}" for i in range(30))]
+
+    def _run():
+        result_holder["results"] = compressor.compress_batch(contents)
+        finished.set()
+
+    worker = threading.Thread(target=_run)
+    worker.start()
+    released = False
+    try:
+        assert blocked.wait(timeout=1)
+        assert not finished.wait(timeout=0.05)
+        stuck.release()
+        released = True
+        assert finished.wait(timeout=1)
+    finally:
+        if not released:
+            stuck.release()
+        worker.join(timeout=1)
+    assert not worker.is_alive()
+
+    results = result_holder["results"]
+    assert [result.compressed_tokens for result in results] == [20, 15]
+
+
+def test_default_max_concurrent():
+    assert kc._default_max_concurrent("onnx", "onnx") == 1
+    assert kc._default_max_concurrent("pytorch", "cpu") == 1
+    assert kc._default_max_concurrent("pytorch", "cuda") == 1
+
+
+def test_execution_wait_budget(monkeypatch):
+    assert kc._execution_wait_budget_seconds() == 3.0
+
+    monkeypatch.setenv(KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV, "bogus")
+    assert kc._execution_wait_budget_seconds() == 3.0
+
+    monkeypatch.setenv(KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV, "-1")
+    assert kc._execution_wait_budget_seconds() == 0.0
+
+
+def test_request_deadline_caps_default_wait_single(monkeypatch):
+    monkeypatch.setenv(KOMPRESS_REQUEST_DEADLINE_ENV, "10")
+    model = FakeModel()
+    compressor = _make_compressor(monkeypatch, model)
+    stuck = kc._execution_semaphore("onnx", "onnx")
+    assert stuck.acquire(timeout=0)
+    try:
+        started = time.monotonic()
+        result = compressor.compress(CONTENT_40_WORDS)
+        elapsed = time.monotonic() - started
+    finally:
+        stuck.release()
+
+    assert elapsed < 0.2
+    assert result.compressed == CONTENT_40_WORDS
+    assert model.calls == 0
+
+
+def test_request_deadline_caps_default_wait_batch(monkeypatch):
+    monkeypatch.setenv(KOMPRESS_REQUEST_DEADLINE_ENV, "10")
+    model = FakeModel()
+    compressor = _make_compressor(monkeypatch, model)
+    monkeypatch.setattr(KompressCompressor, "_should_use_sequential_fallback", lambda self: False)
+    stuck = kc._execution_semaphore("onnx", "onnx")
+    assert stuck.acquire(timeout=0)
+    contents = [CONTENT_40_WORDS, " ".join(f"x{i}" for i in range(30))]
+    try:
+        started = time.monotonic()
+        results = compressor.compress_batch(contents)
+        elapsed = time.monotonic() - started
+    finally:
+        stuck.release()
+
+    assert elapsed < 0.2
+    assert [r.compressed for r in results] == contents
+    assert model.calls == 0
+
+
+def test_carried_deadline_reaches_single_to_batch(monkeypatch):
+    monkeypatch.setenv(KOMPRESS_REQUEST_DEADLINE_ENV, "10")
+    model = FakeModel()
+    compressor = _make_compressor(monkeypatch, model)
+    load_state = {"calls": 0}
+
+    def fake_clock():
+        return 999.0 if load_state["calls"] >= 1 else 0.0
+
+    def fake_load(*_args, **_kwargs):
+        load_state["calls"] += 1
+        return model, FakeTokenizer(), "onnx"
+
+    monkeypatch.setattr(kc.time, "perf_counter", fake_clock)
+    monkeypatch.setattr(kc, "_load_kompress", fake_load)
+    monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: False)
+
+    result = compressor.compress(CONTENT_40_WORDS)
+
+    assert result.compressed == CONTENT_40_WORDS
+    assert model.calls == 0
+
+
+def test_carried_deadline_reaches_sequential_fallback(monkeypatch):
+    monkeypatch.setenv(KOMPRESS_REQUEST_DEADLINE_ENV, "10")
+    model = FakeModel()
+    compressor = _make_compressor(monkeypatch, model, chunk_words=40)
+    monkeypatch.setattr(kc.time, "perf_counter", lambda: 999.0 if model.calls >= 1 else 0.0)
+    monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: True)
+    contents = [CONTENT_40_WORDS, " ".join(f"x{i}" for i in range(30))]
+
+    results = compressor.compress_batch(contents)
+
+    assert results[0].compressed != contents[0]
+    assert results[1].compressed == contents[1]
+    assert model.calls == 1
 
 
 def test_acquire_bounded_unbounded_when_both_disabled():

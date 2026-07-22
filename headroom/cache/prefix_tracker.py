@@ -379,16 +379,29 @@ def normalize_message_cache_control(
     ``messages`` and are left untouched (they still count toward the 4 limit, so
     holding messages to one breakpoint leaves room for them).
 
+    Headroom owns WHERE the breakpoint goes; the client still owns WHAT it says:
+    the re-placed marker reuses the newest client marker verbatim, so an explicit
+    ``ttl`` (e.g. ``"1h"``) survives consolidation instead of silently
+    downgrading to the 5-minute default (#2375).
+
     Only block-style (list) content can carry cache_control; string content is
     left as-is. Returns the input unchanged when there is nothing to normalize.
     """
     changed = False
     out: list[dict[str, Any]] = []
     last_block_idx = -1
+    last_marker: dict[str, Any] | None = None
     for i, msg in enumerate(messages):
         content = msg.get("content") if isinstance(msg, dict) else None
         if isinstance(content, list):
-            had = any(isinstance(b, dict) and "cache_control" in b for b in content)
+            had = False
+            for b in content:
+                if isinstance(b, dict) and "cache_control" in b:
+                    had = True
+                    # The newest marker in message order is the client's current
+                    # intent (older ones are replay leftovers) — keep it.
+                    if isinstance(b["cache_control"], dict):
+                        last_marker = b["cache_control"]
             stripped = [
                 {k: v for k, v in b.items() if k != "cache_control"} if isinstance(b, dict) else b
                 for b in content
@@ -403,7 +416,8 @@ def normalize_message_cache_control(
     if last_block_idx >= 0:
         msg = out[last_block_idx]
         content = list(msg["content"])
-        content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+        marker = dict(last_marker) if last_marker else {"type": "ephemeral"}
+        content[-1] = {**content[-1], "cache_control": marker}
         out[last_block_idx] = {**msg, "content": content}
         changed = True
     return out if changed else messages

@@ -108,6 +108,78 @@ def test_install_apply_help_lists_no_http2() -> None:
     assert "--no-http2" in result.output
 
 
+def test_capture_passthrough_env_skips_empty_and_unrelated() -> None:
+    from headroom.cli.install import _capture_passthrough_env
+
+    captured = _capture_passthrough_env(
+        {
+            "ANTHROPIC_TARGET_API_URL": "https://gw.example/v1",
+            "OPENAI_TARGET_API_URL": "",  # unset-equivalent, must be skipped
+            "SOME_UNRELATED_VAR": "x",
+        }
+    )
+
+    assert captured == {"ANTHROPIC_TARGET_API_URL": "https://gw.example/v1"}
+
+
+def _apply_capturing_build_manifest(monkeypatch) -> dict[str, object]:
+    """Stub install-apply side effects and return the captured build_manifest kwargs."""
+    captured: dict[str, object] = {}
+
+    class Manifest:
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        targets = ["claude"]
+        mutations: list[object] = []
+        artifacts: list[object] = []
+
+    def fake_build_manifest(**kwargs):
+        captured.update(kwargs)
+        return Manifest()
+
+    monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
+    monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+    )
+    return captured
+
+
+def test_install_apply_captures_target_api_url_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_TARGET_API_URL", "https://gateway.internal/v1")
+    captured = _apply_capturing_build_manifest(monkeypatch)
+
+    result = CliRunner().invoke(main, ["install", "apply"])
+
+    assert result.exit_code == 0, result.output
+    # The exported gateway URL rode into the manifest env so the supervised
+    # proxy forwards there instead of the public Anthropic endpoint (#2240).
+    assert captured["extra_env"]["ANTHROPIC_TARGET_API_URL"] == "https://gateway.internal/v1"
+
+
+def test_install_apply_explicit_env_overrides_captured(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_TARGET_API_URL", "https://auto.internal/v1")
+    captured = _apply_capturing_build_manifest(monkeypatch)
+
+    result = CliRunner().invoke(
+        main,
+        ["install", "apply", "--env", "ANTHROPIC_TARGET_API_URL=https://explicit.internal/v1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    # An explicit --env must win over the auto-captured value.
+    assert captured["extra_env"]["ANTHROPIC_TARGET_API_URL"] == "https://explicit.internal/v1"
+
+
 def test_install_status_includes_backend_from_health_probe(monkeypatch) -> None:
     runner = CliRunner()
 

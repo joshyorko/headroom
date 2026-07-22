@@ -177,8 +177,7 @@ class MemoryHandler:
     - Native tool: Anthropic's memory_20250818 built-in tool (experimental)
     """
 
-    # Cosine similarity thresholds for dedup
-    DEDUP_AUTO_THRESHOLD = 0.92  # Auto-supersede (same fact, different wording)
+    # Cosine similarity threshold for dedup hints
     DEDUP_HINT_THRESHOLD = 0.75  # Suggest merge to LLM (related, possibly duplicate)
 
     def __init__(self, config: MemoryConfig, agent_type: str = "unknown") -> None:
@@ -569,7 +568,7 @@ class MemoryHandler:
         # Check which tools are already present
         existing_names: set[str] = set()
         for tool in tools:
-            name = tool.get("name") or tool.get("function", {}).get("name")
+            name = tool.get("name") or (tool.get("function") or {}).get("name")
             if name:
                 existing_names.add(name)
 
@@ -1050,7 +1049,9 @@ your responses, not to drive new actions."""
         """Check if response contains memory tool calls."""
         tool_calls = self._extract_tool_calls(response, provider)
         for tc in tool_calls:
-            name = tc.get("name") or tc.get("function", {}).get("name")
+            # Coalesce `function` with `or {}` so an explicit {"function": null}
+            # on a malformed/partial upstream tool call doesn't crash detection.
+            name = tc.get("name") or (tc.get("function") or {}).get("name")
             # Check for both custom and native memory tools
             if name in MEMORY_TOOL_NAMES or name == NATIVE_MEMORY_TOOL_NAME:
                 return True
@@ -1117,7 +1118,11 @@ your responses, not to drive new actions."""
         results: list[dict[str, Any]] = []
 
         for tc in tool_calls:
-            tool_name = tc.get("name") or tc.get("function", {}).get("name")
+            # `tc.get("function", {})` returns None for an explicit
+            # {"function": null} (the default only applies to a missing key), so
+            # the following `.get` would raise AttributeError on a malformed /
+            # partial upstream tool call. Coalesce to {}.
+            tool_name = tc.get("name") or (tc.get("function") or {}).get("name")
             tool_id = tc.get("id") or tc.get("call_id", "")
 
             # Parse input data
@@ -1126,7 +1131,9 @@ your responses, not to drive new actions."""
             else:
                 # Chat Completions format: function.arguments
                 # Responses API format: arguments (top-level string)
-                args_str = tc.get("arguments") or tc.get("function", {}).get("arguments") or "{}"
+                args_str = (
+                    tc.get("arguments") or (tc.get("function") or {}).get("arguments") or "{}"
+                )
                 try:
                     input_data = json.loads(args_str)
                 except json.JSONDecodeError:
@@ -1207,7 +1214,7 @@ your responses, not to drive new actions."""
         provider: str = "anthropic",
         request_context: RequestContext | None = None,
     ) -> str:
-        """Execute memory_save tool with provenance, dedup hints, and async background dedup."""
+        """Execute memory_save tool with provenance and dedup hints."""
         content = input_data.get("content", "")
         if not content:
             return json.dumps({"status": "error", "error": "content is required"})
@@ -1249,7 +1256,8 @@ your responses, not to drive new actions."""
             metadata=provenance_metadata,
         )
 
-        # Search for similar existing memories (for hints + async dedup)
+        # Search for similar existing memories so the caller can decide whether
+        # to merge them through the explicit memory_update path.
         similar_memories = []
         try:
             results = await backend.search_memories(
@@ -1286,12 +1294,6 @@ your responses, not to drive new actions."""
                 f"or ignore if these are distinct facts."
             )
 
-        # Async background dedup: auto-supersede obvious duplicates
-        if similar_memories:
-            asyncio.create_task(
-                self._background_dedup(memory.id, similar_memories, effective_user_id, backend)
-            )
-
         logger.info(
             "event=memory_save user=%s scope=%s agent=%s provider=%s similar=%d",
             effective_user_id,
@@ -1302,51 +1304,6 @@ your responses, not to drive new actions."""
         )
 
         return json.dumps(result)
-
-    async def _background_dedup(
-        self,
-        new_memory_id: str,
-        similar_results: list[Any],
-        user_id: str,
-        backend: Any | None = None,
-    ) -> None:
-        """Auto-supersede obvious duplicates in background (fire-and-forget).
-
-        If an existing memory has >0.92 cosine similarity to the new one,
-        mark the older one as superseded. This runs asynchronously and
-        never blocks the tool response.
-
-        ``backend`` defaults to the legacy ``self._backend`` so existing
-        non-routed callers keep working; routed callers pass the same
-        per-project backend they wrote to so dedup never crosses
-        workspaces.
-        """
-        target = backend if backend is not None else self._backend
-        if target is None:
-            return
-        try:
-            for result in similar_results:
-                if result.score < self.DEDUP_AUTO_THRESHOLD:
-                    continue
-                if result.memory.id == new_memory_id:
-                    continue
-
-                old = result.memory
-                # Skip if already superseded
-                if old.metadata.get("superseded_by"):
-                    continue
-
-                # Mark old memory as superseded by deleting it
-                # (update_memory creates a new version — for dedup we just remove the duplicate)
-                if hasattr(target, "delete_memory"):
-                    await target.delete_memory(old.id)
-                    logger.info(
-                        f"Memory dedup: removed '{old.content[:50]}' "
-                        f"(superseded by {new_memory_id}, {result.score:.2f} cosine, "
-                        f"agent={old.metadata.get('source_agent', '?')})"
-                    )
-        except Exception as e:
-            logger.warning(f"Memory background dedup failed: {e}")
 
     async def _execute_search(
         self,

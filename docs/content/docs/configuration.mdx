@@ -280,7 +280,7 @@ headroom proxy --learn --min-evidence 3
 |----------|-------------|---------|
 | `HEADROOM_HOST` | Proxy bind host | `127.0.0.1` |
 | `HEADROOM_PORT` | Proxy bind port | `8787` |
-| `HEADROOM_MODE` | Proxy optimization mode: `token` or `cache` | `token` |
+| `HEADROOM_MODE` | Proxy optimization mode: `token` or `cache` | `cache` |
 | `HEADROOM_WORKERS` | Uvicorn worker count | `1` |
 | `HEADROOM_LIMIT_CONCURRENCY` | Maximum concurrent connections before 503 | `1000` |
 | `HEADROOM_MAX_CONNECTIONS` | Maximum upstream HTTP connections | `500` |
@@ -288,7 +288,7 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_KEEPALIVE_EXPIRY` | Seconds an idle upstream keep-alive connection is kept open | `90` |
 | `HEADROOM_HTTP_PROXY` | HTTP proxy URL for upstream provider requests only; HTTPS provider APIs use CONNECT | -- |
 | `HEADROOM_BUDGET` | Daily budget limit in USD | -- |
-| `HEADROOM_TELEMETRY` | Set to `on` to opt in to anonymous telemetry | `off` (opt-in) |
+| `HEADROOM_TELEMETRY` | Set to `on` for **local-only** usage stats (powers your own `/stats` and dashboard; nothing is sent externally) | `off` |
 | `HEADROOM_STATELESS` | Set to `true` to disable filesystem writes | `false` |
 | `HEADROOM_MODEL_LIMITS` | Custom model config (JSON string or file path) | -- |
 | `HEADROOM_BASE_URL` | Base URL of the Headroom proxy (TypeScript SDK) | `http://localhost:8787` |
@@ -298,7 +298,6 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_SAVINGS_PATH` | Override persistent savings file location. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
 | `HEADROOM_TOIN_PATH` | Override TOIN telemetry file location. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
 | `HEADROOM_SUBSCRIPTION_STATE_PATH` | Override subscription tracker state file. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
-| `HEADROOM_TELEMETRY` | Set to `on` to opt in to anonymous telemetry | `off` |
 | `HEADROOM_PERIODIC_TOIN_STATS` | Controls periodic TOIN stats logging in long-lived proxy workers. Set to `0`, `false`, `off`, or `no` to disable the 5-minute stats loop without disabling TOIN learning or request-time feedback. | `true` |
 | `HEADROOM_MEMORY_INJECTION_MODE` | Memory-context routing mode: `live_zone_tail` (default) or `disabled`. The legacy `system_prompt` mode was retired by PR-A2; supplying it raises. | `live_zone_tail` |
 | `HEADROOM_PROXY_PYTHON_FORWARDER_MODE` | Python forwarder serialization mode. `byte_faithful` (default) forwards original request bytes verbatim when no transform mutated the body and re-serializes canonically only when needed — keeps Anthropic prompt-cache hit-rate intact. `legacy_json_kwarg` is an explicit operator opt-in for emergency rollback to the historical `httpx ... json=body` behavior. NOT a fallback — only flip on explicit operator decision. | `byte_faithful` |
@@ -369,7 +368,7 @@ precedence rules: explicit argument > per-resource env var > derived
 from canonical root > default. Every legacy env var continues to work
 unchanged.
 
-See the **[Filesystem Contract](https://github.com/chopratejas/headroom/blob/main/wiki/filesystem-contract.md)**
+See the **[Filesystem Contract](https://github.com/headroomlabs-ai/headroom/blob/main/wiki/filesystem-contract.md)**
 page for the full bucket table, plugin-author guidance, and the Docker
 naming overlap note (`HEADROOM_WORKSPACE` is *not* the same as
 `HEADROOM_WORKSPACE_DIR`).

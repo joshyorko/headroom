@@ -443,6 +443,15 @@ class StreamingMixin:
                     # signature validation to pass.
                     if "data" in block:
                         current_block["data"] = block["data"]
+                elif btype:
+                    # Non-standard block (server_tool_use, web_search_tool_result,
+                    # ...): copy through all of the block's fields so the
+                    # reconstruction doesn't silently drop them to a bare
+                    # {type, index}. Mirrors the sibling reconstructor
+                    # `_reconstruct_anthropic_response`, which does `dict(block)`.
+                    for _k, _v in block.items():
+                        if _k != "type":
+                            current_block[_k] = _v
                 blocks_by_index[block_index] = current_block
 
             elif event_type == "content_block_delta":
@@ -485,13 +494,20 @@ class StreamingMixin:
                 idx = data.get("index")
                 target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
                 if target is not None:
-                    # Parse accumulated JSON for tool_use blocks.
-                    if target.get("type") == "tool_use" and "_partial_json" in target:
+                    # Parse accumulated JSON into `input` for any block that
+                    # streamed `input_json_delta` — tool_use AND server_tool_use
+                    # (and future tool-ish blocks). Gating on the block type
+                    # missed server_tool_use, leaving its `input` at the empty
+                    # start-event value and leaking the `_partial_json` scratch
+                    # key into replayed assistant history, which Anthropic then
+                    # rejects with `server_tool_use.input: Input should be an
+                    # object` (#2438). Always strip the scratch key.
+                    if "_partial_json" in target:
+                        raw = target.pop("_partial_json")
                         try:
-                            target["input"] = json.loads(target["_partial_json"])
+                            target["input"] = json.loads(raw) if raw else {}
                         except json.JSONDecodeError:
                             target["input"] = {}
-                        del target["_partial_json"]
                     # Materialize the thinking buffer into the
                     # canonical `thinking` field expected by the
                     # Anthropic API.
@@ -549,8 +565,17 @@ class StreamingMixin:
         }
         events.append(f"event: message_start\ndata: {json.dumps(msg_start)}\n\n".encode())
 
-        # Content blocks
-        for idx, block in enumerate(response.get("content", [])):
+        # Content blocks. `content` is provider/reconstruction-controlled, so a
+        # present-but-null value or a non-list would crash `enumerate`, and a
+        # non-dict element would crash `block.get(...)`. Guard both, matching the
+        # sibling `_record_ccr_feedback_from_response` below. This is reached from
+        # a call site (anthropic.py buffered CCR path) that only catches
+        # ValueError, so an unguarded TypeError/AttributeError would 500 the
+        # streamed request.
+        content = response.get("content")
+        for idx, block in enumerate(content if isinstance(content, list) else []):
+            if not isinstance(block, dict):
+                continue
             # content_block_start
             if block.get("type") == "text":
                 block_start = {
@@ -664,10 +689,13 @@ class StreamingMixin:
             msg_delta_payload["stop_reason"] = response["stop_reason"]
         if "stop_details" in response:
             msg_delta_payload["stop_details"] = response["stop_details"]
+        usage = response.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
         msg_delta = {
             "type": "message_delta",
             "delta": msg_delta_payload,
-            "usage": {"output_tokens": response.get("usage", {}).get("output_tokens", 0)},
+            "usage": {"output_tokens": usage.get("output_tokens", 0)},
         }
         events.append(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode())
 

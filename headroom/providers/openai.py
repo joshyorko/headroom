@@ -460,6 +460,16 @@ class OpenAIProvider(Provider):
 
         Never raises an exception - uses sensible defaults for unknown models.
         """
+        # Explicitly configured limits win first. Behind a gateway/alias proxy
+        # (Kong, LiteLLM, ...) Headroom sees the raw client model name
+        # (e.g. "claude-opus"), which litellm.get_model_info can't resolve, so
+        # resolution would fall through to the 128K default + an "Unknown model"
+        # warning and skew compression. Configuring the alias via
+        # HEADROOM_MODEL_LIMITS / ~/.headroom/models.json makes it authoritative
+        # here, before the dynamic LiteLLM lookup. Fail-soft, no network.
+        if model in self._context_limits:
+            return self._context_limits[model]
+
         # Try LiteLLM first
         litellm = _get_litellm_module()
         if litellm is not None:

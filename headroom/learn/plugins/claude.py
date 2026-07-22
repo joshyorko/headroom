@@ -82,9 +82,9 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
             name = _project_display_name(project_path, entry.name)
 
             context_file = None
-            if project_path.exists():
+            if _path_exists(project_path):
                 claude_md = project_path / "CLAUDE.md"
-                if claude_md.exists():
+                if _path_exists(claude_md):
                     context_file = claude_md
 
             memory_dir = entry / "memory"
@@ -208,7 +208,12 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 
                     if line_type == "assistant":
                         self._extract_tool_uses(d, tool_uses)
-                        usage = d.get("message", {}).get("usage", {})
+                        # `get("message", {})` returns None for an explicit
+                        # {"message": null} line (the default only applies to a
+                        # missing key); `.get` on None then raises AttributeError,
+                        # which the OSError/UnicodeDecodeError guard does not catch
+                        # — so one malformed line crashed the whole learn run.
+                        usage = (d.get("message") or {}).get("usage", {})
                         total_input_tokens += usage.get("input_tokens", 0)
                         total_input_tokens += usage.get("cache_read_input_tokens", 0)
                         total_input_tokens += usage.get("cache_creation_input_tokens", 0)
@@ -237,7 +242,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 
     def _extract_tool_uses(self, d: dict, tool_uses: dict[str, tuple[str, dict]]) -> None:
         """Extract tool_use blocks from an assistant message."""
-        msg = d.get("message", {})
+        msg = d.get("message") or {}
         content = msg.get("content", [])
         if not isinstance(content, list):
             return
@@ -261,7 +266,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
         timestamp: str | None = None,
     ) -> None:
         """Extract tool_result blocks from a user message and match to tool_uses."""
-        msg = d.get("message", {})
+        msg = d.get("message") or {}
         content = msg.get("content", [])
         if not isinstance(content, list):
             return
@@ -327,7 +332,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
         timestamp: str | None = None,
     ) -> None:
         """Extract user text messages and interruptions from a user line."""
-        msg = d.get("message", {})
+        msg = d.get("message") or {}
         content = msg.get("content", "")
 
         if isinstance(content, str) and content.strip():
@@ -363,6 +368,23 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 # =============================================================================
 
 
+def _path_exists(path: Path) -> bool:
+    """Like ``Path.exists()`` but treats an unreadable path as absent.
+
+    ``_decode_project_path`` probes speculative candidate paths (e.g.
+    ``/home/marco/rocha`` when reconstructing ``/home/marco-rocha/...``). A
+    candidate can collide with another user's directory whose parent isn't
+    stat-able, and ``Path.exists()`` calls ``os.stat`` which then raises
+    ``PermissionError`` instead of returning ``False`` — crashing the whole
+    ``learn`` command (issue #2443). Match ``_greedy_path_decode``'s existing
+    ``OSError`` handling and treat any such error as "does not exist".
+    """
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
 def _decode_windows_path(drive: str, parts: list[str]) -> Path | None:
     """Reconstruct a Windows path from drive letter + dash-split tokens.
 
@@ -373,10 +395,10 @@ def _decode_windows_path(drive: str, parts: list[str]) -> Path | None:
     if not tokens:
         return None
     win_path = Path(f"{drive}:\\" + "\\".join(tokens))
-    if win_path.exists():
+    if _path_exists(win_path):
         return win_path
     drive_root = Path(f"{drive}:\\")
-    if drive_root.exists():
+    if _path_exists(drive_root):
         result = _greedy_path_decode(drive_root, tokens)
         if result:
             return result
@@ -406,7 +428,7 @@ def _decode_project_path(escaped_name: str) -> Path | None:
         return None
 
     simple = Path("/" + escaped_name[1:].replace("-", "/"))
-    if simple.exists():
+    if _path_exists(simple):
         return simple
 
     if len(parts) < 3:
@@ -440,9 +462,9 @@ def _project_display_name(project_path: Path, fallback: str) -> str:
 def _greedy_path_decode(base: Path, parts: list[str]) -> Path | None:
     """Greedily decode remaining path parts using real child directories."""
     if not parts:
-        return base if base.exists() else None
+        return base if _path_exists(base) else None
 
-    if not base.exists() or not base.is_dir():
+    if not _path_exists(base) or not base.is_dir():
         return None
 
     try:

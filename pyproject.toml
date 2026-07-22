@@ -57,7 +57,12 @@ dependencies = [
     "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
-    "ast-grep-cli>=0.30.0",       # AST-aware code slicing (CodeCompressor); binary wheel
+    # AST-aware code slicing (CodeCompressor); binary wheel. 0.44.1 is excluded:
+    # that PyPI release was a compromised supply-chain build shipping an
+    # info-stealer `sg.exe` (Trojan:Win64/Lazy!MTB) alongside the real binary
+    # (GH #2332). The `!=` keeps every other release installable, including a
+    # future patched one.
+    "ast-grep-cli>=0.30.0,!=0.44.1",
     "pyyaml>=6.0",                # omp wrap: parse/merge omp's models.yml registry
     "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
     "tomlkit>=0.13.0,<1.0",       # Loss-minimizing Codex config recovery
@@ -73,7 +78,7 @@ proxy = [
     "orjson>=3.9.14; platform_python_implementation != 'PyPy'",
     "httpx[http2]>=0.24.0",
     "openai>=2.14.0",             # OpenAI API format support
-    "mcp>=1.0.0",                 # MCP server (headroom_compress, retrieve, stats)
+    "mcp>=1.28.1",                 # MCP server (headroom_compress, retrieve, stats)
     "magika>=0.6.0",              # ML content detection for ContentRouter
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
@@ -114,19 +119,27 @@ ml = [
     # strands-agents`) drags huggingface-hub backwards.
     "huggingface-hub>=1.5.0,<2.0",
 ]
-# Memory system (hierarchical memory with vector search)
+# Memory system (hierarchical memory with vector search).
+# Uses the pure-Python sqlite-vec backend by default (VectorBackend.AUTO ->
+# SQLITE_VEC), so no C++ toolchain is required. The optional HNSW backend lives
+# in the [vector] extra below; installing it here would make `[all]` (which pulls
+# [memory]) fail on any machine without a compiler — see #1368.
 memory = [
-    "hnswlib>=0.8.0",
     "sqlite-vec>=0.1.6",
     "sentence-transformers>=2.2.0,<6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
+# Optional HNSW vector backend. Needs a C++ toolchain to build hnswlib, so it is
+# kept out of [memory] and [all]; opt in with `pip install headroom-ai[vector]`
+# and select it via MemoryConfig(vector_backend=VectorBackend.HNSW). The default
+# sqlite-vec backend needs no compiler.
+vector = [
+    "hnswlib>=0.8.0",
+]
 # Qdrant + Neo4j memory backend helpers
 memory-stack = [
-    "mem0ai>=1.0.0,<2.0",
+    "mem0ai>=2.0.0,<3.0",
     "qdrant-client>=1.9.0,<2.0",
     "neo4j>=5.20.0,<7.0",
-    "langchain-neo4j>=0.10.0,<1.0",
-    "rank-bm25>=0.2.2,<1.0",
 ]
 # Apple-Silicon GPU (MPS) offload for the memory embedder. Opt in at runtime with
 # HEADROOM_EMBEDDER_RUNTIME=pytorch_mps. macOS-only; intentionally excluded from [all].
@@ -212,7 +225,7 @@ autogen = [
 ]
 # MCP server for Claude Code integration
 mcp = [
-    "mcp>=1.0.0",
+    "mcp>=1.28.1",
     "httpx>=0.24.0",
     "starlette>=0.27.0",
     "uvicorn>=0.23.0,<1.0",
@@ -240,7 +253,13 @@ evals = [
 ]
 # AWS Bedrock backend
 bedrock = [
-    "boto3>=1.28.0",
+    # `aws login` (IAM Identity Provider / console-login, DPoP) requires
+    # boto3 >= 1.41.0 AND the AWS Common Runtime (CRT) per AWS docs
+    # ("Boto3 1.41.0 or later with CRT"). CRT is a separate install — pull it
+    # via the botocore [crt] extra (awscrt). Without it, resolving `aws login`
+    # credentials raises botocore's MissingDependencyException.
+    "boto3>=1.41.0",
+    "botocore[crt]>=1.41.0",
 ]
 # HTML content extraction
 html = [
@@ -251,7 +270,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff>=0.1.0",
+    "ruff==0.15.17",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "openai>=1.0.0",

@@ -69,6 +69,28 @@ def _scrub_developer_headroom_env(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
 
 
+# The Copilot "routed to Copilot" flag is a module-global ContextVar that
+# build_copilot_upstream_url() sets as a side effect. Unit tests that call that
+# builder directly (or otherwise run in the shared root context) would leave it
+# set and mislabel a later test's request outcome as "copilot". Reset it around
+# every test so build-time side effects can't leak between tests.
+@pytest.fixture(autouse=True)
+def _reset_copilot_routing_flag():
+    # The macos/windows-native-wrapper CI jobs run the installer tests with only
+    # pytest installed (no headroom): they drive the installer shell scripts via
+    # subprocess, so headroom isn't importable and there's no routing flag to
+    # reset. Skip the reset there instead of erroring at setup.
+    try:
+        from headroom.copilot_auth import reset_request_routed_to_copilot
+    except ModuleNotFoundError:
+        yield
+        return
+
+    reset_request_routed_to_copilot()
+    yield
+    reset_request_routed_to_copilot()
+
+
 # =============================================================================
 # Global test hooks
 # =============================================================================

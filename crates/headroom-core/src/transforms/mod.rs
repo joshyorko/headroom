@@ -55,7 +55,8 @@ pub use magika_detector::{magika_detect, map_magika_label, MagikaDetectorError};
 pub use pipeline::{
     CompressionContext, CompressionPipeline, CompressionPipelineBuilder, DiffNoise, DiffOffload,
     JsonMinifier, JsonOffload, LogOffload, LogTemplate, OffloadOutput, OffloadTransform,
-    PipelineConfig, PipelineResult, ReformatOutput, ReformatTransform, TransformError,
+    PipelineConfig, PipelineResult, ProseFieldOffload, ReformatOutput, ReformatTransform,
+    TransformError,
 };
 pub use recommendations::{Recommendation, RecommendationStore, RECOMMENDATIONS_PATH_ENV_VAR};
 pub use safety::{tool_pair_indices, ToolPair};

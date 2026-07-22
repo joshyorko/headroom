@@ -348,6 +348,86 @@ class TestCompressEndpointCompression:
         assert outcome.tokens_saved == 0
 
 
+class TestCompressEndpointLossyInlineMode:
+    """config.mode="lossy_inline" must compress losslessly-then-lossily but emit
+    NO CCR marker / retrieval round-trip, so the output is safe to forward
+    straight to a provider (Kong-sidecar use case)."""
+
+    def _big_tool_message(self):
+        large_data = json.dumps(
+            [
+                {
+                    "id": i,
+                    "name": f"Item {i}",
+                    "description": f"Detailed description for item {i}. "
+                    f"Status active, created 2024-01-{(i % 28) + 1:02d}, "
+                    f"category=electronics, price={i * 10.99:.2f}, stock={i * 5}.",
+                    "tags": ["electronics", "sale", "featured", "new-arrival"],
+                }
+                for i in range(200)
+            ]
+        )
+        return [
+            {"role": "user", "content": "What items are available?"},
+            {"role": "tool", "tool_call_id": "call_1", "content": large_data},
+            {"role": "user", "content": "Summarize them."},
+        ]
+
+    @pytest.fixture
+    def client(self):
+        # disable_kompress keeps the real ONNX model out of the test: marker
+        # suppression is exercised by SmartCrusher (pure-Python) regardless, and
+        # the mode inherits enable_kompress from config so this stays fast.
+        config = ProxyConfig(
+            optimize=True,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            disable_kompress=True,
+        )
+        app = create_app(config)
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as c:
+            yield c
+
+    def test_lossy_inline_emits_no_ccr_markers(self, client):
+        messages = self._big_tool_message()
+        response = client.post(
+            "/v1/compress",
+            json={"messages": messages, "model": "gpt-4", "config": {"mode": "lossy_inline"}},
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        # Core guarantee: no CCR markers anywhere — no store/retrieval needed.
+        assert data["ccr_hashes"] == []
+        blob = json.dumps(data["messages"])
+        assert "<<ccr:" not in blob
+        assert "Retrieve more: hash=" not in blob
+        assert "Retrieve original: hash=" not in blob
+
+        # Real compression happened. These guard against a fail-open-to-zero
+        # (e.g. a content-detector hang tripping the executor timeout) passing
+        # vacuously as 0 <= 0.
+        assert data["tokens_before"] > 0
+        assert data["tokens_saved"] > 0
+        assert data["tokens_after"] < data["tokens_before"]
+        assert data["tokens_saved"] == data["tokens_before"] - data["tokens_after"]
+
+    def test_lossless_then_lossy_alias(self, client):
+        """The spelled-out alias selects the same mode."""
+        messages = self._big_tool_message()
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": messages,
+                "model": "gpt-4",
+                "config": {"mode": "lossless_then_lossy"},
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["ccr_hashes"] == []
+
+
 class TestCompressEndpointDoesNotBlockLoop:
     """/v1/compress must offload to the compression executor so a slow/large
     payload cannot freeze the single event loop (#718)."""

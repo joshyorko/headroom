@@ -488,7 +488,10 @@ def parse_tool_call(
         name = tool_call.get("name")
         input_data = tool_call.get("input", {})
     elif provider == "openai":
-        function = tool_call.get("function", {})
+        # `get("function", {})` returns None for an explicit {"function": null}
+        # (the default only applies to a missing key), so `.get` below would
+        # raise AttributeError on a malformed/partial tool call. Coalesce to {}.
+        function = tool_call.get("function") or {}
         name = function.get("name")
         # OpenAI passes args as JSON string
         args_str = function.get("arguments", "{}")
@@ -500,7 +503,8 @@ def parse_tool_call(
             input_data = {}
     elif provider == "google":
         # Google/Gemini format: {"functionCall": {"name": "...", "args": {...}}}
-        function_call = tool_call.get("functionCall", {})
+        # Coalesce to {} so an explicit {"functionCall": null} does not crash.
+        function_call = tool_call.get("functionCall") or {}
         name = function_call.get("name")
         input_data = function_call.get("args", {})
     elif provider == "openai_responses":

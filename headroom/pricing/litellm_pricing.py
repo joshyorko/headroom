@@ -8,6 +8,9 @@ See: https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_windo
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,15 +43,65 @@ except ImportError:
 
 _resolved_model_cache: dict[str, str] = {}
 
+logger = logging.getLogger("headroom.pricing")
+
+# --- Gateway model-name resolution ---------------------------------------
+# When Headroom sits behind a gateway (Kong, LiteLLM, ...) that aliases model
+# names, the raw client name it sees (e.g. "claude-opus") is not a priced key
+# in litellm.model_cost, so dollar savings read $0. HEADROOM_MODEL_ALIAS_MAP is
+# an optional, gateway-agnostic, fail-soft static JSON map {client_name: target}
+# that reduces that name to a priced model_cost key (trying the target as-is and
+# with a bedrock/ or vertex_ai/ provider prefix stripped). Unset -> behavior is
+# identical to today's bare-prefix resolution; pricing never breaks.
+_GATEWAY_PROVIDER_PREFIXES = ("bedrock/", "vertex_ai/")
+
+
+def _static_alias_map() -> dict[str, str]:
+    raw = os.environ.get("HEADROOM_MODEL_ALIAS_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        logger.debug("invalid HEADROOM_MODEL_ALIAS_MAP JSON", exc_info=True)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if k and v}
+
+
+def _reduce_to_priced_key(target: str) -> str | None:
+    """Reduce a gateway target to a priced litellm.model_cost key, or None."""
+    if not LITELLM_AVAILABLE or litellm is None:
+        return None
+    candidates = [target]
+    for prefix in _GATEWAY_PROVIDER_PREFIXES:
+        if target.startswith(prefix):
+            candidates.append(target[len(prefix) :])
+    for candidate in candidates:
+        info = litellm.model_cost.get(candidate)
+        if info and info.get("input_cost_per_token") is not None:
+            return candidate
+    return None
+
 
 def resolve_litellm_model(model: str) -> str:
     """Resolve model name to one LiteLLM recognizes, adding provider prefix if needed.
     Results are cached per model name to avoid blocking the event loop
     with repeated synchronous litellm lookups.
+
+    When HEADROOM_MODEL_ALIAS_MAP is configured, a raw client name / group alias
+    is first reduced to a priced model_cost key; otherwise this falls through to
+    the bare-prefix rules. Shared by the live (cost.py) and persisted
+    (savings_tracker) pricing paths so both figures price identically.
     """
     if model in _resolved_model_cache:
         return _resolved_model_cache[model]
-    resolved = _resolve_litellm_model_uncached(model)
+    priced: str | None = None
+    alias = _static_alias_map()
+    if alias:
+        priced = _reduce_to_priced_key(alias.get(model, model))
+    resolved = priced if priced is not None else _resolve_litellm_model_uncached(model)
     _resolved_model_cache[model] = resolved
     return resolved
 

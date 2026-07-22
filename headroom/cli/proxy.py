@@ -352,6 +352,20 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--compressor",
+    "compressor",
+    multiple=True,
+    envvar="HEADROOM_COMPRESSORS",
+    help=(
+        "Restrict the active built-in compressors to the named set (opt-in). "
+        "Repeat the flag or pass a comma-separated list; recognized names are "
+        "smart_crusher, kompress, code_aware, search, log, tabular, config, "
+        "html, image. Unselected built-ins are disabled; '*' selects all. "
+        "Omit to keep every compressor enabled (default). "
+        "Env: HEADROOM_COMPRESSORS."
+    ),
+)
+@click.option(
     "--no-subscription-tracking",
     is_flag=True,
     envvar="HEADROOM_NO_SUBSCRIPTION_TRACKING",
@@ -957,6 +971,7 @@ def proxy(
     lossless: bool,
     no_ccr_proactive_expansion: bool,
     proxy_extension: tuple[str, ...],
+    compressor: tuple[str, ...],
     no_subscription_tracking: bool,
     subscription_poll_interval: int | None,
     retry_max_attempts: int | None,
@@ -1242,6 +1257,13 @@ def proxy(
         # both yield ["a", "b", "c"]. None when nothing was supplied.
         proxy_extensions=(
             [part.strip() for chunk in proxy_extension for part in chunk.split(",") if part.strip()]
+            or None
+        ),
+        # Same flatten-and-split shape as proxy_extensions, but a set: order
+        # and duplicates don't matter for a selection. None when nothing was
+        # supplied, which leaves every built-in compressor enabled.
+        compressors=(
+            {part.strip() for chunk in compressor for part in chunk.split(",") if part.strip()}
             or None
         ),
         subscription_tracking_enabled=not no_subscription_tracking,

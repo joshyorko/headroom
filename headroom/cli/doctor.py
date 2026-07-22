@@ -157,6 +157,17 @@ def check_claude_routing(settings_path: Path, port: int) -> CheckResult:
             status=WARN,
             summary=f"could not parse {settings_path}: {exc}",
         )
+    # `json.loads` succeeds on valid non-object JSON (e.g. `[]`, `null`, `42`),
+    # which a hand-edited or reset settings file can contain. `.get` on a
+    # non-dict raises AttributeError, and it is not one of the caught parse
+    # errors above, so it would crash the very command run to diagnose the
+    # broken config. Treat a non-object like an unparseable file.
+    if not isinstance(payload, dict):
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary=f"could not parse {settings_path}: not a JSON object",
+        )
     base_url = ""
     env_block = payload.get("env")
     if isinstance(env_block, dict):
@@ -199,7 +210,10 @@ def check_claude_remote_control_gate(
     if settings_path.exists():
         try:
             payload = json.loads(settings_path.read_text(encoding="utf-8"))
-            env_block = payload.get("env")
+            # Valid non-object JSON (`[]`, `null`, ...) parses fine but has no
+            # `.get`, and AttributeError is not caught below; guard for dict-ness
+            # so a malformed settings file can't crash the gate check.
+            env_block = payload.get("env") if isinstance(payload, dict) else None
             if isinstance(env_block, dict):
                 settings_env = env_block
                 settings_base_url = str(env_block.get("ANTHROPIC_BASE_URL", "") or "")

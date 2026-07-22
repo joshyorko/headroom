@@ -108,6 +108,16 @@ class TestClaudeRouting:
         path.write_text("{not json", encoding="utf-8")
         assert check_claude_routing(path, 8787).status == WARN
 
+    @pytest.mark.parametrize("body", ["[]", "null", "42", '"a string"'])
+    def test_non_object_json_warns(self, tmp_path, body):
+        # Valid JSON that isn't an object parses cleanly, so it slips past the
+        # JSONDecodeError guard; the later payload.get("env") must not crash the
+        # diagnostic command that is being run precisely because the config is
+        # suspect.
+        path = tmp_path / "settings.json"
+        path.write_text(body, encoding="utf-8")
+        assert check_claude_routing(path, 8787).status == WARN
+
     def test_no_env_key_warns(self, tmp_path):
         path = tmp_path / "settings.json"
         path.write_text(json.dumps({"env": {}}), encoding="utf-8")
@@ -171,6 +181,19 @@ class TestClaudeRemoteControlGate:
             encoding="utf-8",
         )
         assert check_claude_remote_control_gate(path, {}) is None
+
+    @pytest.mark.parametrize("body", ["[]", "null", "42"])
+    def test_non_object_settings_does_not_crash(self, tmp_path, body):
+        # A valid-but-non-object settings file parses past the JSONDecodeError
+        # guard; payload.get("env") must not raise AttributeError. The shell env
+        # still drives the gate, so a custom base there still warns.
+        path = tmp_path / "settings.json"
+        path.write_text(body, encoding="utf-8")
+        result = check_claude_remote_control_gate(
+            path, {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}
+        )
+        assert result is not None
+        assert result.status == WARN
 
     def test_api_key_auth_suppresses_warning(self, tmp_path):
         # Issue #1779: a PAYG / API-key session never had Remote Control, so the

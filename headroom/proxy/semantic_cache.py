@@ -52,9 +52,14 @@ class SemanticCache:
         """
         return compute_semantic_cache_key(messages, model, **key_fields)
 
-    async def get(self, messages: list[dict], model: str) -> CacheEntry | None:
+    async def get(
+        self,
+        messages: list[dict],
+        model: str,
+        **key_fields: Any,
+    ) -> CacheEntry | None:
         """Get cached response if exists and not expired."""
-        key = self._compute_key(messages, model)
+        key = self._compute_key(messages, model, **key_fields)
         async with self._lock:
             entry = self._cache.get(key)
 
@@ -79,9 +84,10 @@ class SemanticCache:
         response_body: bytes,
         response_headers: dict[str, str],
         tokens_saved: int = 0,
+        **key_fields: Any,
     ):
         """Cache a response."""
-        key = self._compute_key(messages, model)
+        key = self._compute_key(messages, model, **key_fields)
 
         async with self._lock:
             # If key already exists, remove it first to update position

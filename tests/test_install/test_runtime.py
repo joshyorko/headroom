@@ -457,15 +457,22 @@ def test_run_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> Non
 
     monkeypatch.setattr("headroom.install.runtime.resolve_headroom_command", lambda: ["headroom"])
     monkeypatch.setattr("headroom.install.runtime.sys.platform", "win32")
-    monkeypatch.setattr("headroom.install.runtime.subprocess.DETACHED_PROCESS", 1, raising=False)
+    monkeypatch.setattr("headroom.install.runtime.subprocess.CREATE_NO_WINDOW", 4, raising=False)
     monkeypatch.setattr(
         "headroom.install.runtime.subprocess.CREATE_NEW_PROCESS_GROUP", 2, raising=False
     )
+    nt_calls: list[tuple[list[str], dict]] = []
     fake_proc_nt = FakeProc()
-    monkeypatch.setattr(
-        "headroom.install.runtime.subprocess.Popen", lambda command, **kwargs: fake_proc_nt
-    )
+
+    def fake_popen_nt(command: list[str], **kwargs):
+        nt_calls.append((command, kwargs))
+        return fake_proc_nt
+
+    monkeypatch.setattr("headroom.install.runtime.subprocess.Popen", fake_popen_nt)
     assert start_detached_agent("demo") is fake_proc_nt
+    # DETACHED_PROCESS is not used: it makes CREATE_NO_WINDOW a no-op on
+    # Windows, so a detached console child would pop up a visible window.
+    assert nt_calls[0][1]["creationflags"] == 4 | 2
 
     monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
     fake_proc_posix = FakeProc()

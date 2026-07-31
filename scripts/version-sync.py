@@ -74,6 +74,28 @@ def update_marketplace_manifest(file_path: Path, version: str) -> None:
         f.write("\n")
 
 
+def update_server_json(file_path: Path, version: str) -> None:
+    """Update the MCP registry descriptor's version fields.
+
+    ``server.json`` is asserted byte-for-byte against ``render_server_json()``
+    (tests/test_mcp_registry/test_server_json.py), which derives the version from
+    ``pyproject.toml``. Nothing regenerated this file, so it silently fell behind
+    every release and failed that test on the release PR. Values are rewritten in
+    place so key order and formatting keep matching the builder's output.
+    """
+    with open(file_path, encoding="utf-8") as f:
+        data = json.load(f)
+    data["version"] = version
+    packages = data.get("packages")
+    if isinstance(packages, list):
+        for package in packages:
+            if isinstance(package, dict):
+                package["version"] = version
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
 def update_plugin_versions(root: Path, version: str) -> None:
     """Update marketplace and plugin manifest versions."""
     update_marketplace_manifest(root / ".claude-plugin" / "marketplace.json", version)
@@ -172,6 +194,7 @@ def main() -> None:
     update_openclaw_package_json(args.root / "plugins" / "openclaw" / "package.json", version)
     update_package_json(args.root / "sdk" / "typescript" / "package.json", version)
     update_plugin_versions(args.root, version)
+    update_server_json(args.root / "server.json", version)
     write_release_metadata(args.root, version)
 
     print(f"Version synchronized to {version}")

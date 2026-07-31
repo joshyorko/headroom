@@ -9,7 +9,12 @@ import pytest
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
-from headroom.observability import HeadroomOtelMetrics, reset_otel_metrics, set_otel_metrics
+from headroom.observability import (
+    HeadroomOtelMetrics,
+    get_otel_meter,
+    reset_otel_metrics,
+    set_otel_metrics,
+)
 from headroom.proxy.prometheus_metrics import PrometheusMetrics
 from headroom.transforms.pipeline import TransformPipeline
 
@@ -124,6 +129,22 @@ def test_headroom_otel_metrics_records_proxy_and_pipeline_metrics() -> None:
         signal="json_bloat",
     )
     assert waste_point.value == 12
+
+
+def test_get_otel_meter_uses_headrooms_configured_provider() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    set_otel_metrics(HeadroomOtelMetrics(meter_provider=provider))
+
+    try:
+        meter = get_otel_meter("example.integration", "1.0.0")
+        meter.create_counter("example.integration.events").add(1, {"source": "test"})
+
+        metric = _collect_metrics(reader)["example.integration.events"]
+        point = _find_point(metric, source="test")
+        assert point.value == 1
+    finally:
+        reset_otel_metrics()
 
 
 @dataclass

@@ -22,6 +22,7 @@ from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
 from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy.token_counting import gemini_output_tokens
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -37,6 +38,16 @@ def _usage_int(value: Any, default: int = 0) -> int:
 
 class GeminiHandlerMixin:
     """Mixin providing Gemini API handler methods for HeadroomProxy."""
+
+    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
+        from headroom.proxy.token_counting import count_tokens_offloaded
+
+        return await count_tokens_offloaded(self, model, messages)
+
+    async def _count_texts_offloaded(self, model, texts):  # noqa: ANN001, ANN201
+        from headroom.proxy.token_counting import count_texts_offloaded
+
+        return await count_texts_offloaded(self, model, texts)
 
     def _is_cloudcode_antigravity_request(
         self, body: dict[str, Any], headers: dict[str, str]
@@ -259,7 +270,6 @@ class GeminiHandlerMixin:
         from fastapi.responses import JSONResponse, Response
 
         from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
-        from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -453,7 +463,9 @@ class GeminiHandlerMixin:
                     # output_tokens) would then raise TypeError on the non-error
                     # path. Mirrors the streaming _usage_int guard.
                     total_input_tokens = _usage_int(usage.get("promptTokenCount"))
-                    output_tokens = _usage_int(usage.get("candidatesTokenCount"))
+                    output_tokens = gemini_output_tokens(
+                        usage
+                    )  # includes thinking tokens (2.5-family)
                     cache_read_tokens = _usage_int(usage.get("cachedContentTokenCount"))
                 except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError):
                     pass
@@ -491,9 +503,8 @@ class GeminiHandlerMixin:
                     headers=response_headers,
                 )
 
-        # Token counting
-        tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages)
+        # Token counting (offloaded off the event loop — GH #1701)
+        tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
         # Optimization
         transforms_applied: list[str] = []
@@ -706,7 +717,9 @@ class GeminiHandlerMixin:
                         if usage.get("promptTokenCount") is None
                         else usage["promptTokenCount"]
                     )
-                    output_tokens = _usage_int(usage.get("candidatesTokenCount"))
+                    output_tokens = gemini_output_tokens(
+                        usage
+                    )  # includes thinking tokens (2.5-family)
                     # Gemini returns cachedContentTokenCount for context-cached tokens
                     # These are charged at 10-25% of the input price depending on model
                     cache_read_tokens = _usage_int(usage.get("cachedContentTokenCount"))
@@ -816,7 +829,6 @@ class GeminiHandlerMixin:
         from fastapi.responses import JSONResponse
 
         from headroom.proxy.helpers import _read_request_json
-        from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -880,8 +892,10 @@ class GeminiHandlerMixin:
             if isinstance(contents, list) and idx < len(contents)
         }
 
-        tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages) if messages else 0
+        # Token counting (offloaded off the event loop — GH #1701)
+        tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
+        if not messages:
+            original_tokens = 0
         optimized_messages = messages
         optimized_tokens = original_tokens
         transforms_applied: list[str] = []
@@ -981,7 +995,6 @@ class GeminiHandlerMixin:
         from fastapi.responses import JSONResponse
 
         from headroom.proxy.helpers import _read_request_json
-        from headroom.tokenizers import get_tokenizer
 
         start_time = time.time()
         request_id = await self._next_request_id()
@@ -1019,14 +1032,17 @@ class GeminiHandlerMixin:
             request_id=request_id,
         )
 
-        # Token counting
-        tokenizer = get_tokenizer(model)
-        original_tokens = 0
-        for content in contents:
-            parts = content.get("parts", [])
-            for part in parts:
-                if "text" in part:
-                    original_tokens += tokenizer.count_text(part["text"])
+        # Token counting (offloaded off the event loop — GH #1701). Reuse the
+        # shared _dict_parts coercion and keep only str text values: count_text
+        # raises on a non-str part value and the fail-open path re-runs the same
+        # input, so a malformed part would otherwise 500 the streaming request.
+        text_parts = [
+            part["text"]
+            for content in (contents if isinstance(contents, list) else [])
+            for part in self._dict_parts(content)
+            if isinstance(part.get("text"), str)
+        ]
+        _, original_tokens = await self._count_texts_offloaded(model, text_parts)
 
         optimization_latency = (time.time() - start_time) * 1000
 
@@ -1069,7 +1085,6 @@ class GeminiHandlerMixin:
         from fastapi.responses import JSONResponse, Response
 
         from headroom.proxy.helpers import _read_request_json
-        from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -1140,9 +1155,8 @@ class GeminiHandlerMixin:
                 headers=response_headers,
             )
 
-        # Token counting (original)
-        tokenizer = get_tokenizer(model)
-        original_tokens = tokenizer.count_messages(messages)
+        # Token counting (original, offloaded off the event loop — GH #1701)
+        tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
         # Apply compression using the same pipeline as generateContent
         transforms_applied: list[str] = []

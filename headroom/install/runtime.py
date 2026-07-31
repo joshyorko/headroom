@@ -305,7 +305,10 @@ def start_detached_agent(profile: str) -> subprocess.Popen[str]:
 
     kwargs: dict[str, Any] = {"stdout": log_file, "stderr": log_file}
     if _is_windows():
-        kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+        # DETACHED_PROCESS makes CREATE_NO_WINDOW a no-op (per Win32 docs), so a
+        # detached console child pops up a visible window. Use CREATE_NO_WINDOW
+        # instead; it still detaches from the parent's console.
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(
             subprocess, "CREATE_NEW_PROCESS_GROUP", 0
         )
     else:
@@ -429,7 +432,9 @@ def _spawn_detached_restart(profile: str) -> None:
     """
     command = [*resolve_headroom_command(), "install", "restart", "--profile", profile]
     popen_kwargs: dict[str, Any] = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-    if not _is_windows():
+    if _is_windows():
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    else:
         popen_kwargs["start_new_session"] = True
     subprocess.Popen(command, **popen_kwargs)
 

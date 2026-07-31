@@ -129,9 +129,14 @@ class RemoteKompressCompressor:
             cache_key = store_kompress_in_ccr(content, compressed, result.original_tokens)
             if cache_key:
                 result.cache_key = cache_key
+                # Report the source line span so a reader can tell content was
+                # compressed away rather than absent (#2586).
+                source_lines = content.count("\n") + 1
+                line_word = "line" if source_lines == 1 else "lines"
                 result.compressed += (
                     f"\n[{result.original_tokens} items compressed to "
-                    f"{result.compressed_tokens}. Retrieve more: hash={cache_key}]"
+                    f"{result.compressed_tokens} (from {source_lines} source {line_word})."
+                    f" Retrieve more: hash={cache_key}]"
                 )
 
         return result

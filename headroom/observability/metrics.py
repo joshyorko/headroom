@@ -127,6 +127,7 @@ class HeadroomOtelMetrics:
     """Shared OTEL metrics facade for Headroom operations."""
 
     def __init__(self, meter_provider: Any | None = None):
+        self._meter_provider = meter_provider
         if meter_provider is None:
             self._meter = metrics.get_meter(_SCOPE_NAME, _headroom_version())
         else:
@@ -312,6 +313,21 @@ class HeadroomOtelMetrics:
             callbacks=[_cb_overage],
         )
 
+    def get_meter(self, name: str, version: str | None = None) -> Any:
+        """Return a meter backed by Headroom's configured metric provider.
+
+        Optional integrations can use this to create their own instruments
+        without creating a second exporter or meter provider.
+        """
+
+        if self._meter_provider is None:
+            if version is None:
+                return metrics.get_meter(name)
+            return metrics.get_meter(name, version)
+        if version is None:
+            return self._meter_provider.get_meter(name)
+        return self._meter_provider.get_meter(name, version)
+
     @staticmethod
     def _attrs(**attrs: Any) -> dict[str, Any]:
         filtered: dict[str, Any] = {}
@@ -470,6 +486,18 @@ def get_otel_metrics() -> HeadroomOtelMetrics:
                 _global_metrics = HeadroomOtelMetrics()
 
     return _global_metrics
+
+
+def get_otel_meter(name: str, version: str | None = None) -> Any:
+    """Return a meter backed by Headroom's configured OTEL metric provider.
+
+    This is intended for optional integrations that need to create their own
+    instruments while sharing Headroom's configured exporter and lifecycle.
+    When OTEL metrics are disabled, the returned meter is the standard no-op
+    compatible meter from the OpenTelemetry API.
+    """
+
+    return get_otel_metrics().get_meter(name, version)
 
 
 def set_otel_metrics(otel_metrics: HeadroomOtelMetrics) -> HeadroomOtelMetrics:

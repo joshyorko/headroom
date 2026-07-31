@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 
 from headroom.proxy.models import ProxyConfig
 from headroom.proxy.server import create_app
+from headroom.transforms import kompress_compressor
 
 
 class _ReadyCompressor:
@@ -86,6 +87,31 @@ def test_readyz_promotes_deferred_kompress_after_runtime_load(monkeypatch):
         "status": "healthy",
         "backend": "onnx",
     }
+
+
+@pytest.mark.parametrize("attached", [False, True])
+def test_readyz_promotes_kompress_from_module_cache(monkeypatch, attached):
+    model = object()
+    monkeypatch.setattr(
+        kompress_compressor,
+        "_kompress_cache",
+        {kompress_compressor.HF_MODEL_ID: (model, object(), "onnx")},
+    )
+    compressor = _ReadyCompressor(ready=False) if attached else None
+    app, proxy = _health_app(monkeypatch, compressor)
+    proxy.warmup.kompress.info["source_status"] = "deferred"
+
+    payload = TestClient(app).get("/readyz").json()
+
+    assert payload["checks"]["kompress"] == {
+        "enabled": True,
+        "ready": True,
+        "status": "healthy",
+        "backend": "onnx",
+    }
+    assert proxy.warmup.kompress.handle is model
+    if compressor is not None:
+        assert compressor.calls == ["is_ready"]
 
 
 def test_readyz_promotes_remote_kompress_backend(monkeypatch):

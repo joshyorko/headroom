@@ -155,6 +155,54 @@ class TestDigestBuilder:
         digest = _build_digest(_project(), [])
         assert "0 sessions" in digest or "test-project" in digest
 
+    def test_long_error_output_preserves_tail_root_cause(self):
+        # A traceback's diagnosis lives at the tail; a head-only slice would drop it (#2590).
+        traceback = (
+            "Traceback (most recent call last):\n"
+            + "\n".join(
+                f'  File "mod{i}.py", line {i}, in fn{i}\n    call_{i}()' for i in range(40)
+            )
+            + "\nKeyError: 'the-actual-root-cause'"
+        )
+        sessions = [
+            SessionData(
+                session_id="s1",
+                tool_calls=[
+                    _tc(
+                        name="Bash",
+                        output=traceback,
+                        is_error=True,
+                        error_category=ErrorCategory.UNKNOWN,
+                        msg_index=0,
+                    )
+                ],
+            )
+        ]
+        digest = _build_digest(_project(), sessions)
+        assert "Traceback" in digest
+        assert "KeyError: 'the-actual-root-cause'" in digest
+        assert "…" in digest
+
+    def test_short_error_output_not_truncated(self):
+        short = "ModuleNotFoundError: No module named 'foo'"
+        sessions = [
+            SessionData(
+                session_id="s1",
+                tool_calls=[
+                    _tc(
+                        name="Bash",
+                        output=short,
+                        is_error=True,
+                        error_category=ErrorCategory.MODULE_NOT_FOUND,
+                        msg_index=0,
+                    )
+                ],
+            )
+        ]
+        digest = _build_digest(_project(), sessions)
+        assert short in digest
+        assert "…" not in digest
+
 
 # =============================================================================
 # Prior Patterns Injection Tests

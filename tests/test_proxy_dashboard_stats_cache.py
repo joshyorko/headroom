@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -30,9 +29,7 @@ class _ToinStub:
 
 
 @pytest.fixture(autouse=True)
-def _reset_rtk_stats_cache(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-    monkeypatch.delenv("HEADROOM_RTK_GAIN_SCOPE", raising=False)
+def _stub_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
     proxy_helpers._rtk_stats_cache.update(
         {"expires_at": 0.0, "has_value": False, "tool": None, "value": None}
@@ -259,10 +256,7 @@ def test_get_context_tool_stats_reads_lean_ctx_gain(monkeypatch: pytest.MonkeyPa
         return SimpleNamespace(returncode=0, stdout=json.dumps({"summary": summary}))
 
     monkeypatch.setattr(proxy_helpers.time, "monotonic", lambda: now["value"])
-    monkeypatch.setattr(
-        "headroom.lean_ctx.get_lean_ctx_path",
-        lambda: Path("/usr/bin/lean-ctx"),
-    )
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/lean-ctx")
     monkeypatch.setattr(subprocess, "run", _fake_run)
 
     first = proxy_helpers._get_context_tool_stats()
@@ -340,6 +334,7 @@ def test_stats_cached_query_reuses_short_ttl_snapshot(monkeypatch: pytest.Monkey
         }
 
     monkeypatch.setattr(server, "_get_context_tool_stats", _fake_context_tool_stats)
+
     monkeypatch.setattr(server, "get_toin", lambda: _ToinStub())
 
     app = create_app(
@@ -368,10 +363,6 @@ def test_stats_cached_query_reuses_short_ttl_snapshot(monkeypatch: pytest.Monkey
     assert uncached.status_code == 200
 
     assert calls == {"store": 3, "telemetry": 3, "feedback": 3, "context_tool": 3}
-    assert first.json()["context_tool"]["configured"] == "rtk"
-    assert first.json()["context_tool"]["label"] == "RTK"
-    assert first.json()["cli_filtering"]["tokens_saved"] == 5
-    assert first.json()["tokens"]["saved"] == 5
     assert first.json()["tokens"]["proxy_compression_saved"] == 0
     assert first.json()["tokens"]["cli_filtering_saved"] == 5
     assert first.json()["tokens"]["rtk_saved"] == 5
@@ -635,6 +626,31 @@ def test_session_summary_uses_generic_cli_filtering_keys() -> None:
     assert payload["cost"]["breakdown"]["rtk_savings_usd"] is None
 
 
+def test_session_summary_surfaces_codex_ws_counters() -> None:
+    from headroom.proxy.cost import build_session_summary
+
+    proxy = SimpleNamespace(
+        config=SimpleNamespace(mode="token"),
+        logger=SimpleNamespace(_logs=[]),
+        cost_tracker=SimpleNamespace(stats=lambda: {}),
+    )
+    metrics = SimpleNamespace(
+        requests_by_model={},
+        tokens_saved_total=0,
+        codex_ws_units_total=12,
+        codex_ws_units_modified_total=9,
+        codex_ws_unit_tokens_saved_sum=4321,
+    )
+
+    payload = build_session_summary(proxy, metrics, {}, total_tokens_before=0)
+
+    assert payload["codex_ws"] == {
+        "units_total": 12,
+        "units_modified": 9,
+        "tokens_saved": 4321,
+    }
+
+
 def test_stats_reset_clears_runtime_proxy_counters(monkeypatch: pytest.MonkeyPatch) -> None:
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
@@ -658,7 +674,6 @@ def test_stats_reset_clears_runtime_proxy_counters(monkeypatch: pytest.MonkeyPat
         "get_compression_feedback",
         lambda: _StatsStub({"feedback": 0}, "feedback", {}),
     )
-    monkeypatch.setattr(server, "_get_context_tool_stats", lambda: None)
     monkeypatch.setattr(server, "get_toin", lambda: _ToinStub())
 
     app = create_app(

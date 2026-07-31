@@ -460,3 +460,48 @@ def test_responses_memory_tools_allow_default_and_stored_requests() -> None:
 
     assert _responses_request_allows_memory_tool_continuation(default_store_payload) is True
     assert "store" not in default_store_payload
+
+
+def test_responses_turn_hook_message_fold_is_applied_and_counted() -> None:
+    """On the Responses path a turn hook may fold the `input` items (in place),
+    not just tools. The fold must be written back to the outbound payload AND its
+    token saving added to tokens_saved — before, this path only wrote tools back,
+    so a message fold was silently dropped and uncounted."""
+    from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
+
+    class FoldInput:
+        name = "fold_input"
+
+        def on_request(self, ctx: Any) -> None:
+            # Fold a big function_call_output IN PLACE (mutate the dict; identity
+            # of ctx.messages is unchanged) — the case an identity gate would miss.
+            for item in ctx.messages:
+                if isinstance(item, dict) and isinstance(item.get("output"), str):
+                    item["output"] = "folded"
+
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+    payload: dict[str, Any] = {
+        "type": "response.create",
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": " ".join(["compressible"] * 300),
+            }
+        ],
+    }
+
+    clear_turn_hooks()
+    register_turn_hook(FoldInput())
+    try:
+        working, _modified, tokens_saved, *_ = handler._compress_openai_responses_payload(
+            payload, model="gpt-5.5", request_id="hr_test"
+        )
+    finally:
+        clear_turn_hooks()
+
+    assert working["input"][0]["output"] == "folded"  # fold applied to the outbound payload
+    assert tokens_saved > 0  # ...and the message-fold saving is counted
+    assert payload["input"][0]["output"] != "folded"  # original untouched (deep-copied)

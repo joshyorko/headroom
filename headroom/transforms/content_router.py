@@ -2807,6 +2807,7 @@ class ContentRouter(Transform):
         language: str | None = None,
         question: str | None = None,
         bias: float = 1.0,
+        _allow_embedded: bool = True,
     ) -> tuple[str, int, list[str]]:
         """Apply a compression strategy to content.
 
@@ -2827,6 +2828,37 @@ class ContentRouter(Transform):
             log]``). Log readers use this to see *how* we got to the
             final compressor without parsing decision_reason strings.
         """
+        # ── STRUCTURAL (embedded) JSON routing ───────────────────────────────
+        # Before anything else: if this block is not a single JSON value but
+        # CONTAINS balanced JSON span(s), route each span through this very
+        # dispatch and splice the result back (surrounding bytes kept exact).
+        # This is how nested/embedded JSON reaches the JSON compressors at all —
+        # today's linear splitter never sees it. Each span goes through the
+        # UNCHANGED path, so SmartCrusher/CodeCompressor register their
+        # `<<ccr:…>>` markers exactly as for a whole-block JSON (CCR is hash-
+        # keyed → location-agnostic). `_allow_embedded=False` on the recursive
+        # call is a one-shot re-entrancy guard (NOT a depth cap). Deterministic +
+        # benefit-gated (no size/min thresholds) → prefix-cache- and CCR-store-
+        # stable, and a strict no-op when the block has no embedded JSON.
+        if _allow_embedded:
+            from headroom.transforms.recursive_json import route_embedded_json
+
+            def _dispatch_span(span: str) -> str | None:
+                strat = self._strategy_from_detection_type(_detect_content(span).content_type)
+                text, _t, _c = self._apply_strategy_to_content(
+                    span,
+                    strat,
+                    context,
+                    question=question,
+                    bias=bias,
+                    _allow_embedded=False,
+                )
+                return text if text != span else None
+
+            routed = route_embedded_json(content, _dispatch_span, tok=_estimate_tokens)
+            if routed is not None:
+                return routed, _estimate_tokens(routed), ["embedded_json"]
+
         # Track original tokens for TOIN recording
         original_tokens = _estimate_tokens(content)
         compressed: str | None = None

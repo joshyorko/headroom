@@ -41,6 +41,8 @@ scripts/*
 !scripts/headroom-rebuild-install
 !scripts/headroom-dagger-mcp
 !scripts/headroom-dagger-mcp-filter.py
+!scripts/record_kompress_fixtures.py
+!scripts/record_code_compressor_fixtures.py
 
 # Rust / Cargo build artifacts
 /target/

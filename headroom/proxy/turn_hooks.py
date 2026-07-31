@@ -56,6 +56,12 @@ class TurnHook(Protocol):
 
     name: str
 
+    # Optional: set True if this hook's ``on_request`` needs no later re-drive
+    # (a fold-only hook). Such hooks run on streaming turns too; hooks that may
+    # re-drive in ``on_response`` leave it unset and run buffered-only. Absent ⇒
+    # False (conservative). See :func:`run_request_hooks`.
+    stream_safe: bool
+
     def on_request(self, ctx: TurnContext) -> None:
         """Inspect / mutate ``ctx`` (e.g. ``ctx.tools``) before it goes upstream."""
 
@@ -86,9 +92,22 @@ def clear_turn_hooks() -> None:
     _hooks.clear()
 
 
-def run_request_hooks(ctx: TurnContext) -> None:
-    """Run every hook's ``on_request``. Inert when none are registered; never raises."""
+def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> None:
+    """Run each hook's ``on_request``. Inert when none registered; never raises.
+
+    ``on_request`` mutates the outbound request before the upstream send, so it is
+    safe on a streamed turn *as long as the hook needs no later re-drive*. A hook
+    that may re-drive the model in ``on_response`` (e.g. defer a tool, then reload
+    it when the model asks) can't run on a stream — the bytes are already flowing,
+    there's nothing to re-drive. So on streaming turns the handler passes
+    ``stream_safe_only=True`` and only hooks that opt in via a truthy ``stream_safe``
+    attribute run; fold-only hooks (which never re-drive) set it and thus keep
+    working on streamed OpenAI-compatible traffic. Default off ⇒ conservative:
+    a hook is treated as buffered-only unless it declares itself stream-safe.
+    """
     for hook in _hooks:
+        if stream_safe_only and not getattr(hook, "stream_safe", False):
+            continue
         fn = getattr(hook, "on_request", None)
         if fn is None:
             continue

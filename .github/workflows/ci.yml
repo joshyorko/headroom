@@ -70,7 +70,6 @@ jobs:
               - 'headroom/cli/**'
               - 'headroom/install/**'
               - 'headroom/providers/**'
-              - 'headroom/rtk/**'
               - 'crates/**'
               - '**/*.rs'
               - 'Cargo.toml'

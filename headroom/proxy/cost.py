@@ -44,6 +44,22 @@ def _get_litellm_module() -> Any | None:
 
 logger = logging.getLogger("headroom.proxy")
 
+# Pricing-lookup warnings are emitted on the per-request cost path, so an
+# unresolvable model (a custom / OpenAI-compatible name LiteLLM can't price,
+# e.g. glm-5.2) floods proxy.log with an identical WARNING every single request
+# (#2504). Track which models have already been warned so each fires once per
+# process; the set is tiny and bounded by the number of distinct models seen.
+_warned_pricing_models: set[str] = set()
+
+
+def _warn_pricing_once(model: str, message: str) -> None:
+    """Emit ``message`` at WARNING only the first time ``model`` fails pricing."""
+    if model in _warned_pricing_models:
+        return
+    _warned_pricing_models.add(model)
+    logger.warning(message)
+
+
 # Provider-specific cache discount multipliers (what fraction of input price)
 # Used to calculate dollar savings from prefix caching
 _CACHE_ECONOMICS = {
@@ -368,19 +384,14 @@ def merge_cost_stats(
     cache_stats: dict,
     cli_tokens_avoided: int = 0,
 ) -> dict | None:
-    """Merge compression, cache, and CLI savings into cost stats.
+    """Merge compression and cache savings into cost stats.
 
     Each savings layer is reported separately with its own scope:
     - savings_usd: compression savings at model list price (monotonic)
     - cache_savings_usd: prefix cache discount from provider (separate)
-    - cli_tokens_avoided: tokens filtered by the selected CLI context tool
-      (token count only, no $ estimate)
 
     The dollar metric (savings_usd) remains ONLY proxy compression savings
-    priced at the model's published input rate. CLI filtering is folded into
-    the dashboard's compression token total, but it has no reliable
-    model-specific dollar estimate because those tokens never reached the
-    proxy request.
+    priced at the model's published input rate.
     Prefix cache savings stay separate because they are a provider discount,
     not token removal. This avoids the non-monotonic moving-average repricing
     bug (#83).
@@ -458,8 +469,8 @@ def build_session_summary(
     proxy: Any,
     metrics: Any,
     prefix_cache_stats: dict,
-    cli_tokens_avoided: int,
     total_tokens_before: int,
+    cli_tokens_avoided: int = 0,
 ) -> dict[str, Any]:
     """Build a human-readable session summary from metrics and request logs.
 
@@ -543,8 +554,7 @@ def build_session_summary(
         best_detail = f"{best['original']:,} → {best['optimized']:,} tokens"
 
     # Cost summary — dollar savings are proxy-compression only at model list
-    # price. CLI filtering tokens are counted in token savings but have no
-    # model-specific price because they never reached the proxy request.
+    # price.
     cost_stats = proxy.cost_tracker.stats() if proxy.cost_tracker else {}
     cost_with = cost_stats.get("cost_with_headroom_usd", 0.0)
     compression_savings = cost_stats.get("savings_usd", 0.0)
@@ -577,6 +587,13 @@ def build_session_summary(
             "rtk_tokens_avoided": cli_tokens_avoided,
             "total_tokens_saved_with_rtk": metrics.tokens_saved_total + cli_tokens_avoided,
             "total_tokens_before_with_rtk": total_tokens_before,
+            "total_tokens_before": total_tokens_before,
+            # Tool-schema deferral / turn-hook tool shrink, tracked apart from
+            # message compression, so consumers can see the full picture.
+            "tool_schema_tokens_saved": getattr(metrics, "tool_search_saved_total", 0),
+            "total_tokens_saved_all_layers": (
+                metrics.tokens_saved_total + getattr(metrics, "tool_search_saved_total", 0)
+            ),
         },
         "uncompressed_requests": {k: v for k, v in uncompressed_reasons.items() if v > 0},
         "cost": {
@@ -593,13 +610,17 @@ def build_session_summary(
                     "dollar savings use proxy compression tokens at model list price."
                 ),
                 "rtk_savings_usd": None,
-                "rtk_savings_note": (
-                    "CLI filtering tokens are included in token savings only; dollar savings "
-                    "use proxy compression tokens at model list price."
-                ),
             },
         },
     }
+
+    ws_units = getattr(metrics, "codex_ws_units_total", 0)
+    if ws_units:
+        summary["codex_ws"] = {
+            "units_total": ws_units,
+            "units_modified": getattr(metrics, "codex_ws_units_modified_total", 0),
+            "tokens_saved": getattr(metrics, "codex_ws_unit_tokens_saved_sum", 0),
+        }
 
     # MCP-side compression: events written by `headroom mcp serve`
     # instances (one or more) to the shared stats log. Surfaces direct
@@ -691,7 +712,10 @@ class CostTracker:
         """
         litellm = _get_litellm_module()
         if litellm is None:
-            logger.warning("LiteLLM not available - cannot calculate costs")
+            _warn_pricing_once(
+                f"__litellm_unavailable__:{model}",
+                f"LiteLLM not available - cannot calculate costs for model {model}",
+            )
             return None
 
         try:
@@ -713,7 +737,7 @@ class CostTracker:
             return float(total_cost) if total_cost > 0 else None
 
         except Exception as e:
-            logger.warning(f"Failed to get pricing for model {model}: {e}")
+            _warn_pricing_once(model, f"Failed to get pricing for model {model}: {e}")
             return None
 
     def _prune_old_costs(self):

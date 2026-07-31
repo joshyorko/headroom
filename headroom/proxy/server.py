@@ -136,7 +136,6 @@ from headroom.proxy.helpers import (
     _get_context_tool_reported_project_stats,
     _get_context_tool_stats,
     _get_image_compressor,  # noqa: F401
-    _get_rtk_stats,  # noqa: F401
     _read_request_json,  # noqa: F401
     _setup_file_logging,  # noqa: F401
     ingest_context_tool_stats,
@@ -1713,14 +1712,16 @@ class HeadroomProxy(
                 self.warmup.merge_transform_status(transform_status)
 
         # Update internal status from eager loading results
-        if eager_status.get("kompress") == "enabled":
-            self._kompress_status = "enabled"
+        if eager_status.get("kompress") in {"enabled", "deferred"}:
+            self._kompress_status = eager_status["kompress"]
         if eager_status.get("code_aware") == "enabled":
             self._code_aware_status = "enabled"
 
         # Log component status
         if self._kompress_status == "enabled":
             logger.info("Kompress: ENABLED (ModernBERT token compressor)")
+        elif self._kompress_status == "deferred":
+            logger.info("Kompress: DEFERRED (model loads on first request)")
         elif self.config.optimize:
             logger.info("Kompress: not installed (pip install headroom-ai[ml] for ML compression)")
 
@@ -1902,6 +1903,10 @@ class HeadroomProxy(
         logger.info(f"Input tokens:          {m.tokens_input_total:,}")
         logger.info(f"Output tokens:         {m.tokens_output_total:,}")
         logger.info(f"Tokens saved:          {m.tokens_saved_total:,}")
+        if m.tool_search_saved_total > 0:
+            # Tool-schema deferral / turn-hook tool shrink — counted apart from
+            # message compression (tool bytes never move tok_before/after).
+            logger.info(f"Tool schemas deferred: {m.tool_search_saved_total:,}")
         # Active-compression ratio: savings as a fraction of what we
         # *attempted* to compress (extracted units + tool schema),
         # NOT the whole request. The full-request denominator is
@@ -2643,6 +2648,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 return True
             proxy.warmup.kompress.mark_loaded(handle=compressor, backend=backend)
             return True
+
+        try:
+            from headroom.transforms.kompress_compressor import HF_MODEL_ID, _kompress_cache
+        except ImportError:
+            return True
+
+        cached = _kompress_cache.get(HF_MODEL_ID)
+        if cached is not None:
+            try:
+                model, _tokenizer, backend = cached
+            except (TypeError, ValueError):
+                pass
+            else:
+                if backend and proxy.warmup.kompress.status != "loaded":
+                    proxy.warmup.kompress.mark_loaded(handle=model, backend=backend)
         return True
 
     def _health_checks() -> dict[str, dict[str, Any]]:
@@ -3745,7 +3765,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # compression and the configured context tool both remove tokens before
         # they reach model context, so dashboard-facing savings combines them.
         proxy_compression_tokens = m.tokens_saved_total
-        all_layers_tokens_saved = proxy_compression_tokens + cli_tokens_avoided
+        # "All layers" must include tool-schema deferral (the tool_search layer
+        # enumerated in by_layer below) — otherwise the advertised total omits it.
+        all_layers_tokens_saved = (
+            proxy_compression_tokens + cli_tokens_avoided + m.tool_search_saved_total
+        )
         total_tokens_before = m.tokens_input_total + all_layers_tokens_saved
         proxy_total_before_compression = m.tokens_input_total + proxy_compression_tokens
         # `attempted_input_tokens` is the compressible-only denominator
@@ -3777,7 +3801,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         # Build human-readable summary
         summary = _build_session_summary(
-            proxy, m, prefix_cache_stats, cli_tokens_avoided, total_tokens_before
+            proxy,
+            m,
+            prefix_cache_stats,
+            cli_tokens_avoided=cli_tokens_avoided,
+            total_tokens_before=total_tokens_before,
         )
         # DEBUG: log the summary payload for external upsert consumers
         try:
@@ -3998,7 +4026,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         "all_layers_tokens": all_layers_tokens_saved,
                         "description": (
                             "Tokens removed by Headroom proxy compression. "
-                            "Dashboard token savings also includes CLI context-tool filtering."
+                            "Dashboard token savings also includes CLI context-tool filtering "
+                            "and deferred tool schemas."
                         ),
                     },
                     "prefix_cache": {
@@ -4437,17 +4466,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         series: Literal["history", "hourly", "daily", "weekly", "monthly"] = "history",
         history_mode: Literal["compact", "full", "none"] = "compact",
     ):
-        """Get durable proxy compression history plus display-session state.
-
-        The JSON payload also carries a ``cli_filtering`` key with live RTK
-        stats. This is a curated subset (``tool``, ``label``, ``available``,
-        ``lifetime``, ``session``) tailored to the Historical tab, not the
-        full ``_get_context_tool_stats()`` payload that ``/stats`` exposes.
-        It is ``None`` only when the stats read hard-fails; when the tool is
-        merely absent, ``cli_filtering`` stays populated with
-        ``available: False`` and zeroed counters so the tab can distinguish
-        "not installed" from "installed, no data yet."
-        """
+        """Get durable proxy compression history plus display-session state."""
         if format == "csv":
             filename = f"headroom-stats-history-{series}.csv"
             return Response(
@@ -4458,16 +4477,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         history = proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
 
-        # Augment with live RTK/cli-filtering lifetime stats so the Historical
-        # tab can display them.  These live in the context-tool's own stats file
-        # and survive proxy restarts — exactly what the Historical tab needs.
-        # Best-effort: if the RTK stats file can't be read (missing, parse error,
-        # IO), fall back to None so the Historical tab stays available instead of
-        # 500ing. The tab hides the card when cli_filtering is None.
         try:
             cli_stats = await asyncio.to_thread(_get_context_tool_stats)
         except Exception:
-            logger.debug("stats-history: RTK stats unavailable", exc_info=True)
+            logger.debug("stats-history: context-tool stats unavailable", exc_info=True)
             cli_stats = None
         if cli_stats:
             history["cli_filtering"] = {

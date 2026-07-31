@@ -257,3 +257,45 @@ def test_non_dict_and_typed_tools_stay_resident() -> None:
     out = inject_tool_search_deferral(tools)
     typed = [t for t in out if t.get("type") == "web_search_20250305"]
     assert len(typed) == 1 and typed[0].get("defer_loading") is None
+
+
+# ---------------------------------------------------------------------------
+# PascalCase clients (Claude Code). The core-tool exemption is spelled in
+# lowercase, so an exact-match comparison never fired for Claude Code: every
+# tool was deferred, including Claude Code's own ``ToolSearch``.
+# ---------------------------------------------------------------------------
+
+
+def _claude_code_tools() -> list[dict]:
+    """Claude Code's surface: PascalCase built-ins, its ToolSearch, MCP tools."""
+    names = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "ToolSearch"] + [
+        f"mcp__srv__t{i}" for i in range(12)
+    ]
+    return [{"name": n, "description": n, "input_schema": {}} for n in names]
+
+
+def test_core_tools_match_case_insensitively() -> None:
+    # Without a case-insensitive match, routine edit/read/run loops each pay a
+    # search round-trip — the exact thing _TOOL_SEARCH_CORE_TOOLS exists to avoid.
+    out = inject_tool_search_deferral(_claude_code_tools())
+    by_name = {t.get("name"): t for t in out if "name" in t}
+    for name in ("Bash", "Read", "Write", "Edit", "Glob", "Grep"):
+        assert by_name[name].get("defer_loading") is None, name
+    # MCP tools are still deferred — the token saving is preserved.
+    assert by_name["mcp__srv__t0"].get("defer_loading") is True
+
+
+def test_client_tool_search_tool_is_never_deferred() -> None:
+    # ToolSearch is the client's own schema fetcher for tools that never appear
+    # in the request body (TaskCreate, WebFetch, …). Deferring it hides the only
+    # tool that can load them, so they become permanently unreachable.
+    out = inject_tool_search_deferral(_claude_code_tools())
+    by_name = {t.get("name"): t for t in out if "name" in t}
+    assert by_name["ToolSearch"].get("defer_loading") is None
+
+
+def test_resident_real_tool_survives_pascal_case_surface() -> None:
+    # The injected search tool is typed and does not satisfy the invariant on its
+    # own; Anthropic 400s when every real tool is deferred.
+    out = inject_tool_search_deferral(_claude_code_tools())
+    assert any(not t.get("type") and not t.get("defer_loading") for t in out)

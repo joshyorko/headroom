@@ -36,7 +36,9 @@ MODEL_PATTERNS: list[tuple[str, str]] = [
     (r"^curie", "tiktoken"),
     (r"^babbage", "tiktoken"),
     (r"^ada", "tiktoken"),
-    # Anthropic models -> estimation (Claude uses custom tokenizer)
+    # Anthropic models -> real BPE proxy (Claude's tokenizer is private; priced
+    # against tiktoken o200k_base for consistent, monotone counts — see
+    # _create_anthropic)
     (r"^claude-", "anthropic"),
     # Llama family -> huggingface (when available)
     (r"^llama", "huggingface"),
@@ -335,13 +337,33 @@ class TokenizerRegistry:
             return EstimatingTokenCounter()
 
     def _create_anthropic(self, model: str) -> TokenCounter:
-        """Create Anthropic tokenizer.
+        """Create Anthropic (Claude) tokenizer.
 
-        Anthropic uses a custom tokenizer that's not publicly available.
-        We use estimation calibrated for Claude models.
+        Anthropic's tokenizer isn't public. Rather than a character-ratio
+        estimate — whose chars-per-token flips with the detected content type
+        (JSON 3.2 / code 3.5 / English 4.0), so compressing text can appear to
+        *increase* tokens and two components disagree on the same bytes — price
+        Claude against a real BPE (tiktoken ``o200k_base``) as a stable, monotone
+        proxy. It is not Claude's exact vocab, but it is deterministic,
+        consistent before/after, and within ~10-20% of Claude's real counts —
+        which is what compression ratios and context-pressure gating need. Falls
+        back to the character estimator if the tiktoken vocab can't be loaded.
         """
-        # Claude models use ~3.5 chars per token on average
-        return EstimatingTokenCounter(chars_per_token=3.5)
+        try:
+            from .tiktoken_counter import (
+                TiktokenCounter,
+                TiktokenLoadError,
+                load_encoding,
+            )
+
+            try:
+                load_encoding("o200k_base")
+            except TiktokenLoadError:
+                logger.info("tiktoken o200k_base unavailable for %s; using char estimator", model)
+                return EstimatingTokenCounter(chars_per_token=3.5)
+            return TiktokenCounter(model, encoding="o200k_base")
+        except Exception:  # pragma: no cover - defensive; keep counting alive
+            return EstimatingTokenCounter(chars_per_token=3.5)
 
     def _create_google(self, model: str) -> TokenCounter:
         """Create Google tokenizer.

@@ -87,11 +87,6 @@ function Require-Command {
     }
 }
 
-function Get-RtkTarget {
-    $arch = if ($env:PROCESSOR_ARCHITECTURE -match 'ARM64') { 'aarch64' } else { 'x86_64' }
-    return "${arch}-pc-windows-msvc"
-}
-
 function Ensure-HostDirs {
     foreach ($dir in @(
         (Join-Path $HostHome '.headroom'),
@@ -825,52 +820,6 @@ function Parse-InstallProfileArgs {
     return $profile
 }
 
-function Invoke-ClaudeRtkInit {
-    $rtkPath = Join-Path $HostHome '.headroom\bin\rtk.exe'
-    if (-not (Test-Path $rtkPath)) {
-        Write-Warning "rtk was not installed at $rtkPath; Claude hooks were not registered"
-        return
-    }
-
-    try {
-        & $rtkPath init --global --auto-patch | Out-Null
-    } catch {
-        Write-Warning "Failed to register Claude hooks with rtk; continuing without hook registration"
-    }
-}
-
-function Get-ContextTool {
-    $value = $env:HEADROOM_CONTEXT_TOOL
-    if ([string]::IsNullOrWhiteSpace($value)) {
-        return 'rtk'
-    }
-
-    $value = $value.Trim().ToLowerInvariant().Replace('_', '-')
-    if ($value -eq 'leanctx') {
-        return 'lean-ctx'
-    }
-    if ($value -ne 'rtk' -and $value -ne 'lean-ctx') {
-        Fail 'HEADROOM_CONTEXT_TOOL must be one of: lean-ctx, rtk'
-    }
-    return $value
-}
-
-function Invoke-LeanCtxInit {
-    param([string]$Agent)
-
-    $cmd = Get-Command lean-ctx -ErrorAction SilentlyContinue
-    if (-not $cmd) {
-        Write-Warning "lean-ctx is not installed on PATH; $Agent lean-ctx setup was skipped"
-        return
-    }
-
-    try {
-        & $cmd.Source init --agent $Agent | Out-Null
-    } catch {
-        Write-Warning "Failed to initialize lean-ctx for $Agent; continuing without lean-ctx setup"
-    }
-}
-
 function Invoke-WithTemporaryEnv {
     param(
         [hashtable]$Environment,
@@ -1399,7 +1348,6 @@ function Parse-WrapArgs {
     $known = New-Object System.Collections.Generic.List[string]
     $hostArgs = New-Object System.Collections.Generic.List[string]
     $port = 8787
-    $noRtk = $false
     $noProxy = $false
     $learn = $false
     $backend = $null
@@ -1427,12 +1375,6 @@ function Parse-WrapArgs {
             }
             '^--port=' {
                 $port = Parse-PortValue -Value ($arg -replace '^--port=', '')
-                $known.Add($arg)
-                $i += 1
-                continue
-            }
-            '^--no-rtk$' {
-                $noRtk = $true
                 $known.Add($arg)
                 $i += 1
                 continue
@@ -1496,6 +1438,13 @@ function Parse-WrapArgs {
                 $i += 1
                 continue
             }
+            '^--rtk$|^--no-rtk$|^--no-project-rtk$|^--keep-rtk$|^--context-tool$|^--context-tool=|^--no-context-tool$' {
+                # Retired CLI context tools (rtk, lean-ctx). Reject explicitly: the
+                # default branch below forwards the first unknown flag AND everything
+                # after it to the wrapped tool, so a leftover --no-rtk in a script
+                # would silently swallow a following --port and be ignored downstream.
+                Fail "CLI context tools (rtk, lean-ctx) have been removed from Headroom. Drop $arg and unset HEADROOM_CONTEXT_TOOL; 'headroom wrap' uninstalls what they left behind on first run."
+            }
             default {
                 for ($j = $i; $j -lt $Arguments.Count; $j++) {
                     $hostArgs.Add($Arguments[$j])
@@ -1509,7 +1458,6 @@ function Parse-WrapArgs {
         KnownArgs = $known.ToArray()
         HostArgs = $hostArgs.ToArray()
         Port = $port
-        NoRtk = $noRtk
         NoProxy = $noProxy
         Learn = $learn
         Backend = $backend
@@ -1528,8 +1476,6 @@ function Invoke-PrepareOnly {
     $dockerArgs.AddRange([string[]]@('run','--rm'))
     Add-TtyArgs -ArgsList $dockerArgs
     $dockerArgs.AddRange((Get-SharedDockerArgs))
-    $dockerArgs.Add('--env')
-    $dockerArgs.Add("HEADROOM_RTK_TARGET=$(Get-RtkTarget)")
     $dockerArgs.Add('--entrypoint')
     $dockerArgs.Add('headroom')
     $dockerArgs.Add($HeadroomImage)
@@ -1647,7 +1593,6 @@ switch ($args[0]) {
         }
 
         $parsed = Parse-WrapArgs -Arguments $wrapArgs
-        $contextTool = Get-ContextTool
         $proxyArgs = New-Object System.Collections.Generic.List[string]
         if ($parsed.Learn) { $proxyArgs.Add('--learn') }
         if ($parsed.Backend) { $proxyArgs.AddRange([string[]]@('--backend', $parsed.Backend)) }
@@ -1667,20 +1612,10 @@ switch ($args[0]) {
             if (-not $parsed.NoProxy) {
                 $prepareArgs.Add('--no-proxy')
             }
-            if ((-not $parsed.NoRtk) -and $contextTool -eq 'lean-ctx') {
-                $prepareArgs.Add('--no-rtk')
-            }
             Invoke-PrepareOnly -Tool $tool -KnownArgs $prepareArgs.ToArray()
-
-            if ((-not $parsed.NoRtk) -and $contextTool -eq 'lean-ctx') {
-                Invoke-LeanCtxInit -Agent $tool
-            }
 
             switch ($tool) {
                 'claude' {
-                    if ((-not $parsed.NoRtk) -and $contextTool -eq 'rtk') {
-                        Invoke-ClaudeRtkInit
-                    }
                     $exitCode = Invoke-WithTemporaryEnv -Environment @{ ANTHROPIC_BASE_URL = "http://127.0.0.1:$($parsed.Port)" } -Command 'claude' -Arguments $parsed.HostArgs
                     exit $exitCode
                 }

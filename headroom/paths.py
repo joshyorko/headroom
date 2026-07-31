@@ -78,10 +78,6 @@ _DEBUG_400_DIR = "debug_400"
 _CODEX_WIRE_DEBUG_DIR = "codex_wire"
 _BIN_DIR = "bin"
 _PROXY_CLIENTS_DIR = "clients"
-_RTK_UNIX = "rtk"
-_RTK_WIN = "rtk.exe"
-_LEAN_CTX_UNIX = "lean-ctx"
-_LEAN_CTX_WIN = "lean-ctx.exe"
 _DEPLOY_DIR = "deploy"
 _PLUGINS_DIR = "plugins"
 
@@ -327,20 +323,6 @@ def proxy_clients_dir(port: int) -> Path:
     return workspace_dir() / _PROXY_CLIENTS_DIR / str(port)
 
 
-def rtk_path() -> Path:
-    """Return the path to the vendored ``rtk`` binary."""
-
-    name = _RTK_WIN if os.name == "nt" else _RTK_UNIX
-    return bin_dir() / name
-
-
-def lean_ctx_path() -> Path:
-    """Return the path to the vendored ``lean-ctx`` binary."""
-
-    name = _LEAN_CTX_WIN if os.name == "nt" else _LEAN_CTX_UNIX
-    return bin_dir() / name
-
-
 def deploy_root() -> Path:
     """Return the root directory for persistent deployment profiles."""
 
@@ -441,8 +423,6 @@ __all__ = [
     "codex_wire_debug_dir",
     "bin_dir",
     "proxy_clients_dir",
-    "rtk_path",
-    "lean_ctx_path",
     "deploy_root",
     "beacon_lock_path",
     "models_config_path",

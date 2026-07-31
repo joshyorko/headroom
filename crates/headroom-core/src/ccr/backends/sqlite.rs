@@ -5,16 +5,21 @@
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS ccr_entries (
-//!     hash         TEXT PRIMARY KEY,
-//!     original     BLOB NOT NULL,
-//!     created_at   INTEGER NOT NULL,   -- unix-seconds
-//!     ttl_seconds  INTEGER NOT NULL
+//!     hash          TEXT PRIMARY KEY,
+//!     original      BLOB NOT NULL,
+//!     created_at    INTEGER NOT NULL,   -- unix-seconds
+//!     ttl_seconds   INTEGER NOT NULL,   -- idle window, restarted on get
+//!     last_accessed INTEGER NOT NULL    -- unix-seconds
 //! );
 //! ```
 //!
-//! On every `get` we lazy-purge stale rows
-//! (`WHERE created_at + ttl_seconds <= now`) — no background reaper
-//! thread, no cron.
+//! The TTL is an **idle window** (#2604): every successful `get`
+//! restarts the row's clock via `last_accessed`, bounded by an absolute
+//! max lifetime measured from `created_at`. On every `get` we
+//! lazy-purge stale rows (`WHERE last_accessed + ttl_seconds <= now OR
+//! created_at + max_lifetime <= now`) — no background reaper thread,
+//! no cron. DBs created by pre-sliding builds are migrated in place
+//! (the `last_accessed` column is added, backfilled from `created_at`).
 //!
 //! All hot statements are prepared once on connection setup and reused
 //! per call (per realignment build constraint #5: performant). Writes
@@ -43,14 +48,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::ccr::CcrStore;
+use crate::ccr::{max_lifetime_for, CcrStore};
 
 /// SQLite-backed CCR store.
 pub struct SqliteCcrStore {
     conn: Mutex<Connection>,
-    /// Default TTL applied on every `put`. Mirrors Python's
-    /// `compression_store` 30-minute window.
+    /// Default idle TTL applied on every `put`. Mirrors Python's
+    /// `compression_store` idle window.
     default_ttl_seconds: u64,
+    /// Absolute max lifetime (seconds since `created_at`) that caps the
+    /// sliding idle window. Defaults to 8x the idle TTL.
+    max_lifetime_seconds: u64,
     /// Path the connection was opened against — kept for diagnostics
     /// and for the proxy-restart simulation test.
     path: PathBuf,
@@ -58,9 +66,24 @@ pub struct SqliteCcrStore {
 
 impl SqliteCcrStore {
     /// Open or create the DB file at `path` and prepare the schema.
+    /// `default_ttl_seconds` is the idle window; the absolute max
+    /// lifetime defaults to 8x that (see
+    /// [`crate::ccr::DEFAULT_MAX_LIFETIME_MULTIPLIER`]).
     /// Errors surface to the caller (`from_config`); we never silently
     /// fall back to the in-memory backend (`feedback_no_silent_fallbacks.md`).
     pub fn open(path: impl AsRef<Path>, default_ttl_seconds: u64) -> rusqlite::Result<Self> {
+        let max_lifetime =
+            max_lifetime_for(std::time::Duration::from_secs(default_ttl_seconds)).as_secs();
+        Self::open_with_ttls(path, default_ttl_seconds, max_lifetime)
+    }
+
+    /// Full-control constructor: idle window and absolute max lifetime
+    /// specified independently.
+    pub fn open_with_ttls(
+        path: impl AsRef<Path>,
+        default_ttl_seconds: u64,
+        max_lifetime_seconds: u64,
+    ) -> rusqlite::Result<Self> {
         let path_buf = path.as_ref().to_path_buf();
         let conn = Connection::open(&path_buf)?;
 
@@ -73,23 +96,47 @@ impl SqliteCcrStore {
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS ccr_entries (
-                 hash         TEXT PRIMARY KEY,
-                 original     BLOB NOT NULL,
-                 created_at   INTEGER NOT NULL,
-                 ttl_seconds  INTEGER NOT NULL
+                 hash          TEXT PRIMARY KEY,
+                 original      BLOB NOT NULL,
+                 created_at    INTEGER NOT NULL,
+                 ttl_seconds   INTEGER NOT NULL,
+                 last_accessed INTEGER NOT NULL
              )",
             [],
         )?;
+        Self::migrate_legacy_schema(&conn)?;
         // No secondary index — the schema is one-row-per-PK and the only
         // non-PK lookup (the lazy-purge sweep) is a `WHERE` predicate on
-        // a small table; an index on `created_at + ttl_seconds` would
-        // cost more than it saves.
+        // a small table; an index on the expiry expressions would cost
+        // more than it saves.
 
         Ok(Self {
             conn: Mutex::new(conn),
             default_ttl_seconds,
+            max_lifetime_seconds,
             path: path_buf,
         })
+    }
+
+    /// DBs created before the sliding-TTL change lack `last_accessed`.
+    /// Add it in place and backfill from `created_at` so legacy rows
+    /// keep their original expiry baseline rather than being purged or
+    /// artificially refreshed.
+    fn migrate_legacy_schema(conn: &Connection) -> rusqlite::Result<()> {
+        let has_last_accessed = conn
+            .prepare("SELECT 1 FROM pragma_table_info('ccr_entries') WHERE name = 'last_accessed'")?
+            .exists([])?;
+        if !has_last_accessed {
+            conn.execute(
+                "ALTER TABLE ccr_entries ADD COLUMN last_accessed INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE ccr_entries SET last_accessed = created_at WHERE last_accessed = 0",
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     /// Path the connection was opened against. Test helper.
@@ -102,12 +149,15 @@ impl SqliteCcrStore {
         self.default_ttl_seconds
     }
 
-    /// Drop all expired rows. Lazy — invoked from `get`. Returns the
+    /// Drop all expired rows: idle past their window, or past the
+    /// absolute max lifetime. Lazy — invoked from `get`. Returns the
     /// number of rows purged.
-    fn purge_expired(conn: &Connection, now: u64) -> rusqlite::Result<usize> {
+    fn purge_expired(&self, conn: &Connection, now: u64) -> rusqlite::Result<usize> {
         let purged = conn.execute(
-            "DELETE FROM ccr_entries WHERE created_at + ttl_seconds <= ?1",
-            params![now as i64],
+            "DELETE FROM ccr_entries
+             WHERE last_accessed + ttl_seconds <= ?1
+                OR created_at + ?2 <= ?1",
+            params![now as i64, self.max_lifetime_seconds as i64],
         )?;
         Ok(purged)
     }
@@ -129,12 +179,13 @@ impl CcrStore for SqliteCcrStore {
         // Upsert by PK. ON CONFLICT REPLACE matches the in-memory
         // backend's idempotent re-store semantics.
         let res = conn.execute(
-            "INSERT INTO ccr_entries (hash, original, created_at, ttl_seconds)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO ccr_entries (hash, original, created_at, ttl_seconds, last_accessed)
+             VALUES (?1, ?2, ?3, ?4, ?3)
              ON CONFLICT(hash) DO UPDATE SET
-                 original    = excluded.original,
-                 created_at  = excluded.created_at,
-                 ttl_seconds = excluded.ttl_seconds",
+                 original      = excluded.original,
+                 created_at    = excluded.created_at,
+                 ttl_seconds   = excluded.ttl_seconds,
+                 last_accessed = excluded.last_accessed",
             params![
                 hash,
                 payload.as_bytes(),
@@ -165,7 +216,7 @@ impl CcrStore for SqliteCcrStore {
         // Lazy purge sweep, then the real lookup. Both happen under
         // the same mutex so the row we read is guaranteed not to have
         // been just-deleted by another caller.
-        if let Err(err) = Self::purge_expired(&conn, now) {
+        if let Err(err) = self.purge_expired(&conn, now) {
             tracing::warn!(
                 target = "ccr.sqlite",
                 error = %err,
@@ -176,8 +227,10 @@ impl CcrStore for SqliteCcrStore {
         let row: Option<Vec<u8>> = conn
             .query_row(
                 "SELECT original FROM ccr_entries
-                 WHERE hash = ?1 AND created_at + ttl_seconds > ?2",
-                params![hash, now as i64],
+                 WHERE hash = ?1
+                   AND last_accessed + ttl_seconds > ?2
+                   AND created_at + ?3 > ?2",
+                params![hash, now as i64, self.max_lifetime_seconds as i64],
                 |r| r.get::<_, Vec<u8>>(0),
             )
             .optional()
@@ -191,7 +244,22 @@ impl CcrStore for SqliteCcrStore {
                 None
             });
 
-        row.and_then(|bytes| String::from_utf8(bytes).ok())
+        let row = row?;
+        // Sliding idle window (#2604): a successful hit restarts the
+        // row's idle clock. Still under the same mutex as the lookup.
+        if let Err(err) = conn.execute(
+            "UPDATE ccr_entries SET last_accessed = ?2 WHERE hash = ?1",
+            params![hash, now as i64],
+        ) {
+            tracing::warn!(
+                target = "ccr.sqlite",
+                hash = %hash,
+                error = %err,
+                "ccr_sqlite_touch_failed"
+            );
+        }
+
+        String::from_utf8(row).ok()
     }
 
     fn len(&self) -> usize {

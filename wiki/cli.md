@@ -741,7 +741,6 @@ headroom wrap claude --port 9999
 | Option / arg | Default | Meaning |
 |---|---|---|
 | `--port`, `-p` | `8787` | Proxy port |
-| `--no-rtk` | off | Skip `rtk` installation and hook registration |
 | `--no-proxy` | off | Reuse an existing proxy |
 | `--learn` | off | Enable live traffic learning |
 | `--verbose`, `-v` | off | Verbose output |
@@ -760,7 +759,6 @@ headroom wrap codex --backend anyllm --anyllm-provider groq
 | Option / arg | Default | Meaning |
 |---|---|---|
 | `--port`, `-p` | `8787` | Proxy port |
-| `--no-rtk` | off | Skip `rtk` installation and `AGENTS.md` injection |
 | `--no-proxy` | off | Reuse an existing proxy |
 | `--learn` | off | Enable live traffic learning |
 | `--backend` | unset | Proxy backend override |
@@ -781,7 +779,6 @@ headroom wrap copilot --backend anyllm --anyllm-provider groq -- --model gpt-4o
 | Option / arg | Default | Meaning |
 |---|---|---|
 | `--port`, `-p` | `8787` | Proxy port |
-| `--no-rtk` | off | Skip `rtk` installation and GitHub Copilot instructions injection |
 | `--no-proxy` | off | Reuse an existing proxy |
 | `--learn` | off | Enable live traffic learning |
 | `--backend` | unset | Proxy backend override |
@@ -805,7 +802,6 @@ headroom wrap aider --backend litellm-vertex --region us-central1
 | Option / arg | Default | Meaning |
 |---|---|---|
 | `--port`, `-p` | `8787` | Proxy port |
-| `--no-rtk` | off | Skip `rtk` installation and `CONVENTIONS.md` injection |
 | `--no-proxy` | off | Reuse an existing proxy |
 | `--learn` | off | Enable live traffic learning |
 | `--backend` | unset | Proxy backend override |
@@ -821,13 +817,11 @@ Requires the `aider` binary on the host.
 ```bash
 headroom wrap cursor
 headroom wrap cursor --port 9999
-headroom wrap cursor --no-rtk
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--port`, `-p` | `8787` | Proxy port |
-| `--no-rtk` | off | Skip `rtk` installation and `.cursorrules` injection |
 | `--no-proxy` | off | Reuse an existing proxy |
 | `--learn` | off | Enable live traffic learning |
 | `--verbose`, `-v` | off | Verbose output |

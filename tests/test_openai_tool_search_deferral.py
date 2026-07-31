@@ -143,3 +143,17 @@ def test_noop_when_nothing_deferrable():
 
 def test_noop_for_non_list():
     assert inject_tool_search_deferral_openai(None, "gpt-5.5") is None
+
+
+def test_resident_names_match_case_insensitively():
+    # The resident-name sets are lowercase; clients are not required to be. An
+    # exact match deferred every tool for a PascalCase client, including its own
+    # tool-search tool. Mirrors the Anthropic-side fix.
+    tools = [_fn(n) for n in ("Bash", "Read", "Edit", "Terminal", "ToolSearch")] + [
+        _fn(f"slack_{i}") for i in range(10)
+    ]
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.5")
+    by_name = {t.get("name"): t for t in out if "name" in t}
+    for name in ("Bash", "Read", "Edit", "Terminal", "ToolSearch"):
+        assert by_name[name].get("defer_loading") is None, name
+    assert by_name["slack_0"].get("defer_loading") is True

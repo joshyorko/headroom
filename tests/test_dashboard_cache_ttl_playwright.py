@@ -23,7 +23,6 @@ def _sample_stats() -> dict:
             "savings_usd": 12.34,
             "compression_savings_usd": 12.34,
             "cache_savings_usd": 5.25,
-            "cli_tokens_avoided": 0,
         },
         "requests": {
             "total": 128,
@@ -37,7 +36,6 @@ def _sample_stats() -> dict:
             "input": 245_000,
             "output": 88_000,
             "saved": 143_000,
-            "cli_tokens_avoided": 0,
             "total_before_compression": 388_000,
             "savings_percent": 36.86,
         },

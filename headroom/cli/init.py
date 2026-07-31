@@ -508,6 +508,14 @@ def _ensure_codex_provider(path: Path, provider_url: str | int) -> None:
         f"{_CODEX_PROVIDER_MARKER_END}"
     )
     content = path.read_text(encoding="utf-8") if path.exists() else ""
+    # Remove stale/unmanaged copies before writing the single init-owned table.
+    # Older init paths could leave a second [model_providers.headroom] block,
+    # which makes the entire Codex config invalid TOML.
+    content = re.sub(
+        r"(?ms)^[ \t]*\[model_providers\.headroom\][ \t]*\r?\n.*?(?=^[ \t]*\[|\Z)",
+        "",
+        content,
+    )
     # init owns the ROOT-level model_provider/openai_base_url: drop any prior
     # root assignment so we replace it instead of emitting a duplicate top-level
     # key (#260). Scope the strip to the document root (everything before the
@@ -1110,20 +1118,15 @@ def _configure_codex_durable_setup(
             scope="user" if global_scope else "project",
             project_dir=Path.cwd(),
         )
-        if no_tokensave:
-            wrap_cli._disable_tokensave_mcp(registrar, verbose=verbose)
-        elif code_graph:
-            wrap_cli._setup_tokensave_mcp(registrar, verbose=verbose, force=True)
-
-        if no_serena:
-            wrap_cli._disable_serena_mcp(registrar, verbose=verbose)
-        elif serena:
-            wrap_cli._setup_serena_mcp(
-                registrar,
-                context="codex",
-                verbose=verbose,
-                force=True,
-            )
+        wrap_cli._setup_coding_compressor(
+            registrar,
+            serena_context="codex",
+            serena=serena or code_graph,
+            no_serena=no_serena,
+            no_tokensave=no_tokensave,
+            verbose=verbose,
+            force=True,
+        )
 
     return normalized_proxy_url
 

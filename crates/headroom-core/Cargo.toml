@@ -137,6 +137,24 @@ redis = { version = "0.27", optional = true, default-features = false }
 # classifier live with the other Phase B/F policy primitives without
 # cycling through the proxy crate. Tiny crate (no I/O, just types).
 http = "1"
+# tree-sitter + per-language grammars for the CodeCompressor AST port.
+# Versions are pinned to EXACTLY match the Python reference grammars
+# (`tree-sitter-<lang>` PyPI wheels) so the Rust and Python parsers emit
+# node-for-node identical ASTs — the precondition for byte-parity. Same
+# version number on crates.io + PyPI means the same `grammar.js` source,
+# hence the same generated `parser.c`. The grammar-parity canary (9
+# samples × 8 languages) confirmed 100% identical node-type + line-span
+# trees at these exact pins. Bumping any pin requires re-running the
+# canary and re-recording the code_aware_compressor fixtures.
+tree-sitter = "=0.25.2"
+tree-sitter-python = "=0.25.0"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-go = "=0.25.0"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-java = "=0.23.5"
+tree-sitter-c = "=0.24.2"
+tree-sitter-cpp = "=0.23.4"
 
 # Load ONNX Runtime dynamically on every platform. The alternative,
 # `ort-download-binaries-*`, statically links Microsoft's prebuilt ORT:
@@ -153,7 +171,10 @@ fastembed = { version = "5", default-features = false, optional = true, features
     "ort-load-dynamic",
     "image-models",
 ] }
-ort = { version = "2.0.0-rc.12", default-features = false, optional = true, features = ["load-dynamic"] }
+# Direct dependency for Kompress inference (`ort::session::Session` /
+# `ort::value::Tensor`). Keep this pinned to the lock entry and optional so
+# `default-features = false` consumers can still build without ONNX Runtime.
+ort = { version = "=2.0.0-rc.12", default-features = false, optional = true, features = ["load-dynamic"] }
 
 [features]
 # `ml` is ON by default, so a stock build is byte-for-byte what it was before:

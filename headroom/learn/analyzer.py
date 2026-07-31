@@ -178,7 +178,7 @@ class SessionAnalyzer:
             total_failures=len(failed_calls),
         )
 
-        # Detect loops up front: an RTK re-fetch loop has NO failed calls
+        # Detect loops up front: a re-fetch loop has NO failed calls
         # (each truncated command succeeds), so it must be a first-class reason
         # to analyze — otherwise the guard below would skip the most expensive
         # waste pattern whenever a session has no failures and no events.
@@ -371,6 +371,26 @@ def _format_event(event: SessionEvent) -> str | None:
     return None
 
 
+_ERROR_PREVIEW_MAX = 200
+
+
+def _truncate_head_tail(text: str, max_chars: int = _ERROR_PREVIEW_MAX) -> str:
+    """Collapse newlines and truncate, keeping both the head and the tail.
+
+    A head-only slice drops the end of a traceback, which is exactly where the
+    root cause (``ExceptionType: message``) lives, so the digest would show only
+    the preamble and lose the diagnosis (see #2590). Keep both ends instead.
+    """
+    text = text.replace("\n", " ").strip()
+    if len(text) <= max_chars:
+        return text
+    sep = " … "
+    keep = max_chars - len(sep)
+    head = keep // 2
+    tail = keep - head
+    return f"{text[:head].rstrip()}{sep}{text[-tail:].lstrip()}"
+
+
 def _format_tool_call(tc: ToolCall) -> str:
     """Format a single tool call into a compact digest line."""
     status = "ERROR" if tc.is_error else "OK"
@@ -380,8 +400,9 @@ def _format_tool_call(tc: ToolCall) -> str:
     input_str = tc.input_summary[:120]
 
     if tc.is_error:
-        # Include truncated error output for failures
-        output_preview = tc.output[:200].replace("\n", " ").strip()
+        # Include truncated error output for failures, keeping the tail so a
+        # traceback's root cause survives (#2590).
+        output_preview = _truncate_head_tail(tc.output)
         return f"  [{tc.msg_index}] {tc.name}: {input_str} → {status}{error_cat}: {output_preview}"
     else:
         # Just indicate success with size
@@ -402,7 +423,7 @@ Your job is to identify patterns that, if documented, would PREVENT TOKEN WASTE 
 Focus on (in priority order):
 1. **Loops (HIGHEST PRIORITY)** — patterns that REPEATED within a session. If the
    digest has a "Detected Loops" section, every loop there MUST get a guardrail
-   rule, because loop waste scales with repetition. This includes RTK re-fetch
+   rule, because loop waste scales with repetition. This includes re-fetch
    loops: a command whose output was truncated, so the agent re-ran variants of
    it to fetch more. The fix names the command and prescribes getting the full
    output up front (e.g., "read the whole file" / "raise the output limit for X").

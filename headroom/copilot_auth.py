@@ -110,7 +110,31 @@ def token_fingerprint(token: str) -> str:
 
 
 def _github_host() -> str:
-    return (os.environ.get("GITHUB_COPILOT_HOST") or DEFAULT_GITHUB_HOST).strip().lower()
+    explicit = os.environ.get("GITHUB_COPILOT_HOST", "").strip().lower()
+    if explicit:
+        return explicit
+
+    enterprise_domain = _configured_enterprise_domain()
+    if enterprise_domain:
+        return enterprise_domain
+
+    configured_url = os.environ.get("GITHUB_COPILOT_API_URL", "").strip()
+    if configured_url:
+        hostname = _configured_url_hostname(configured_url)
+        if _is_public_copilot_api_host(hostname):
+            return DEFAULT_GITHUB_HOST
+        for prefix in ("copilot-api.", "api."):
+            if hostname.startswith(prefix):
+                hostname = hostname[len(prefix) :]
+                break
+        if hostname and hostname not in {
+            DEFAULT_GITHUB_HOST,
+            "api.github.com",
+            "githubcopilot.com",
+        }:
+            return hostname
+
+    return DEFAULT_GITHUB_HOST
 
 
 def headroom_copilot_auth_path() -> Path:
@@ -132,8 +156,28 @@ def _enterprise_hostname(enterprise_url: str) -> str:
     normalized = normalize_copilot_enterprise_url(enterprise_url)
     if not normalized:
         return ""
-    parsed = urlparse(f"https://{normalized}")
-    return (parsed.hostname or normalized.split("/", 1)[0]).lower()
+    try:
+        parsed = urlparse(f"https://{normalized}")
+        _ = parsed.port
+    except ValueError:
+        return ""
+    hostname = (parsed.hostname or "").strip().lower()
+    return hostname if hostname and " " not in hostname else ""
+
+
+def _configured_url_hostname(configured_url: str) -> str:
+    raw = configured_url.strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        _ = parsed.port
+    except ValueError:
+        return ""
+    hostname = (parsed.hostname or "").strip().lower()
+    return hostname if hostname and " " not in hostname else ""
 
 
 def _copilot_subdomain_enterprise_host(enterprise_url: str) -> str | None:
@@ -148,7 +192,11 @@ def _copilot_subdomain_enterprise_host(enterprise_url: str) -> str | None:
         if host.startswith(prefix):
             host = host[len(prefix) :]
             break
-    if not host or host in {"github.com", "www.github.com", "api.github.com"}:
+    if (
+        not host
+        or host in {"github.com", "www.github.com", "api.github.com"}
+        or _is_public_copilot_api_host(host)
+    ):
         return None
     return host
 

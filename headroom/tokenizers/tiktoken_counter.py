@@ -212,15 +212,19 @@ class TiktokenCounter(BaseTokenizer):
     MESSAGE_OVERHEAD = 3
     REPLY_OVERHEAD = 3
 
-    def __init__(self, model: str = "gpt-4o"):
+    def __init__(self, model: str = "gpt-4o", encoding: str | None = None):
         """Initialize tiktoken counter.
 
         Args:
             model: Model name to determine encoding.
                    Defaults to 'gpt-4o' (o200k_base encoding).
+            encoding: Explicit tiktoken encoding name (e.g. 'o200k_base') that
+                   overrides model-based resolution. Used to price
+                   private-tokenizer models (Claude) against a real BPE proxy
+                   instead of a character estimate.
         """
         self.model = model
-        self.encoding_name = get_encoding_for_model(model)
+        self.encoding_name = encoding or get_encoding_for_model(model)
         self._encoding = None  # Lazy load
 
     @property

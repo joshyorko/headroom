@@ -102,7 +102,6 @@ def _invoke_wrap_claude(
         [
             "wrap",
             "claude",
-            "--no-context-tool",
             "--no-mcp",
             "--no-tokensave",
             "--no-serena",

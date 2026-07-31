@@ -97,6 +97,11 @@ class PrometheusMetrics:
         self.tokens_input_total = 0
         self.tokens_output_total = 0
         self.tokens_saved_total = 0
+        # Tool-schema savings (deferral + turn-hook tool shrink), aggregated from
+        # per-request tags. Tracked apart from tokens_saved_total (which is message
+        # compression only — tool bytes never move tok_before/after) so every sink
+        # can surface the tool-schema layer instead of silently dropping it.
+        self.tool_search_saved_total = 0
         # Sum of tokens we actually attempted to compress across the
         # session: extracted units that passed all gates + tool-schema
         # tokens we ran compaction against. Excludes prefix-frozen
@@ -324,6 +329,7 @@ class PrometheusMetrics:
             self.tokens_input_total = 0
             self.tokens_output_total = 0
             self.tokens_saved_total = 0
+            self.tool_search_saved_total = 0
             self.attempted_input_tokens_total = 0
 
             self.compressions_by_strategy.clear()
@@ -683,6 +689,7 @@ class PrometheusMetrics:
         output_tokens_saved: int = 0,
         project: str | None = None,
         client: str | None = None,
+        tool_search_saved: int = 0,
     ):
         """Record metrics for a request."""
         # Post-guard invariant (all providers): Headroom never forwards a request
@@ -709,6 +716,7 @@ class PrometheusMetrics:
             self.tokens_input_total += input_tokens
             self.tokens_output_total += output_tokens
             self.tokens_saved_total += tokens_saved
+            self.tool_search_saved_total += max(0, int(tool_search_saved))
             # See the attribute definition for why this is the right
             # denominator for the active-compression ratio.
             self.attempted_input_tokens_total += max(0, int(attempted_input_tokens))
@@ -1545,33 +1553,5 @@ class PrometheusMetrics:
                 ),
                 value=redactions_total(),
             )
-
-            # Phase G PR-G3 remediation (C4): RTK invocations counter
-            # also lives Python-side. RTK is wrapped by the
-            # `headroom wrap` CLI (headroom.cli.wrap); the proxy
-            # observes invocation counts via a process-local tracker
-            # the wrap tail bumps. The Rust proxy previously held a
-            # dead counter for this; that's been removed.
-            from headroom.cli.wrap_rtk_metrics import rtk_invocation_counts
-
-            counts = rtk_invocation_counts()
-            lines.extend(
-                [
-                    "# HELP wrap_rtk_invocations_total RTK invocations observed via the wrap CLI tail",
-                    "# TYPE wrap_rtk_invocations_total counter",
-                ]
-            )
-            if not counts:
-                # Emit a zero-row under the sentinel tool name so
-                # the family advertises HELP/TYPE on a fresh boot
-                # and dashboards can probe it before any RTK
-                # invocation has happened. Matches the Rust side's
-                # H3 force-zero contract.
-                lines.append('wrap_rtk_invocations_total{tool="__init__"} 0')
-            else:
-                for tool, count in counts.items():
-                    safe_tool = _escape_label_value(str(tool))
-                    lines.append(f'wrap_rtk_invocations_total{{tool="{safe_tool}"}} {count}')
-            lines.append("")
 
             return "\n".join(lines)

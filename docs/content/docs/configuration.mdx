@@ -5,20 +5,6 @@ description: All configuration options for the Headroom Python and TypeScript SD
 
 Headroom can be configured via the SDK constructor, proxy command line, environment variables, or per-request overrides.
 
-## CLI Context Tool
-
-`headroom wrap ...` uses RTK for local shell-output filtering by default.
-Set `HEADROOM_CONTEXT_TOOL=lean-ctx` to have wrap commands install or reuse
-`lean-ctx` and run `lean-ctx init --agent <tool>` instead of RTK setup.
-
-```bash
-export HEADROOM_CONTEXT_TOOL=lean-ctx
-headroom wrap claude
-headroom wrap codex --prepare-only
-```
-
-Supported values are `rtk` and `lean-ctx`; unset defaults to `rtk`.
-
 If Codex history disappeared after using an older wrapper, see [Recover Codex State](/docs/codex-recovery) before wrapping Codex again.
 
 The proxy reads RTK lifetime savings with global scope by default so a shared
@@ -26,7 +12,9 @@ daemon reports savings across the operator's projects. Set
 `HEADROOM_RTK_GAIN_SCOPE=project` to query `rtk gain --project` from the
 proxy process working directory.
 
-## Modes
+## SDK Modes (`default_mode` / `headroom_mode`)
+
+These modes apply to SDK usage via `HeadroomClient(default_mode=...)` or per-request `headroom_mode=...`. They are **not** the same as the proxy `--mode` flag.
 
 | Mode | Behavior | Use Case |
 |------|----------|----------|
@@ -311,8 +299,54 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_BETA_TRACKER_MAX_SESSIONS` | LRU capacity of the in-memory session beta tracker. Once full, the oldest session entry is evicted. | `1000` |
 | `HEADROOM_MODEL_ROUTER_ENABLED` | Enable cost-aware model routing. `1`/`true`/`yes`/`on`/`enabled` turns it on and requires `HEADROOM_MODEL_ROUTES`. See [Cost-aware model routing](/docs/configuration#cost-aware-model-routing). | `off` |
 | `HEADROOM_MODEL_ROUTES` | JSON array of ordered routing rules for cost-aware model routing (schema below). | -- |
+| `HEADROOM_THINKING_COMPACT` | Compact plain-text reasoning that models re-send every turn (Kimi/GLM/DeepSeek `reasoning_content` / inline `<think>`): Kompress it on warm turns, drop it on cold turns. No-op for Claude/Codex/OpenAI (encrypted reasoning). See [Cold-prefix hook](#cold-prefix-hook--reasoning-compaction). | `off` |
+| `HEADROOM_THINKING_COMPACT_KEEP_LAST` | Most-recent assistant turns whose reasoning is left intact (the active reasoning the model still uses). Only applies with `HEADROOM_THINKING_COMPACT`. | `1` |
+| `HEADROOM_COLD_RECOMPACT` | On a confirmed-cold turn (idle past the real cache TTL), recompact the whole prefix — cross-turn dedupe + superseded-read drop + lossless folds — instead of forwarding a byte-identical prefix to a dead cache. Warm turns unchanged. Pair with `HEADROOM_DEDUPE`. See [Cold-prefix hook](#cold-prefix-hook--reasoning-compaction). | `off` |
+| `HEADROOM_DEDUPE` | Whole-conversation verbatim cross-turn dedup in the router (cache-safe, information-preserving via retrieval markers). Superseded-read drop + lossless folds run without it; this adds verbatim dedup. | `off` |
+| `HEADROOM_CACHE_TTL_LEARN` | Append per-turn cache-outcome observations (provider, model, idle, hit/miss) to `cache_ttl_observations.jsonl` for the offline `headroom-cache-ttl` learner. Observation-only (no request-behavior change); respects `HEADROOM_STATELESS`; the log is size-bounded. | `off` |
+| `HEADROOM_KOMPRESS_ENDPOINT` / `HEADROOM_KOMPRESS_ENDPOINT_TOKEN` | Offload ML compression (Kompress) to a remote endpoint instead of the local ONNX model — used by reasoning compaction and the router when set. | -- |
 
 For provider-only proxying, prefer `HEADROOM_HTTP_PROXY` over process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or `NO_PROXY`. HTTPX reads those global variables, but Headroom also passes them through to tool executions.
+
+### Cold-prefix hook & reasoning compaction
+
+Two related optimizations target tokens that agent harnesses re-send every turn:
+model **reasoning** (re-billed as input on Kimi/GLM/DeepSeek and on Claude 4.6+),
+and the **prefix** itself once its prompt cache has lapsed. All flags below are
+**off by default** — the base proxy is unchanged until you opt in.
+
+**What to set for what:**
+
+| Goal | Set | Notes |
+|------|-----|-------|
+| Shrink Kimi/GLM/DeepSeek reasoning re-sent each turn | `HEADROOM_THINKING_COMPACT=1` (+ `HEADROOM_KOMPRESS_ENDPOINT` for the best ratio) | Warm turns Kompress the reasoning; cold turns drop it. No-op for Claude/Codex/OpenAI (their reasoning is an encrypted handle, already cheap on resend). |
+| Recompact a dead-cache prefix instead of re-sending it whole | `HEADROOM_COLD_RECOMPACT=1` (+ `HEADROOM_DEDUPE=1`) | Fires only when the cache has genuinely lapsed. Works in both `cache` and `token` mode. |
+| Learn each provider's real cache TTL | `HEADROOM_CACHE_TTL_LEARN=1`, then run the `headroom-cache-ttl` estimator periodically | Sharpens cold detection for providers that don't expose a TTL (Kimi/OpenAI). |
+
+**How cold detection knows the TTL.** A wrong "cold" call would recompact a
+*warm* prefix and bust the cache, so the TTL must be right:
+
+- **Claude Code:** read exactly, from the request's `cache_control.ttl` plus CC's
+  own controls — `ENABLE_PROMPT_CACHING_1H` (1h), `FORCE_PROMPT_CACHING_5M` (5m),
+  and `DISABLE_PROMPT_CACHING` (+ per-model `DISABLE_PROMPT_CACHING_<FAMILY>`),
+  which turns caching off and makes every turn a free recompaction candidate.
+- **Kimi / OpenAI / Codex:** they don't expose a TTL, so detection uses a
+  conservative default until the learner (`HEADROOM_CACHE_TTL_LEARN` + the
+  `headroom-cache-ttl` plugin) fills in the real value from observed hits/misses.
+
+**Can these be on by default?**
+
+- `HEADROOM_THINKING_COMPACT` — **stays opt-in.** It rewrites model inputs
+  (reasoning the model actively uses) and depends on Kompress, so its quality /
+  latency trade should be a deliberate choice.
+- `HEADROOM_COLD_RECOMPACT` — **opt-in today; a candidate to default for Claude
+  Code** once TTL detection is field-validated. It only fires on confirmed-cold
+  turns and recompacts losslessly, but a mis-read TTL would bust a warm cache
+  (expensive), so it waits for confidence. For Kimi/OpenAI it should stay opt-in
+  until the learner has data.
+- `HEADROOM_CACHE_TTL_LEARN` — **the safest to default on:** observation-only, a
+  size-bounded local log, and it respects `HEADROOM_STATELESS`. Kept opt-in for
+  now so nothing is written to disk unasked.
 
 ### Cost-aware model routing
 

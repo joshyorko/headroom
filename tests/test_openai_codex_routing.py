@@ -205,6 +205,14 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         # synchronously so MagicMock call_count assertions fire.
         return fn()
 
+    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
+        # Test stub for HeadroomProxy._count_tokens_offloaded: resolve the
+        # tokenizer and count inline (the real method offloads to the executor).
+        from headroom.tokenizers import get_tokenizer
+
+        tokenizer = get_tokenizer(model)
+        return tokenizer, tokenizer.count_messages(messages)
+
     async def _record_request_outcome(self, outcome) -> None:
         # Test stub: delegates to the production funnel so wire shape
         # matches HeadroomProxy._record_request_outcome.

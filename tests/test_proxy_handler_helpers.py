@@ -381,6 +381,51 @@ def test_passthrough_usage_normalizes_vertex_usage_metadata() -> None:
     }
 
 
+def test_gemini_output_tokens_includes_thinking_when_exclusive() -> None:
+    """Gemini 2.5 thinking: when prompt + candidates != total, thoughtsTokenCount
+    is a separate output bucket and must be added, or output cost undercounts."""
+    from headroom.proxy.token_counting import gemini_output_tokens
+
+    exclusive = {
+        "promptTokenCount": 1000,
+        "candidatesTokenCount": 200,
+        "thoughtsTokenCount": 500,
+        "totalTokenCount": 1700,
+    }
+    assert gemini_output_tokens(exclusive) == 700  # 200 visible + 500 thinking
+
+    # Inclusive: candidatesTokenCount already covers thoughts (prompt+cand==total).
+    inclusive = {
+        "promptTokenCount": 1000,
+        "candidatesTokenCount": 700,
+        "thoughtsTokenCount": 500,
+        "totalTokenCount": 1700,
+    }
+    assert gemini_output_tokens(inclusive) == 700
+
+    # No thinking tokens: just the candidates count (common non-2.5 case).
+    assert gemini_output_tokens({"candidatesTokenCount": 42, "totalTokenCount": 100}) == 42
+    # Robust to empty / missing fields.
+    assert gemini_output_tokens({}) == 0
+
+
+def test_passthrough_usage_counts_gemini_thinking_tokens() -> None:
+    """_passthrough_usage_from_json must include thinking tokens in output_tokens."""
+    usage = _passthrough_usage_from_json(
+        {
+            "usageMetadata": {
+                "promptTokenCount": 1000,
+                "candidatesTokenCount": 200,
+                "thoughtsTokenCount": 500,
+                "totalTokenCount": 1700,
+                "cachedContentTokenCount": 100,
+            }
+        }
+    )
+    assert usage["output_tokens"] == 700
+    assert usage["input_tokens"] == 1000
+
+
 def test_vertex_passthrough_records_usage_metadata_for_dashboard() -> None:
     handler = object.__new__(HeadroomProxy)
     handler.http_client = _VertexUsageClient()
@@ -712,10 +757,13 @@ def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn()
     ) == [compressed]
 
 
-def test_proxy_helper_creates_fresh_image_compressors(monkeypatch) -> None:
+def test_proxy_helper_reuses_a_singleton_image_compressor(monkeypatch) -> None:
+    # #2513: the compressor caches heavyweight models, so it must be a
+    # process-wide singleton rather than a fresh instance per request.
     from headroom.proxy import helpers
 
     monkeypatch.setattr(helpers, "_image_compressor_available", None)
+    monkeypatch.setattr(helpers, "_image_compressor_instance", None)
     _FreshCompressor.instances = 0
 
     with patch("headroom.image.ImageCompressor", _FreshCompressor):
@@ -723,9 +771,9 @@ def test_proxy_helper_creates_fresh_image_compressors(monkeypatch) -> None:
         second = helpers._get_image_compressor()
 
     assert isinstance(first, _FreshCompressor)
-    assert isinstance(second, _FreshCompressor)
-    assert first is not second
-    assert _FreshCompressor.instances == 2
+    assert first is second
+    assert first._is_singleton is True
+    assert _FreshCompressor.instances == 1
 
 
 def test_proxy_helper_caches_image_stack_import_failure(monkeypatch) -> None:
@@ -742,6 +790,7 @@ def test_proxy_helper_caches_image_stack_import_failure(monkeypatch) -> None:
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(helpers, "_image_compressor_available", None)
+    monkeypatch.setattr(helpers, "_image_compressor_instance", None)
     monkeypatch.setattr(builtins, "__import__", fake_import)
 
     assert helpers._get_image_compressor() is None

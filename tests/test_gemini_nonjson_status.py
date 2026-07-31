@@ -57,6 +57,14 @@ class _Handler(GeminiHandlerMixin):
     async def _record_request_outcome(self, outcome) -> None:  # noqa: ANN001
         self.outcomes.append(outcome)
 
+    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
+        # Test stub for HeadroomProxy._count_tokens_offloaded: resolve the
+        # tokenizer and count inline (the real method offloads to the executor).
+        from headroom.tokenizers import get_tokenizer
+
+        tokenizer = get_tokenizer(model)
+        return tokenizer, tokenizer.count_messages(messages)
+
 
 @pytest.mark.asyncio
 async def test_generate_content_forwards_non_json_upstream_status(

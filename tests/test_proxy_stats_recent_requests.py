@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from headroom.proxy import server
 from headroom.proxy.models import ProxyConfig
 from headroom.proxy.server import create_app
 
@@ -166,17 +165,6 @@ def test_stats_recent_requests_includes_token_incomplete_requests() -> None:
 
 def test_agent_usage_totals_use_proxy_only_savings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
-    monkeypatch.setattr(
-        server,
-        "_get_context_tool_stats",
-        lambda: {
-            "tool": "rtk",
-            "label": "RTK",
-            "tokens_saved": 500,
-            "session": {},
-            "lifetime": {},
-        },
-    )
     app = create_app(
         ProxyConfig(
             optimize=False,
@@ -220,7 +208,7 @@ def test_agent_usage_totals_use_proxy_only_savings(monkeypatch: pytest.MonkeyPat
     assert response.status_code == 200
     payload = response.json()
 
-    assert payload["tokens"]["saved"] == 600
+    assert payload["tokens"]["saved"] == 100
     assert payload["agent_usage"]["totals"]["before_tokens"] == 1000
     assert payload["agent_usage"]["totals"]["tokens_saved"] == 100
     assert payload["agent_usage"]["totals"]["savings_percent"] == 10.0

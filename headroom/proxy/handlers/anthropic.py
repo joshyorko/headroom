@@ -72,46 +72,9 @@ class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
-        """Resolve a tokenizer and count messages off the event loop.
+        from headroom.proxy.token_counting import count_tokens_offloaded
 
-        Tokenizer resolution can be expensive on first use (HuggingFace
-        backends may download vocab files) and counting a full Claude Code
-        conversation is CPU-bound, so both run on the compression executor
-        bounded by ``COMPRESSION_TIMEOUT_SECONDS`` (GH #1701: an unbounded
-        on-loop load froze the whole server). On timeout or error this
-        fails open to character-based estimation.
-
-        Returns:
-            Tuple of ``(tokenizer, token_count)``. The tokenizer is fully
-            initialized, so later ``count_messages`` calls on it are pure
-            CPU work.
-        """
-        from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
-        from headroom.tokenizers import EstimatingTokenCounter, get_tokenizer
-
-        def _resolve_and_count():  # noqa: ANN202
-            tokenizer = get_tokenizer(model)
-            return tokenizer, tokenizer.count_messages(messages)
-
-        try:
-            return await self._run_compression_in_executor(
-                _resolve_and_count,
-                timeout=float(COMPRESSION_TIMEOUT_SECONDS),
-            )
-        except Exception as e:  # fail open — includes asyncio.TimeoutError
-            # Log the downgrade once per model, not per request.
-            fallback_models = getattr(self, "_token_count_fallback_models", None)
-            if fallback_models is None:
-                fallback_models = set()
-                self._token_count_fallback_models = fallback_models
-            if model not in fallback_models:
-                fallback_models.add(model)
-                logger.warning(
-                    f"Token counting for model {model} failed or timed out "
-                    f"({e.__class__.__name__}); falling back to estimation"
-                )
-            estimator = EstimatingTokenCounter()
-            return estimator, estimator.count_messages(messages)
+        return await count_tokens_offloaded(self, model, messages)
 
     @staticmethod
     def _resolve_ccr_workspace(
@@ -1151,6 +1114,46 @@ class AnthropicHandlerMixin:
                     original_client_messages,
                     frozen_message_count,
                 )
+            # Cold-prefix cache-miss hook (HEADROOM_COLD_RECOMPACT). Claude's thinking is
+            # an encrypted handle we can't shrink, so when the prompt cache has lapsed
+            # (idle past TTL → dead, nothing to bust) we instead recompact the whole
+            # prefix — cross-turn dedupe (+HEADROOM_DEDUPE) + superseded-read drop +
+            # lossless folds. Decided once here, then applied per mode below: TOKEN mode
+            # sets frozen_message_count=0 (reuses the frozen==0 path); CACHE mode runs a
+            # lossless whole-prefix recompaction instead of the byte-identical splice
+            # (the splice preserves a dead cache) and skips the overlay replay. Both are
+            # deterministic → the recompacted prefix re-caches byte-stable on warm turns.
+            _cold_recompact_active = False
+            if os.environ.get("HEADROOM_COLD_RECOMPACT", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                from headroom.transforms.cold_prefix import (
+                    anthropic_cache_ttl_seconds,
+                    is_cold_prefix,
+                )
+
+                # Read CC's ACTUAL prompt-cache TTL (request cache_control.ttl + the
+                # DISABLE_/ENABLE_/FORCE_PROMPT_CACHING_* env controls) instead of the
+                # static 300s guess — a wrong TTL is exactly what busts a warm cache.
+                # None ⇒ caching is OFF (no cache to bust) ⇒ recompact every turn.
+                _cc_ttl = anthropic_cache_ttl_seconds(
+                    model, original_client_messages, system_prompt
+                )
+                _cold_recompact_active = _cc_ttl is None or is_cold_prefix(
+                    prefix_tracker, ttl_seconds=_cc_ttl
+                )
+                if _cold_recompact_active:
+                    logger.info(
+                        "[%s] cold-prefix recompaction: cc_cache_ttl=%s idle=%.0fs — recompacting "
+                        "whole prefix (dedupe/superseded-read/lossless)",
+                        request_id,
+                        "disabled" if _cc_ttl is None else f"{_cc_ttl}s",
+                        idle_seconds,
+                    )
+                    if is_token_mode(self.config.mode):
+                        frozen_message_count = 0
 
             # PR-A6 (P5-50, preps P0-6): session-sticky `anthropic-beta` merge.
             # Read the client's beta value (note: anthropic-beta is NOT
@@ -1482,6 +1485,25 @@ class AnthropicHandlerMixin:
                             pipeline_timing = result.timing
                             original_tokens = result.tokens_before
                             optimized_tokens = result.tokens_after
+                    elif _cold_recompact_active:
+                        # CACHE mode, cold turn: the prompt cache is dead, so the
+                        # byte-identical splice preserves nothing. Recompact the whole
+                        # prefix losslessly (dedupe + superseded-read drop + folds) and
+                        # forward that — the overlay replay below is skipped on cold so
+                        # this survives. Deterministic → re-caches byte-stable warm.
+                        from headroom.transforms.cold_prefix import cold_recompact_messages
+
+                        recompacted, _cold_transforms = await self._run_compression_in_executor(
+                            lambda: cold_recompact_messages(
+                                original_client_messages,
+                                tokenizer=tokenizer,
+                                context=extract_user_query(original_client_messages),
+                            ),
+                            timeout=COMPRESSION_TIMEOUT_SECONDS,
+                        )
+                        optimized_messages = recompacted
+                        optimized_tokens = tokenizer.count_messages(optimized_messages)
+                        transforms_applied = _cold_transforms
                     else:
                         previous_original_messages = prefix_tracker.get_last_original_messages()
                         previous_forwarded_messages = prefix_tracker.get_last_forwarded_messages()
@@ -1594,16 +1616,22 @@ class AnthropicHandlerMixin:
                 overlay_cached_prefix,
             )
 
-            _ov = overlay_cached_prefix(
-                optimized_messages,
-                original_client_messages,
-                prefix_tracker.get_last_original_messages(),
-                prefix_tracker.get_last_forwarded_messages(),
-            )
-            _overlay_replayed = _ov != optimized_messages
-            if _overlay_replayed:
-                optimized_messages = _ov
-                optimized_tokens = tokenizer.count_messages(optimized_messages)
+            # On a confirmed-cold turn we deliberately do NOT replay the previously
+            # forwarded prefix: the cache is dead (nothing to keep byte-identical for)
+            # and the replay would clobber the whole-prefix recompaction we just did.
+            if _cold_recompact_active:
+                _overlay_replayed = False
+            else:
+                _ov = overlay_cached_prefix(
+                    optimized_messages,
+                    original_client_messages,
+                    prefix_tracker.get_last_original_messages(),
+                    prefix_tracker.get_last_forwarded_messages(),
+                )
+                _overlay_replayed = _ov != optimized_messages
+                if _overlay_replayed:
+                    optimized_messages = _ov
+                    optimized_tokens = tokenizer.count_messages(optimized_messages)
 
             # Own cache_control placement: the client moves the breakpoint each
             # turn and the overlay replays past markers, so they accumulate ~1/turn
@@ -2422,6 +2450,7 @@ class AnthropicHandlerMixin:
                 run_request_hooks,
             )
 
+            _pre_hook_tokens: int | None = None
             if registered_turn_hooks():
                 _req_ctx = TurnContext(
                     provider="anthropic",
@@ -2430,6 +2459,13 @@ class AnthropicHandlerMixin:
                     tools=body.get("tools"),
                     config=self.config,
                 )
+                # Snapshot BEFORE the hook (same tokenizer) so we can tell whether the
+                # hook itself folded — comparing against the pipeline's optimized_tokens
+                # instead conflates a real fold with a cross-estimator delta (see below).
+                try:
+                    _pre_hook_tokens = tokenizer.count_messages(optimized_messages)
+                except Exception:
+                    _pre_hook_tokens = None
                 run_request_hooks(_req_ctx)
                 if _req_ctx.messages is not optimized_messages:
                     optimized_messages = _req_ctx.messages
@@ -2437,6 +2473,27 @@ class AnthropicHandlerMixin:
                 if _req_ctx.tools is not body.get("tools"):
                     tools = _req_ctx.tools
                     body["tools"] = tools
+
+            # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline
+            # and the handler use different token estimators, and cache-mode branches
+            # can leave original_tokens (handler, line ~1049) and optimized_tokens
+            # (pipeline, result.tokens_after) on different scales — which produced
+            # impossible tok_after>tok_before deltas and masked real savings. Recount
+            # BOTH endpoints (pre-compression snapshot vs final outbound messages) with
+            # the handler tokenizer so the delta is meaningful. This also captures any
+            # turn-hook fold (optimized_messages is post-hook). Runs unconditionally.
+            try:
+                _orig_snapshot = original_client_messages  # noqa: F821 (bound at request start)
+                original_tokens = tokenizer.count_messages(_orig_snapshot)
+                optimized_tokens = tokenizer.count_messages(optimized_messages)
+                tokens_saved = max(0, original_tokens - optimized_tokens)
+                # Attribute the fold to the hook ONLY when the hook itself reduced
+                # tokens (same-tokenizer pre vs post) — not when the recount above
+                # merely normalized a cross-estimator scale difference.
+                if _pre_hook_tokens is not None and optimized_tokens < _pre_hook_tokens:
+                    transforms_applied.append("turn_hook")
+            except Exception:
+                logger.debug("consistency token re-count skipped", exc_info=True)
 
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity
             # steering appended to the system-prompt tail + effort routing on
@@ -2665,6 +2722,13 @@ class AnthropicHandlerMixin:
                             miss = prefix_tracker.classify_cache_miss(
                                 cache_read_tokens=cr_tokens,
                                 current_forwarded_messages=optimized_messages,
+                            )
+                            from headroom.cache.ttl_observations import (
+                                record_cache_observation,
+                            )
+
+                            record_cache_observation(
+                                provider="anthropic", model=model, attribution=miss
                             )
                             if miss.is_miss:
                                 logger.info(
@@ -3296,6 +3360,13 @@ class AnthropicHandlerMixin:
                             miss = prefix_tracker.classify_cache_miss(
                                 cache_read_tokens=cr_tokens,
                                 current_forwarded_messages=optimized_messages,
+                            )
+                            from headroom.cache.ttl_observations import (
+                                record_cache_observation,
+                            )
+
+                            record_cache_observation(
+                                provider="anthropic", model=model, attribution=miss
                             )
                             if miss.is_miss:
                                 logger.info(

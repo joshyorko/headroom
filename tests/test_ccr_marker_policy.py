@@ -27,6 +27,13 @@ def test_has_new_ccr_markers_filters_replayed_forwarded_markers() -> None:
     )
 
 
+def test_source_line_span_marker_is_still_detected() -> None:
+    # The compressor annotates the count with a source-line span (#2586); the
+    # retrieval hash must still be extracted from the enriched marker.
+    marker = "[122 items compressed to 27 (from 5 source lines). Retrieve more: hash=c00eb437e5e5c00eb437e5e5]"
+    assert _hashes(marker) == ["c00eb437e5e5c00eb437e5e5"]
+
+
 def test_has_new_ccr_markers_detects_hash_not_seen_in_previous_forward() -> None:
     old = "[100 items compressed to 10. Retrieve more: hash=abc123def456abc123def456]"
     new = "[50 items compressed to 5. Retrieve more: hash=deadbeefdeadbeefdeadbeef]"

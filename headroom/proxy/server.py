@@ -963,6 +963,21 @@ class HeadroomProxy(
             transforms=[*_intercept_prefix, cache_aligner, openai_router],
             provider=self.openai_provider,
         )
+        # Build the DEFAULT /v1/compress pipeline now, not on first request.
+        # It is a ContentRouter derived from `openai_router` (marker-free), so
+        # a lazy build would land inside the bounded compression executor on a
+        # cold pod's very first gateway request — paying router construction
+        # and, when the ML model runs in-process, model load against the 30 s
+        # compression budget. Building it here also lets startup warmup see it
+        # (`_eager_preload_transforms`). Never fatal: on failure the handler
+        # falls back to the original lazy path.
+        try:
+            self._no_ccr_pipeline()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(
+                "Eager /v1/compress pipeline build failed (%s); deferring to first request",
+                exc,
+            )
 
         # Initialize components
         self.cache = (
@@ -1587,7 +1602,12 @@ class HeadroomProxy(
         eager_status: dict[str, str] = {}
         transform_statuses: list[dict[str, str]] = []
         seen_transform_ids: set[int] = set()
-        for pipeline in (self.anthropic_pipeline, self.openai_pipeline):
+        # The derived /v1/compress pipelines (built eagerly in __init__) own
+        # their own ContentRouter instances, so dedup-by-id() does not cover
+        # them via the two request pipelines — warm them explicitly or the
+        # first gateway request still pays the compressor load.
+        derived_pipelines = list(getattr(self, "_compress_pipeline_cache", {}).values())
+        for pipeline in (self.anthropic_pipeline, self.openai_pipeline, *derived_pipelines):
             for transform in pipeline.transforms:
                 if id(transform) in seen_transform_ids:
                     continue

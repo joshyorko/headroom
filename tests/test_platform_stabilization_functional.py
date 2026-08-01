@@ -68,7 +68,10 @@ def test_v1_compress_success_reports_actual_metrics(monkeypatch) -> None:
             markers_inserted=["marker-1"],
         )
 
-    monkeypatch.setattr(proxy.openai_pipeline, "apply", fake_apply)
+    # The default /v1/compress mode runs a marker-free pipeline derived from
+    # `openai_pipeline`, not `openai_pipeline` itself, so patch the one the
+    # route actually uses. It is built eagerly at create_app() time.
+    monkeypatch.setattr(proxy._compress_pipeline_cache["no_ccr"], "apply", fake_apply)
 
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
         response = client.post(

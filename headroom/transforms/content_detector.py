@@ -111,6 +111,13 @@ _CODE_PATTERNS = {
         ),
         re.compile(r"^.*\b(get|set|init);"),  # auto-property accessors
     ],
+    "php": [
+        re.compile(r"<\?php\b"),
+        re.compile(r"^\s*namespace\s+[\w\\]+\s*;"),
+        re.compile(r"^\s*use\s+[\w\\]+(\s+as\s+\w+)?\s*;"),
+        re.compile(r"^\s*(public|private|protected|static|abstract|final)?\s*function\s+\w+\s*\("),
+        re.compile(r"\$this->"),
+    ],
 }
 
 # Structured-config (YAML/TOML/INI) patterns. TOML and INI share the

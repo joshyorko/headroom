@@ -428,6 +428,211 @@ class TestCompressEndpointLossyInlineMode:
         assert response.json()["ccr_hashes"] == []
 
 
+class TestCompressEndpointModeValidation:
+    """``config.mode`` must be validated, not silently ignored.
+
+    Before this, ``mode: "lossless"`` (a mode that does not exist) or any typo
+    fell through to the default pipeline and the caller got a 200 describing a
+    compression posture it never asked for.
+    """
+
+    @pytest.mark.parametrize(
+        "bad_mode",
+        ["lossless", "CCR", "ccr ", "no_ccr", "", 7, ["ccr"]],
+    )
+    def test_unknown_mode_returns_400(self, client, bad_mode):
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "config": {"mode": bad_mode},
+            },
+        )
+        assert response.status_code == 400
+        data = response.json()
+        assert data["error"]["type"] == "invalid_request"
+        message = data["error"]["message"]
+        # The message must tell the caller what IS valid.
+        for valid in ("ccr", "lossy_inline", "lossless_then_lossy"):
+            assert valid in message
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {},  # mode unset -> default marker-free pipeline
+            {"mode": None},  # explicit null is the same as unset
+            {"mode": "ccr"},
+            {"mode": "lossy_inline"},
+            {"mode": "lossless_then_lossy"},
+        ],
+        ids=["unset", "null", "ccr", "lossy_inline", "lossless_then_lossy"],
+    )
+    def test_valid_modes_return_200(self, client, config):
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "config": config,
+            },
+        )
+        assert response.status_code == 200
+        assert isinstance(response.json()["messages"], list)
+
+
+class TestCompressDefaultPipelineBuiltAtStartup:
+    """The default (marker-free) /v1/compress pipeline must exist before the
+    first request.
+
+    It used to be built lazily, so a cold pod paid ContentRouter construction —
+    and in-process ML model load — inside the bounded compression executor on
+    its first real gateway request.
+    """
+
+    def test_default_pipeline_exists_before_any_request(self):
+        config = ProxyConfig(
+            optimize=True,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+        )
+        # No TestClient / no request: only create_app().
+        proxy = create_app(config).state.proxy
+
+        cache = getattr(proxy, "_compress_pipeline_cache", None)
+        assert cache, "default /v1/compress pipeline was not built at startup"
+        assert "no_ccr" in cache
+        # It must be a DERIVED pipeline, not the shared request pipeline.
+        assert cache["no_ccr"] is not proxy.openai_pipeline
+
+    def test_startup_warmup_covers_the_derived_router(self):
+        """The eager compressor preload must walk the derived pipeline too."""
+        config = ProxyConfig(
+            optimize=True,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+        )
+        proxy = create_app(config).state.proxy
+
+        derived = proxy._compress_pipeline_cache["no_ccr"]
+        derived_ids = {id(t) for t in derived.transforms}
+
+        seen: list[int] = []
+        for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
+            seen.extend(id(t) for t in pipeline.transforms)
+        # Precondition: the derived router is NOT reachable via the request
+        # pipelines, so dedup-by-id() cannot have covered it implicitly.
+        assert derived_ids - set(seen)
+
+        _status, transform_statuses = proxy._eager_preload_transforms()
+        # Base router + derived router both report a status dict.
+        assert len(transform_statuses) >= 2
+
+
+class TestCompressContextLimitByModelFamily:
+    """LiteLLM's guardrail forwards Anthropic model names through this
+    OpenAI-shaped route; the context limit must come from the Anthropic
+    provider for those, not the OpenAI provider's 128K default."""
+
+    @staticmethod
+    def _spy_providers(proxy, monkeypatch):
+        anthropic_calls: list[str] = []
+        openai_calls: list[str] = []
+
+        def anthropic_limit(model):
+            anthropic_calls.append(model)
+            return 987_654
+
+        def openai_limit(model):
+            openai_calls.append(model)
+            return 123_456
+
+        monkeypatch.setattr(proxy.anthropic_provider, "get_context_limit", anthropic_limit)
+        monkeypatch.setattr(proxy.openai_provider, "get_context_limit", openai_limit)
+        return anthropic_calls, openai_calls
+
+    @staticmethod
+    def _spy_pipeline(proxy, monkeypatch):
+        """Capture the kwargs handed to the default (marker-free) pipeline."""
+        seen: dict = {}
+
+        def fake_apply(**kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(
+                messages=kwargs["messages"],
+                tokens_before=10,
+                tokens_after=10,
+                transforms_applied=[],
+                transforms_summary={},
+                markers_inserted=[],
+            )
+
+        monkeypatch.setattr(proxy._compress_pipeline_cache["no_ccr"], "apply", fake_apply)
+        return seen
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-sonnet-4-5-20250929",
+            "bedrock/anthropic.claude-3-5-sonnet",
+            "anthropic/claude-opus-4",
+            "CLAUDE-Sonnet-4-5",  # case-insensitive
+        ],
+    )
+    def test_claude_models_use_anthropic_context_limit(self, client, monkeypatch, model):
+        proxy = client.app.state.proxy
+        anthropic_calls, openai_calls = self._spy_providers(proxy, monkeypatch)
+        seen = self._spy_pipeline(proxy, monkeypatch)
+
+        response = client.post(
+            "/v1/compress",
+            json={"messages": [{"role": "user", "content": "hello"}], "model": model},
+        )
+
+        assert response.status_code == 200
+        assert anthropic_calls == [model]
+        assert openai_calls == []
+        assert seen["model_limit"] == 987_654
+
+    def test_openai_models_still_use_openai_context_limit(self, client, monkeypatch):
+        proxy = client.app.state.proxy
+        anthropic_calls, openai_calls = self._spy_providers(proxy, monkeypatch)
+        seen = self._spy_pipeline(proxy, monkeypatch)
+
+        response = client.post(
+            "/v1/compress",
+            json={"messages": [{"role": "user", "content": "hello"}], "model": "gpt-4o"},
+        )
+
+        assert response.status_code == 200
+        assert openai_calls == ["gpt-4o"]
+        assert anthropic_calls == []
+        assert seen["model_limit"] == 123_456
+
+    def test_token_budget_still_overrides_for_claude_models(self, client, monkeypatch):
+        """token_budget precedence must survive the provider routing."""
+        proxy = client.app.state.proxy
+        anthropic_calls, openai_calls = self._spy_providers(proxy, monkeypatch)
+        seen = self._spy_pipeline(proxy, monkeypatch)
+
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "claude-sonnet-4-5-20250929",
+                "token_budget": 4096,
+            },
+        )
+
+        assert response.status_code == 200
+        assert seen["model_limit"] == 4096
+        # Neither provider is consulted when the caller pins a budget.
+        assert anthropic_calls == []
+        assert openai_calls == []
+
+
 class TestCompressEndpointDoesNotBlockLoop:
     """/v1/compress must offload to the compression executor so a slow/large
     payload cannot freeze the single event loop (#718)."""
@@ -477,6 +682,9 @@ class TestCompressEndpointDoesNotBlockLoop:
                     json={
                         "messages": [{"role": "user", "content": "hello world"}],
                         "model": "gpt-4",
+                        # mode="ccr" routes to `openai_pipeline` (the default is a
+                        # derived marker-free pipeline); this test patches that one.
+                        "config": {"mode": "ccr"},
                     },
                 )
             )

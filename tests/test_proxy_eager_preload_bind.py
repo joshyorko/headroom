@@ -36,7 +36,14 @@ def _make_proxy(*, optimize: bool):
         image_optimize=False,
         subscription_tracking_enabled=False,
     )
-    return create_app(config).state.proxy
+    proxy = create_app(config).state.proxy
+    # Every test here substitutes fake pipelines to control exactly what the
+    # preload walks. The proxy also eagerly builds the default /v1/compress
+    # pipeline (a derived ContentRouter, warmed alongside the request
+    # pipelines), which would inject real transform statuses into those
+    # assertions — drop it so the fakes remain the only input.
+    proxy._compress_pipeline_cache = {}
+    return proxy
 
 
 class _FastTransform:

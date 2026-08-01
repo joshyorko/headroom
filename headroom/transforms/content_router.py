@@ -78,7 +78,11 @@ from .content_detector import (
 )
 from .content_detector import detect_content_type as _regex_detect_content_type
 from .error_detection import content_has_strong_error_indicators
-from .lossless_provider import get_lossless_provider
+from .lossless_provider import (
+    get_lossless_generation,
+    get_lossless_provider,
+    get_lossless_verifier,
+)
 from .mixed_content import ContentSection, mixed_content_indicators
 from .relevance_split import build_relevance_query, plan_relevance_split
 
@@ -99,6 +103,17 @@ _detect_native_verified = False  # native detect has returned once -> skip the w
 # content-type aware incl. JSON). Kept as one module-level instance so the
 # size heuristic lives in a single reusable place, not a hardcoded constant.
 _TOKEN_ESTIMATOR = EstimatingTokenCounter()
+
+
+# `kind` labels supplied by a third-party lossless provider flow into
+# `transforms_applied`, `transforms_summary` and the per-strategy metric/timing
+# dicts (which become Prometheus label values). An unbounded caller-controlled
+# string there is a label-cardinality explosion, so only a short, lowercase,
+# identifier-shaped label is accepted; anything else is replaced with
+# `_PROVIDER_KIND_FALLBACK` rather than raising (a bad label must not fail a
+# request, and the fold itself is still valid).
+_PROVIDER_KIND_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+_PROVIDER_KIND_FALLBACK = "provider"
 
 
 def _estimate_tokens(text: str) -> int:
@@ -1700,6 +1715,12 @@ class ContentRouter(Transform):
     # (fewer lossy chains, safer); 0 = keep the lossy pass on any improvement.
     _DEFAULT_LOSSY_MIN_EXTRA_SAVINGS = 0.05
 
+    # Entry cap for the `_lossless_first` memo. Sized for "the blocks of a
+    # handful of in-flight requests", not for cross-request reuse — on overflow
+    # the whole dict is dropped rather than evicted entry-by-entry, which keeps
+    # the memo O(1) and unlockable at the cost of an occasional cold start.
+    _LOSSLESS_FIRST_MEMO_MAX = 256
+
     def __init__(
         self,
         config: ContentRouterConfig | None = None,
@@ -1764,6 +1785,23 @@ class ContentRouter(Transform):
         self._relevance_scorer: Any = None
         self._relevance_scorer_tried: bool = False
         self._relevance_prewarm_started: bool = False
+        # STAGE 0 memo: `(hash(content), len(content), strategy) -> (best, label)`.
+        # `_lossless_first` is a pure function of its arguments but is called
+        # twice for the same block (`_has_lossless_fold` probes it, then STAGE 0
+        # recomputes it), which also means a registered lossless provider gets
+        # invoked twice. Bounded by `_LOSSLESS_FIRST_MEMO_MAX` with a wholesale
+        # clear (no LRU bookkeeping — this is a within-request hit, not a
+        # long-lived cache; `_cache` is the cross-request one).
+        self._lossless_first_memo: dict[
+            tuple[int, int, CompressionStrategy, int], tuple[str, str | None]
+        ] = {}
+        # Companion memo for the third-party half of STAGE 0, keyed by content
+        # (plus the provider generation) but NOT by strategy — the provider
+        # contract takes no strategy, so the two probes above, which pass
+        # different strategies for the same block, share one provider
+        # invocation. See `_lossless_provider_result`.
+        self._lossless_provider_memo: dict[tuple[int, int, int], tuple[str, str] | None] = {}
+
         # tool_call_id → compact args text, populated by _build_tool_name_map.
         self._tool_call_args: dict[str, str] = {}
         # tool_call_id → raw shell command (bash-search fold), same population.
@@ -2462,6 +2500,26 @@ class ContentRouter(Transform):
         """
         from headroom.transforms.lossless_compaction import compact_lossless
 
+        # Memo: `_has_lossless_fold` probes this method purely to decide whether a
+        # small block is worth admitting and throws the result away, and the real
+        # STAGE 0 pass then recomputes it. That doubles the built-in folds *and*
+        # the third-party provider call for every block that takes both paths.
+        # The method is a pure function of (content, strategy), so cache it.
+        # Resolved with `getattr` so the method still works on a bare instance
+        # (`object.__new__(ContentRouter)`, used by unit tests that exercise the
+        # folds without paying for a full router init).
+        memo = getattr(self, "_lossless_first_memo", None)
+        if memo is None:
+            memo = self._lossless_first_memo = {}
+        # The provider generation is part of the key: this memo caches a value
+        # that DEPENDS on the registered provider, so a provider registered (or
+        # cleared) after a block was first folded must not be served the old
+        # answer forever.
+        memo_key = (hash(content), len(content), strategy, get_lossless_generation())
+        memoized = memo.get(memo_key)
+        if memoized is not None:
+            return memoized
+
         # Apply losslessness to the OUTPUT structure, not to the classification:
         # try the fold implied by the detected strategy first, then the others.
         # Each compact_lossless call is self-verifying (exact inverse or returns
@@ -2498,7 +2556,131 @@ class ContentRouter(Transform):
                 continue
             if len(cand) < len(best):
                 best, best_label = cand, f"lossless_{kind}"
+
+        # A registered lossless provider (headroom.transforms.lossless_provider)
+        # competes on the GENERAL path too, not only on excluded-tool output via
+        # `_lossless_compact_excluded`. Without this an external fold only ever
+        # saw Read/Grep/Glob-style results, so it was inert for gateway traffic
+        # (`/v1/compress`), where tool names are the caller's own. Same contract
+        # (information-preserving + deterministic) and we keep whichever output
+        # is smaller, so a provider can only improve on the built-in folds.
+        #
+        # Diffs are off limits for a provider, for the same reason the built-in
+        # "diff" fold is restricted above: diff folding is subtractive with no
+        # inverse check, and a Kompressed/reflowed hunk breaks `git apply`. The
+        # built-in path can at least reason about its own fold; a third-party one
+        # we cannot, so we simply never offer it diff content.
+        if strategy is not CompressionStrategy.DIFF and not self._looks_like_diff(content):
+            best, best_label = self._apply_lossless_provider(content, best, best_label)
+
+        # Plain dict operations only: this is a pure-function cache, so a racing
+        # double-compute under the parallel compression pool (see
+        # HEADROOM_COMPRESS_WORKERS) costs one redundant fold and nothing else.
+        # A lock here would sit on the hot path of every block for no
+        # correctness gain. Bounded by a wholesale clear rather than LRU
+        # bookkeeping — the memo exists to collapse a within-request double
+        # call, not to be a cross-request cache (`self._cache` is that).
+        if len(memo) >= self._LOSSLESS_FIRST_MEMO_MAX:
+            memo.clear()
+        memo[memo_key] = (best, best_label)
         return best, best_label
+
+    def _apply_lossless_provider(
+        self, content: str, best: str, best_label: str | None
+    ) -> tuple[str, str | None]:
+        """Let a registered lossless provider beat ``best``; never raise.
+
+        The provider only wins on a strictly smaller, non-blank candidate — and
+        in lossless-only mode only if an optionally registered verifier confirms
+        the fold is genuinely reversible.
+        """
+        supplied = self._lossless_provider_result(content)
+        if supplied is None:
+            return best, best_label
+        cand, kind = supplied
+
+        if len(cand) >= len(best):
+            return best, best_label
+
+        # Lossless-only mode has no downstream recovery: STAGE 0's output IS the
+        # answer and there is no CCR marker to retrieve the original from. The
+        # built-in folds are self-verifying; a provider is trusted unless the
+        # operator registered a verifier, in which case it must pass.
+        if self.config.lossless:
+            verifier = get_lossless_verifier()
+            if verifier is not None:
+                try:
+                    ok = verifier(content, cand)
+                except Exception:  # noqa: BLE001 - a raising verifier means "unverified"
+                    logger.debug("lossless verifier raised; rejecting candidate", exc_info=True)
+                    return best, best_label
+                if not ok:
+                    logger.debug("lossless verifier rejected the provider candidate")
+                    return best, best_label
+
+        return cand, f"lossless_{kind}"
+
+    def _lossless_provider_result(self, content: str) -> tuple[str, str] | None:
+        """Validated + memoized ``(candidate, safe_kind)`` from the provider.
+
+        Everything a third-party provider hands back is treated as hostile: a
+        malformed shape, an empty result, a metric-unsafe ``kind`` label or an
+        outright exception all degrade to ``None`` ("provider ignored"). This
+        runs on the request path and its caller (``TransformPipeline.apply``)
+        re-raises, so nothing here may escape.
+
+        Memoized per ``(hash(content), len(content))`` — the provider contract is
+        ``content -> result`` with no other input, so its answer cannot depend on
+        the routing strategy. That matters because one block reaches
+        ``_lossless_first`` twice under *different* strategies (the
+        ``_has_lossless_fold`` admission probe passes PASSTHROUGH, STAGE 0 passes
+        the detected strategy), which would otherwise invoke third-party code
+        twice per block. Same no-lock rationale as the ``_lossless_first`` memo.
+        """
+        provider = get_lossless_provider()
+        if provider is None:
+            return None
+
+        memo = getattr(self, "_lossless_provider_memo", None)
+        if memo is None:
+            memo = self._lossless_provider_memo = {}
+        memo_key = (hash(content), len(content), get_lossless_generation())
+        if memo_key in memo:
+            return memo[memo_key]
+
+        result: tuple[str, str] | None = None
+        try:
+            supplied = provider(content)
+            if supplied is None:
+                result = None
+            # Validate defensively *inside* the try: unpacking a 3-tuple / a bare
+            # string / a non-sequence raises, and that exception used to escape
+            # all the way out of the request.
+            elif not isinstance(supplied, tuple | list) or len(supplied) != 2:
+                logger.debug("lossless provider returned a malformed result; ignoring")
+            elif not isinstance(supplied[0], str) or not isinstance(supplied[1], str):
+                logger.debug("lossless provider returned non-str members; ignoring")
+            # An empty / whitespace-only "fold" wins every length comparison and
+            # would silently delete the block's content. That is not lossless.
+            elif not supplied[0].strip():
+                logger.debug("lossless provider returned an empty result; ignoring")
+            else:
+                raw_kind = supplied[1]
+                # fullmatch, not match: Python's `$` also matches just BEFORE a
+                # trailing newline, so `re.match` would let "log\n" through and
+                # put a newline into a metric label.
+                kind = (
+                    raw_kind if _PROVIDER_KIND_RE.fullmatch(raw_kind) else _PROVIDER_KIND_FALLBACK
+                )
+                result = (supplied[0], kind)
+        except Exception:  # noqa: BLE001 - a broken provider must not break routing
+            logger.debug("lossless provider failed in _lossless_first", exc_info=True)
+            result = None
+
+        if len(memo) >= self._LOSSLESS_FIRST_MEMO_MAX:
+            memo.clear()
+        memo[memo_key] = result
+        return result
 
     @staticmethod
     def _looks_like_diff(content: str) -> bool:
@@ -2508,7 +2690,8 @@ class ContentRouter(Transform):
         Kompressing hunks corrupts ``git apply``. This is defense-in-depth beyond the
         DIFF-strategy and ``lossless_diff``-label checks: a diff can be folded
         best under a non-diff label (e.g. blank-line collapse → ``lossless_text``)
-        or mis-detected, and must still never reach the lossy stage.
+        or mis-detected, and must still never reach the lossy stage. It is also
+        what keeps a third-party lossless provider away from diffs entirely.
         """
         return (
             "diff --git " in content

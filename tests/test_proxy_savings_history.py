@@ -1227,9 +1227,11 @@ def test_savings_tracker_batches_saves_and_matches_immediate(tmp_path):
     batched.record_request(**events[2])  # buffered again
     batched.flush()  # tail persisted
 
-    assert json.loads(batched_path.read_text(encoding="utf-8")) == json.loads(
-        immediate_path.read_text(encoding="utf-8")
-    )
+    batched_payload = json.loads(batched_path.read_text(encoding="utf-8"))
+    immediate_payload = json.loads(immediate_path.read_text(encoding="utf-8"))
+    for payload in (batched_payload, immediate_payload):
+        payload["lifetime_metrics"]["persistence"].pop("last_saved_at", None)
+    assert batched_payload == immediate_payload
 
 
 def test_failed_save_retries_on_next_record_not_after_full_window(tmp_path, monkeypatch):

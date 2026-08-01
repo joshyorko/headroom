@@ -68,6 +68,12 @@ trust_level = "trusted"
     parsed = tomllib.loads(content)
     assert content.count("[model_providers.headroom]") == 1
     assert parsed["model_provider"] == "headroom"
+    assert parsed["experimental_realtime_webrtc_call_base_url"] == (
+        "http://headroom.example.test/p/headroom/v1"
+    )
+    assert parsed["experimental_realtime_ws_base_url"] == (
+        "http://headroom.example.test/p/headroom/v1"
+    )
     assert parsed["model_providers"]["headroom"]["base_url"] == (
         "http://headroom.example.test/p/headroom/v1"
     )

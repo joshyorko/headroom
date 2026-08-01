@@ -601,6 +601,12 @@ class TestSubscriptionRouting:
         assert "requires_openai_auth = true" in (config_dir / "config.toml").read_text(
             encoding="utf-8"
         )
+        content = (config_dir / "config.toml").read_text(encoding="utf-8")
+        assert (
+            'experimental_realtime_webrtc_call_base_url = '
+            '"http://127.0.0.1:8787/backend-api/codex"'
+        ) in content
+        assert 'experimental_realtime_ws_base_url = "http://127.0.0.1:8787/v1"' in content
 
     def test_inject_omits_requires_openai_auth_for_api_key(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -612,9 +618,12 @@ class TestSubscriptionRouting:
 
         wrap_mod._inject_codex_provider_config(8787)
 
-        assert "requires_openai_auth" not in (config_dir / "config.toml").read_text(
-            encoding="utf-8"
-        )
+        content = (config_dir / "config.toml").read_text(encoding="utf-8")
+        assert "requires_openai_auth" not in content
+        assert (
+            'experimental_realtime_webrtc_call_base_url = "http://127.0.0.1:8787/v1"'
+        ) in content
+        assert 'experimental_realtime_ws_base_url = "http://127.0.0.1:8787/v1"' in content
 
     def test_openai_base_url_port_updates_on_rewrap(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -627,6 +636,8 @@ class TestSubscriptionRouting:
         content = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
         assert 'openai_base_url = "http://127.0.0.1:9999/v1"' in content
         assert 'openai_base_url = "http://127.0.0.1:8787/v1"' not in content
+        assert 'experimental_realtime_ws_base_url = "http://127.0.0.1:9999/v1"' in content
+        assert 'experimental_realtime_ws_base_url = "http://127.0.0.1:8787/v1"' not in content
 
     def test_openai_base_url_removed_on_unwrap(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1701,6 +1712,8 @@ def test_init_and_wrap_prepare_only_are_idempotent_full_setup(
     assert content.count("[model_providers.headroom]") == 1
     assert parsed["model_provider"] == "headroom"
     assert parsed["openai_base_url"] == "http://10.10.10.89/v1"
+    assert parsed["experimental_realtime_webrtc_call_base_url"] == "http://10.10.10.89/v1"
+    assert parsed["experimental_realtime_ws_base_url"] == "http://10.10.10.89/v1"
     assert provider["base_url"] == "http://10.10.10.89/v1"
     assert provider["env_http_headers"] == {"X-Headroom-Project": "HEADROOM_PROJECT"}
     assert parsed["mcp_servers"]["headroom"]["env"]["HEADROOM_PROXY_URL"] == "http://10.10.10.89"

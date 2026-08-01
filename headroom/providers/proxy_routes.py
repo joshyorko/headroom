@@ -20,6 +20,10 @@ from headroom.providers.openai_images import (
     OpenAIImageEndpoint,
     handle_openai_image_endpoint,
 )
+from headroom.providers.openai_realtime import (
+    handle_realtime_call,
+    relay_realtime_websocket,
+)
 from headroom.providers.openai_responses import (
     OPENAI_RESPONSES_ROOT_PATHS,
     OPENAI_RESPONSES_SUBPATH_ROUTES,
@@ -240,6 +244,51 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
 
     _register_openai_responses_routes(app, proxy)
+
+    @app.post("/v1/realtime/calls")
+    async def openai_realtime_call(request: Request):
+        assert proxy.http_client is not None
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        return await handle_realtime_call(
+            proxy.http_client,
+            request,
+            api_base_url=custom_base.rstrip("/") or _api_target(proxy, "openai"),
+            chatgpt_backend=False,
+            extra_headers=getattr(proxy.config, "openai_extra_headers", None),
+        )
+
+    @app.post("/backend-api/codex/realtime/calls")
+    async def chatgpt_realtime_call(request: Request):
+        assert proxy.http_client is not None
+        return await handle_realtime_call(
+            proxy.http_client,
+            request,
+            api_base_url=_api_target(proxy, "openai"),
+            chatgpt_backend=True,
+            extra_headers=getattr(proxy.config, "openai_extra_headers", None),
+        )
+
+    @app.websocket("/v1/realtime")
+    async def openai_realtime_sideband(websocket: WebSocket):
+        custom_base = websocket.headers.get("x-headroom-base-url", "").strip()
+        await relay_realtime_websocket(
+            websocket,
+            api_base_url=custom_base.rstrip("/") or _api_target(proxy, "openai"),
+            upstream_path="/v1/realtime",
+            proxy_token=getattr(proxy.config, "proxy_token", None),
+            extra_headers=getattr(proxy.config, "openai_extra_headers", None),
+        )
+
+    @app.websocket("/v1/live/{call_id}")
+    async def openai_live_sideband(websocket: WebSocket, call_id: str):
+        custom_base = websocket.headers.get("x-headroom-base-url", "").strip()
+        await relay_realtime_websocket(
+            websocket,
+            api_base_url=custom_base.rstrip("/") or _api_target(proxy, "openai"),
+            upstream_path=f"/v1/live/{call_id}",
+            proxy_token=getattr(proxy.config, "proxy_token", None),
+            extra_headers=getattr(proxy.config, "openai_extra_headers", None),
+        )
 
     _register_provider_handler_routes(app, proxy)
 

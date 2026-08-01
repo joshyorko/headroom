@@ -466,6 +466,15 @@ def _codex_provider_matches(content: str, provider_url: str, *, requires_openai_
         return False
     if parsed.get("openai_base_url") != provider_url:
         return False
+    expected_call_url = (
+        f"{provider_url.removesuffix('/v1')}/backend-api/codex"
+        if requires_openai_auth
+        else provider_url
+    )
+    if parsed.get("experimental_realtime_webrtc_call_base_url") != expected_call_url:
+        return False
+    if parsed.get("experimental_realtime_ws_base_url") != provider_url:
+        return False
     if provider.get("name") != "OpenAI via Headroom proxy":
         return False
     if provider.get("base_url") != provider_url:
@@ -491,6 +500,11 @@ def _ensure_codex_provider(path: Path, provider_url: str | int) -> None:
     # login (#406).
     uses_chatgpt_auth = codex_uses_chatgpt_auth(path.parent / "auth.json")
     requires_openai_auth = "requires_openai_auth = true\n" if uses_chatgpt_auth else ""
+    realtime_call_url = (
+        f"{provider_url.removesuffix('/v1')}/backend-api/codex"
+        if uses_chatgpt_auth
+        else provider_url
+    )
     content = path.read_text(encoding="utf-8") if path.exists() else ""
     if _codex_provider_matches(content, provider_url, requires_openai_auth=uses_chatgpt_auth):
         retag_to_headroom(path.parent)
@@ -498,7 +512,9 @@ def _ensure_codex_provider(path: Path, provider_url: str | int) -> None:
     block = (
         f"{_CODEX_PROVIDER_MARKER_START}\n"
         'model_provider = "headroom"\n'
-        f"openai_base_url = {_toml_string(provider_url)}\n\n"
+        f"openai_base_url = {_toml_string(provider_url)}\n"
+        f"experimental_realtime_webrtc_call_base_url = {_toml_string(realtime_call_url)}\n"
+        f"experimental_realtime_ws_base_url = {_toml_string(provider_url)}\n\n"
         "[model_providers.headroom]\n"
         'name = "OpenAI via Headroom proxy"\n'
         f"base_url = {_toml_string(provider_url)}\n"
@@ -527,6 +543,11 @@ def _ensure_codex_provider(path: Path, provider_url: str | int) -> None:
     root, rest = content[:_split], content[_split:]
     root = re.sub(r"(?m)^[ \t]*model_provider[ \t]*=.*\r?\n", "", root)
     root = re.sub(r"(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n", "", root)
+    root = re.sub(
+        r"(?m)^[ \t]*experimental_realtime_(?:webrtc_call|ws)_base_url[ \t]*=.*\r?\n",
+        "",
+        root,
+    )
     content = root + rest
     # The provider block carries top-level keys (model_provider, openai_base_url),
     # so it must land at the document root rather than after a trailing table (#260).

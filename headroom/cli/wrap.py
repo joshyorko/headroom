@@ -2272,7 +2272,12 @@ def _strip_codex_headroom_blocks(
 # we can rewrite it cleanly.  Bare keys must precede any [section] in TOML,
 # so a `^` anchor combined with `^[ \t]*key` is sufficient — table lines
 # start with `[`, not with the key name.
-_REDIRECTABLE_KEYS: tuple[str, ...] = ("model_provider", "openai_base_url")
+_REDIRECTABLE_KEYS: tuple[str, ...] = (
+    "model_provider",
+    "openai_base_url",
+    "experimental_realtime_webrtc_call_base_url",
+    "experimental_realtime_ws_base_url",
+)
 
 
 def _strip_existing_codex_headroom_provider_table(content: str) -> str:
@@ -2289,7 +2294,9 @@ def _strip_existing_codex_headroom_provider_table(content: str) -> str:
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
 
-def _redirect_existing_top_level_keys(content: str, provider_url: str) -> str:
+def _redirect_existing_top_level_keys(
+    content: str, provider_url: str, *, uses_chatgpt_auth: bool = False
+) -> str:
     """Rewrite user-defined top-level keys so wrap does not create duplicates.
 
     Codex's ``config.toml`` rejects duplicate top-level keys (TOML spec),
@@ -2318,7 +2325,13 @@ def _redirect_existing_top_level_keys(content: str, provider_url: str) -> str:
             original_value = match.group("value")
             if current_key == "model_provider":
                 new_value = "headroom"
-            else:  # openai_base_url
+            elif current_key == "experimental_realtime_webrtc_call_base_url":
+                new_value = (
+                    f"{provider_url.removesuffix('/v1')}/backend-api/codex"
+                    if uses_chatgpt_auth
+                    else provider_url
+                )
+            else:
                 new_value = provider_url
             if original_value == new_value:
                 return match.group(0)
@@ -2585,8 +2598,12 @@ def _inject_codex_provider_config(port: int, proxy_url: str | None = None) -> st
     # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
     # account menu); omitting it for API-key users avoids forcing an OAuth
     # login (#406).
-    requires_openai_auth = (
-        "requires_openai_auth = true\n" if codex_uses_chatgpt_auth(config_dir / "auth.json") else ""
+    uses_chatgpt_auth = codex_uses_chatgpt_auth(config_dir / "auth.json")
+    requires_openai_auth = "requires_openai_auth = true\n" if uses_chatgpt_auth else ""
+    realtime_call_url = (
+        f"{provider_url.removesuffix('/v1')}/backend-api/codex"
+        if uses_chatgpt_auth
+        else provider_url
     )
     # Per-project savings: Codex sends the X-Headroom-Project header only
     # when the mapped env var (HEADROOM_PROJECT, set by `headroom wrap
@@ -2614,6 +2631,8 @@ def _inject_codex_provider_config(port: int, proxy_url: str | None = None) -> st
     _REDIRECT_TARGETS = {
         "model_provider": "headroom",
         "openai_base_url": provider_url,
+        "experimental_realtime_webrtc_call_base_url": realtime_call_url,
+        "experimental_realtime_ws_base_url": provider_url,
     }
 
     def _build_top_level_block(user_content: str) -> str:
@@ -2657,7 +2676,11 @@ def _inject_codex_provider_config(port: int, proxy_url: str | None = None) -> st
             # byte-for-byte restoration on unwrap.
             user_content = content.strip()
             if user_content:
-                redirected = _redirect_existing_top_level_keys(user_content, provider_url)
+                redirected = _redirect_existing_top_level_keys(
+                    user_content,
+                    provider_url,
+                    uses_chatgpt_auth=uses_chatgpt_auth,
+                )
                 top_block = _build_top_level_block(user_content)
                 if top_block:
                     content = top_block + "\n" + redirected + "\n\n" + provider_section
@@ -2670,6 +2693,8 @@ def _inject_codex_provider_config(port: int, proxy_url: str | None = None) -> st
                     f"{_CODEX_TOP_LEVEL_MARKER}\n"
                     f'model_provider = "{_REDIRECT_TARGETS["model_provider"]}"\n'
                     f'openai_base_url = "{_REDIRECT_TARGETS["openai_base_url"]}"\n'
+                    f'experimental_realtime_webrtc_call_base_url = "{_REDIRECT_TARGETS["experimental_realtime_webrtc_call_base_url"]}"\n'
+                    f'experimental_realtime_ws_base_url = "{_REDIRECT_TARGETS["experimental_realtime_ws_base_url"]}"\n'
                     f"{_CODEX_END_MARKER}\n"
                     f"\n{provider_section}"
                 )
@@ -2679,6 +2704,8 @@ def _inject_codex_provider_config(port: int, proxy_url: str | None = None) -> st
                 f"{_CODEX_TOP_LEVEL_MARKER}\n"
                 f'model_provider = "{_REDIRECT_TARGETS["model_provider"]}"\n'
                 f'openai_base_url = "{_REDIRECT_TARGETS["openai_base_url"]}"\n'
+                f'experimental_realtime_webrtc_call_base_url = "{_REDIRECT_TARGETS["experimental_realtime_webrtc_call_base_url"]}"\n'
+                f'experimental_realtime_ws_base_url = "{_REDIRECT_TARGETS["experimental_realtime_ws_base_url"]}"\n'
                 f"{_CODEX_END_MARKER}\n"
                 f"\n{provider_section}"
             )

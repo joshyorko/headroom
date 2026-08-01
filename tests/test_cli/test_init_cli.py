@@ -302,12 +302,6 @@ def test_init_codex_full_setup_skips_code_intelligence_by_default(
         return None
 
     monkeypatch.setattr("headroom.cli.wrap.shutil.which", fake_which)
-    monkeypatch.setattr(
-        "headroom.cli.wrap._ensure_tokensave_binary",
-        lambda verbose=False: Path("/usr/local/bin/tokensave"),
-    )
-    monkeypatch.setattr("headroom.cli.wrap._index_tokensave_project", lambda *args, **kwargs: None)
-
     init_cli._init_codex(
         global_scope=False,
         profile="init-local-demo",
@@ -333,7 +327,7 @@ def test_init_codex_full_setup_skips_code_intelligence_by_default(
     assert (tmp_path / ".codex" / "hooks.json").exists()
 
 
-def test_init_codex_full_setup_registers_code_intelligence_when_explicit(
+def test_init_codex_full_setup_registers_serena_when_explicit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
@@ -346,27 +340,26 @@ def test_init_codex_full_setup_registers_code_intelligence_when_explicit(
         return None
 
     monkeypatch.setattr("headroom.cli.wrap.shutil.which", fake_which)
-    monkeypatch.setattr(
-        "headroom.cli.wrap._ensure_tokensave_binary",
-        lambda verbose=False: Path("/usr/local/bin/tokensave"),
-    )
-    monkeypatch.setattr("headroom.cli.wrap._index_tokensave_project", lambda *args, **kwargs: None)
-
     init_cli._init_codex(
         global_scope=False,
         profile="init-local-demo",
         port=9000,
         proxy_url="http://headroom.example.test",
-        code_graph=True,
         serena=True,
     )
 
     project_config = tomllib.loads((tmp_path / ".codex" / "config.toml").read_text())
-    assert project_config["mcp_servers"]["tokensave"]["command"] == "/usr/local/bin/tokensave"
-    assert project_config["mcp_servers"]["tokensave"]["args"] == ["serve"]
     assert project_config["mcp_servers"]["serena"]["command"] == "uvx"
     assert "--context" in project_config["mcp_servers"]["serena"]["args"]
     assert "codex" in project_config["mcp_servers"]["serena"]["args"]
+
+
+def test_init_codex_help_excludes_code_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    result = CliRunner().invoke(fake_main, ["init", "codex", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--code-graph" not in result.output
 
 
 def test_init_claude_uses_custom_port(monkeypatch, tmp_path: Path) -> None:
@@ -1634,7 +1627,6 @@ def test_run_init_targets_remote_codex_skips_local_runtime_manifest(monkeypatch)
             "serena": False,
             "no_serena": False,
             "no_tokensave": False,
-            "code_graph": False,
             "verbose": False,
         }
     ]

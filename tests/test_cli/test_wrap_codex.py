@@ -1676,7 +1676,6 @@ def test_init_and_wrap_prepare_only_are_idempotent_full_setup(
             "--proxy-url",
             "http://10.10.10.89",
             "codex",
-            "--code-graph",
         ],
         "wrap": [
             "wrap",

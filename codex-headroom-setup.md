@@ -68,11 +68,11 @@ Use `wrap --prepare-only` only as a compatibility check:
 headroom wrap codex --prepare-only --proxy-url "$HEADROOM_PROXY_URL"
 ```
 
-This should write the same durable provider/MCP/hooks result as `init codex`,
-then exit without launching Codex. Do not use it as the primary documented
-setup flow; it exists so old wrap-based setup snippets keep working. If
-`init codex` and `wrap codex --prepare-only` produce different persistent
-Codex config, that is a Headroom bug.
+This writes the same durable provider, Headroom MCP, and hooks result as
+`init codex`, then exits without launching Codex. Add `--serena` to `init` and
+`--code-memory serena` to `wrap --prepare-only` when code-memory setup is also
+needed. Do not use it as the primary documented setup flow; it exists so old
+wrap-based setup snippets keep working.
 
 ## Recommended new-machine flow
 
@@ -83,16 +83,15 @@ export HEADROOM_PROXY_URL=http://10.10.10.89
 headroom init --proxy-url "$HEADROOM_PROXY_URL" codex
 ```
 
-Serena is installed by default alongside tokensave. `--serena` is accepted for
-explicitness and compatibility with older setup snippets; use `--no-serena` to
-opt out.
+Use `--serena` to explicitly register Serena's code-navigation MCP. Use
+`--no-serena` to remove a Headroom-installed Serena entry.
 
 Useful variants:
 
 ```bash
-headroom init --proxy-url "$HEADROOM_PROXY_URL" codex --no-tokensave
+headroom init --proxy-url "$HEADROOM_PROXY_URL" codex --serena
 headroom init --proxy-url "$HEADROOM_PROXY_URL" codex --no-serena
-headroom init --proxy-url "$HEADROOM_PROXY_URL" codex --code-graph
+headroom init --proxy-url "$HEADROOM_PROXY_URL" codex --no-tokensave
 headroom init -g --proxy-url "$HEADROOM_PROXY_URL" codex
 ```
 
@@ -152,20 +151,7 @@ HEADROOM_PROXY_URL = "http://10.10.10.89"
 # --- end Headroom MCP server ---
 ```
 
-By default it registers tokensave:
-
-```toml
-# --- Headroom MCP server: tokensave ---
-[mcp_servers.tokensave]
-command = "/var/home/you/.local/bin/tokensave"
-args = ["serve"]
-# --- end Headroom MCP server: tokensave ---
-```
-
-The tokensave command can be an absolute path or `tokensave`, depending on where
-the binary is available.
-
-By default, and unless `--no-serena` is passed, it also registers Serena:
+With `--serena`, it registers Serena:
 
 ```toml
 # --- Headroom MCP server: serena ---
@@ -253,7 +239,6 @@ Check MCP registrations:
 
 ```bash
 grep -n '\[mcp_servers.headroom\]' "$HOME/.codex/config.toml"
-grep -n '\[mcp_servers.tokensave\]' "$HOME/.codex/config.toml"
 grep -n '\[mcp_servers.serena\]' "$HOME/.codex/config.toml"
 ```
 

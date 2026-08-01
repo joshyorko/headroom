@@ -1110,7 +1110,7 @@ def _configure_codex_durable_setup(
             global_scope=global_scope,
         )
 
-    if code_graph or serena or no_serena or no_tokensave:
+    if serena or no_serena or no_tokensave:
         from headroom.cli import wrap as wrap_cli
         from headroom.mcp_registry import CodexRegistrar
 
@@ -1121,7 +1121,7 @@ def _configure_codex_durable_setup(
         wrap_cli._setup_coding_compressor(
             registrar,
             serena_context="codex",
-            serena=serena or code_graph,
+            serena=serena,
             no_serena=no_serena,
             no_tokensave=no_tokensave,
             verbose=verbose,
@@ -1140,7 +1140,6 @@ def _init_codex(
     serena: bool = False,
     no_serena: bool = False,
     no_tokensave: bool = False,
-    code_graph: bool = False,
     verbose: bool = False,
 ) -> None:
     _configure_codex_durable_setup(
@@ -1153,7 +1152,6 @@ def _init_codex(
         serena=serena,
         no_serena=no_serena,
         no_tokensave=no_tokensave,
-        code_graph=code_graph,
         verbose=verbose,
     )
     click.echo(f"Configured Codex ({'user' if global_scope else 'local'} scope).")
@@ -1188,7 +1186,6 @@ def _run_init_targets(
     serena: bool = False,
     no_serena: bool = False,
     no_tokensave: bool = False,
-    code_graph: bool = False,
     verbose: bool = False,
 ) -> None:
     normalized_proxy_url = _normalize_proxy_url(proxy_url, port)
@@ -1243,7 +1240,6 @@ def _run_init_targets(
                 serena=serena,
                 no_serena=no_serena,
                 no_tokensave=no_tokensave,
-                code_graph=code_graph,
                 verbose=verbose,
             )
         elif target == "openclaw":
@@ -1417,18 +1413,12 @@ def init_copilot(ctx: click.Context) -> None:
     help="Explicitly install Serena MCP for Codex.",
 )
 @click.option("--no-serena", is_flag=True, help="Remove a Headroom-installed Serena MCP entry.")
-@click.option(
-    "--code-graph",
-    is_flag=True,
-    help="Explicitly install and index the tokensave code-graph MCP server.",
-)
 @click.pass_context
 def init_codex(
     ctx: click.Context,
     no_tokensave: bool,
     serena: bool,
     no_serena: bool,
-    code_graph: bool,
 ) -> None:
     """Install Codex durable hooks and provider routing."""
     _run_init_targets(
@@ -1443,7 +1433,6 @@ def init_codex(
         serena=serena,
         no_serena=no_serena,
         no_tokensave=no_tokensave,
-        code_graph=code_graph,
         verbose=bool(_ctx_value(ctx, "verbose")),
     )
 

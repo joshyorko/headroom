@@ -187,7 +187,7 @@ class TestCCRToolCallParsing:
 
         assert len(ccr_calls) == 1
         assert ccr_calls[0].hash_key == "def456abc123def456abc123"
-        assert ccr_calls[0].query == "authentication error"
+        assert ccr_calls[0].query is None
 
     def test_parse_mixed_tool_calls(self):
         """Parse response with both CCR and other tool calls."""

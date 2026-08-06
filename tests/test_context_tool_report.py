@@ -1,11 +1,5 @@
-import json
-import subprocess
-from pathlib import Path
-
 import pytest
-from click.testing import CliRunner
 
-from headroom.cli.main import main
 from headroom.proxy import helpers
 
 
@@ -221,70 +215,3 @@ def test_context_tool_report_accumulates_multiple_project_rows() -> None:
     assert per_project["codex-desktop-linux"]["rtk_tokens_saved"] == 250
     assert per_project["codex-desktop-linux"]["rtk_commands"] == 9
     assert stats["context_tool"]["stats"]["cwd"] == "/work/codex-desktop-linux"
-
-
-def test_mcp_report_rtk_posts_project_stats(monkeypatch) -> None:
-    import headroom.cli.mcp as mcp_mod
-    import headroom.rtk as rtk_mod
-
-    monkeypatch.setattr(rtk_mod, "get_rtk_path", lambda: Path("/usr/bin/rtk"))
-
-    def fake_run(command, **kwargs):
-        assert command == ["/usr/bin/rtk", "gain", "--project", "--format", "json"]
-        return subprocess.CompletedProcess(
-            command,
-            0,
-            stdout=json.dumps(
-                {
-                    "summary": {
-                        "total_commands": 5,
-                        "total_input": 200,
-                        "total_output": 80,
-                        "total_saved": 120,
-                        "avg_savings_pct": 60.0,
-                    }
-                }
-            ),
-            stderr="",
-        )
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps(
-                {
-                    "ok": True,
-                    "context_tool": {
-                        "tokens_saved": 120,
-                        "total_commands": 5,
-                    },
-                }
-            ).encode("utf-8")
-
-    posted = {}
-
-    def fake_urlopen(request, timeout):
-        posted["url"] = request.full_url
-        posted["body"] = json.loads(request.data.decode("utf-8"))
-        posted["timeout"] = timeout
-        return FakeResponse()
-
-    monkeypatch.setattr(mcp_mod.subprocess, "run", fake_run)
-    monkeypatch.setattr(mcp_mod.urllib.request, "urlopen", fake_urlopen)
-
-    result = CliRunner().invoke(
-        main,
-        ["mcp", "report-rtk", "--proxy-url", "http://headroom.example.test"],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert posted["url"] == "http://headroom.example.test/stats/context-tool"
-    assert posted["body"]["tool"] == "rtk"
-    assert posted["body"]["scope"] == "project"
-    assert posted["body"]["summary"]["total_saved"] == 120
-    assert "120 tokens saved across 5 commands" in result.output

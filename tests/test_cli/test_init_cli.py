@@ -224,18 +224,8 @@ def test_init_codex_merges_feature_flag_into_existing_table(monkeypatch, tmp_pat
     assert provider["model_provider"] == "headroom"
     assert provider["model_providers"]["headroom"]["base_url"] == "http://headroom.example.test/v1"
     hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    session_commands = [
-        hook["command"] for entry in hooks["hooks"]["SessionStart"] for hook in entry["hooks"]
-    ]
-    assert not any("init hook ensure" in command for command in session_commands)
+    assert "SessionStart" not in hooks["hooks"]
     assert "PreToolUse" not in hooks["hooks"]
-    assert session_commands == [
-        command
-        for command in session_commands
-        if "mcp report-rtk" in command
-        and "--proxy-url http://headroom.example.test" in command
-        and "headroom-init-codex-rtk-report" in command
-    ]
 
 
 def test_init_codex_local_proxy_keeps_runtime_ensure_hook(
@@ -256,12 +246,7 @@ def test_init_codex_local_proxy_keeps_runtime_ensure_hook(
         "--profile init-local-demo" in command and "init hook ensure" in command
         for command in session_commands
     )
-    assert any(
-        "mcp report-rtk" in command
-        and "--proxy-url http://127.0.0.1:9000" in command
-        and "headroom-init-codex-rtk-report" in command
-        for command in session_commands
-    )
+    assert not any("mcp report-rtk" in command for command in session_commands)
     assert any(
         "init hook ensure" in hook["command"]
         for entry in hooks["hooks"]["PreToolUse"]
@@ -658,7 +643,7 @@ def test_ensure_codex_hooks_preserves_user_hooks(monkeypatch, tmp_path: Path) ->
     )
     monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
 
-    init_cli._ensure_codex_hooks(path, "init-user")
+    init_cli._ensure_codex_hooks(path, "init-user", "http://127.0.0.1:8787")
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     # The unrelated top-level key survives.
@@ -711,21 +696,8 @@ def test_ensure_codex_provider_leaves_matching_existing_config_unchanged(
 ) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     path = tmp_path / "config.toml"
-    existing = (
-        "# --- Headroom proxy (auto-injected by headroom wrap codex) ---\n"
-        'model_provider = "headroom"\n'
-        'openai_base_url = "http://10.10.10.89/v1"\n'
-        "# --- end Headroom ---\n\n"
-        "# --- Headroom proxy (auto-injected by headroom wrap codex) ---\n"
-        "[model_providers.headroom]\n"
-        'name = "OpenAI via Headroom proxy"\n'
-        'base_url = "http://10.10.10.89/v1"\n'
-        "supports_websockets = true\n"
-        'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }\n'
-        "# --- end Headroom ---\n"
-    )
-    path.write_text(existing, encoding="utf-8")
-
+    init_cli._ensure_codex_provider(path, "http://10.10.10.89/v1")
+    existing = path.read_text(encoding="utf-8")
     init_cli._ensure_codex_provider(path, "http://10.10.10.89/v1")
 
     assert path.read_text(encoding="utf-8") == existing

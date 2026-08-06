@@ -1417,6 +1417,8 @@ class OpenAIHandlerMixin:
         body: dict[str, Any],
         *,
         request_id: str,
+        user_id: str | None = None,
+        backend: Any | None = None,
     ) -> None:
         """Feed one Responses HTTP request into the live traffic learner."""
         traffic_learner = getattr(self, "traffic_learner", None)
@@ -1443,8 +1445,14 @@ class OpenAIHandlerMixin:
                     tool_input=tool_result["input"],
                     tool_output=tool_result["output"],
                     is_error=tool_result["is_error"],
+                    user_id=user_id,
+                    backend=backend,
                 )
-            await traffic_learner.on_messages(learner_messages)
+            await traffic_learner.on_messages(
+                learner_messages,
+                user_id=user_id,
+                backend=backend,
+            )
         except Exception as exc:
             logger.debug("[%s] Traffic learner (responses): %s", request_id, exc)
 
@@ -4687,10 +4695,6 @@ class OpenAIHandlerMixin:
         tags = extract_tags(headers)
         client = classify_client(headers)
 
-        # Learn from the original client payload before memory context or
-        # compression mutates it. This mirrors the Anthropic ingestion path.
-        await self._observe_openai_responses_traffic(body, request_id=request_id)
-
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Memory user-id reads
         # `request.headers` below.
@@ -4786,6 +4790,26 @@ class OpenAIHandlerMixin:
                     getattr(self.memory_handler.config, "project_root_override", "") or None
                 ),
             )
+
+            resolve_for_request = getattr(self.memory_handler, "_resolve_for_request", None)
+            if callable(resolve_for_request):
+                resolved_backend, _, memory_user_id = resolve_for_request(
+                    memory_user_id,
+                    memory_request_ctx,
+                )
+            else:
+                resolved_backend = getattr(self.memory_handler, "backend", None)
+        else:
+            resolved_backend = None
+
+        # Learn from the original client payload before memory context or
+        # compression mutates it, while retaining request-scoped memory identity.
+        await self._observe_openai_responses_traffic(
+            body,
+            request_id=request_id,
+            user_id=memory_user_id,
+            backend=resolved_backend,
+        )
 
         # Rate limiting
         if self.rate_limiter:
@@ -5437,7 +5461,11 @@ class OpenAIHandlerMixin:
                                 await self.memory_handler._ensure_initialized()
                                 if self.memory_handler._backend:
                                     result = await self.memory_handler._execute_memory_tool(
-                                        name, args, memory_user_id, "openai"
+                                        name,
+                                        args,
+                                        memory_user_id,
+                                        "openai",
+                                        request_context=memory_request_ctx,
                                     )
                                 else:
                                     result = json.dumps({"error": "Memory backend not initialized"})
@@ -6314,6 +6342,7 @@ class OpenAIHandlerMixin:
             ws_recorded_compression_timing_totals: dict[str, float] = {}
             ws_ttfb_ms: float | None = None
             ws_recorded_ttfb_ms = False
+            ws_waste_signals_dict: dict[str, int] | None = None
             _ws_bypass = self._headroom_bypass_enabled(ws_headers)
             if _ws_bypass:
                 logger.info(
@@ -7419,6 +7448,31 @@ class OpenAIHandlerMixin:
                             nonlocal ws_recorded_tokens_saved_total
                             nonlocal ws_recorded_attempted_input_tokens_total
                             nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
+                            nonlocal ws_waste_signals_dict
+
+                            if ws_waste_signals_dict is None:
+                                try:
+                                    ws_payload = (
+                                        body["response"]
+                                        if isinstance(body.get("response"), dict)
+                                        else body
+                                    )
+                                    ws_tokenizer = self.openai_provider.get_token_counter(
+                                        str(ws_payload.get("model") or "")
+                                    )
+                                    from headroom.parser import parse_messages
+
+                                    _, _, ws_waste = parse_messages(
+                                        _responses_input_to_waste_messages(
+                                            ws_payload.get("instructions"),
+                                            ws_payload.get("input", ""),
+                                        ),
+                                        ws_tokenizer,
+                                    )
+                                    if ws_waste.total() > 0:
+                                        ws_waste_signals_dict = ws_waste.to_dict()
+                                except Exception:
+                                    pass
 
                             input_delta = ws_input_tokens_total - ws_recorded_input_tokens_total
                             output_delta = ws_output_tokens_total - ws_recorded_output_tokens_total
@@ -7503,6 +7557,7 @@ class OpenAIHandlerMixin:
                                     ttfb_ms=ttfb_for_record_ms,
                                     pipeline_timing=dashboard_pipeline_timing,
                                     transforms_applied=tuple(transforms_applied),
+                                    waste_signals=ws_waste_signals_dict,
                                     num_messages=len(
                                         body.get("messages") or body.get("input") or []
                                     )
@@ -8913,6 +8968,18 @@ class OpenAIHandlerMixin:
 
         start_time = time.time()
         path = request.url.path
+        if provider == "openai" and not is_copilot_api_url(base_url):
+            authorization = next(
+                (value for key, value in request.headers.items() if key.lower() == "authorization"),
+                "",
+            )
+            scheme, _, token = authorization.partition(" ")
+            if scheme.lower() == "bearer" and token.strip().startswith(
+                ("tid_", "gho_", "ghs_", "ghp_", "github_pat_")
+            ):
+                from headroom.proxy.project_context import get_current_copilot_api_url
+
+                base_url = get_current_copilot_api_url() or base_url
         if provider == "anthropic" and endpoint_name == "models" and path.startswith("/v1/models/"):
             from headroom.providers.anthropic import sanitize_anthropic_model_id
 

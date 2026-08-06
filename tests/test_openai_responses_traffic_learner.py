@@ -42,7 +42,13 @@ class _RecordingLearner:
     async def on_tool_result(self, **tool_result: Any) -> None:
         self.tool_results.append(tool_result)
 
-    async def on_messages(self, messages: list[dict[str, Any]]) -> None:
+    async def on_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        user_id: str | None = None,
+        backend: Any | None = None,
+    ) -> None:
         self.message_batches.append(messages)
 
 
@@ -139,5 +145,7 @@ def test_responses_http_request_reaches_traffic_learner() -> None:
             "tool_input": {"cmd": "missing-command"},
             "tool_output": "command not found",
             "is_error": True,
+            "user_id": None,
+            "backend": None,
         }
     ]

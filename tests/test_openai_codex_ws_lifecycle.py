@@ -143,11 +143,12 @@ class _FakeWebSocket:
         self,
         frames: list[str] | None = None,
         *,
+        headers: dict[str, str] | None = None,
         disconnect_after_n_sends: int | None = None,
         hold_after_initial: bool = False,
         call_log: list[str] | None = None,
     ) -> None:
-        self.headers = {"authorization": "Bearer test"}
+        self.headers = dict(headers or {"authorization": "Bearer test"})
         self._frames = list(frames or [])
         self._hold_after_initial = hold_after_initial
         self._disconnect_after_n_sends = disconnect_after_n_sends
@@ -283,6 +284,7 @@ def _make_fake_websockets_module(
     upstream: _FakeUpstream | None,
     *,
     call_log: list[str] | None = None,
+    connect_calls: list[tuple[tuple, dict]] | None = None,
     connect_error: Exception | None = None,
 ):
     """Build a fake ``websockets`` module.
@@ -297,6 +299,8 @@ def _make_fake_websockets_module(
     async def _connect(*args, **kwargs):
         if call_log is not None:
             call_log.append("connect")
+        if connect_calls is not None:
+            connect_calls.append((args, dict(kwargs)))
         if connect_error is not None:
             raise connect_error
         return upstream

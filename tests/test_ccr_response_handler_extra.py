@@ -101,7 +101,7 @@ def test_parse_ccr_tool_calls_google_and_other_calls() -> None:
         CCRToolCall(
             tool_call_id=CCR_TOOL_NAME,
             hash_key="aaaaaaaaaaaaaaaaaaaaaaaa",
-            query="pizza",
+            query=None,
         )
     ]
     assert other_calls == [{"functionCall": {"name": "other_tool", "args": {}}}]

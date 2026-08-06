@@ -358,7 +358,7 @@ def test_init_codex_config_installs_local_hooks_and_project_provider(
         hook["command"] for entry in hooks["hooks"]["SessionStart"] for hook in entry["hooks"]
     ]
     assert any("init hook ensure" in command for command in session_commands)
-    assert any("mcp report-rtk" in command for command in session_commands)
+    assert not any("mcp report-rtk" in command for command in session_commands)
 
     _assert_delivery(
         codex_proxy_stack,

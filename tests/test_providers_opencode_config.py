@@ -443,7 +443,8 @@ def test_build_opencode_config_content_without_mcp() -> None:
     assert "provider" in config
     assert "mcp" not in config
     assert "model" not in config
-    assert config["plugin"] == [["headroom-opencode", {"proxyUrl": "http://127.0.0.1:8787/v1"}]]
+    assert len(config["plugin"]) == 1
+    assert config["plugin"][0].endswith("headroom/providers/opencode/_dist/entry.opencode.js")
 
 
 def test_build_opencode_config_content_with_mcp_uses_local_stdio() -> None:
@@ -471,7 +472,7 @@ def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch) -> None:
         include_mcp=False,
     )
     assert env["HEADROOM_PROJECT"] == "test-proj"
-    assert "headroom-opencode" in env["OPENCODE_CONFIG_CONTENT"]
+    assert "entry.opencode.js" in env["OPENCODE_CONFIG_CONTENT"]
     assert "OPENAI_BASE_URL" not in env
     assert "ANTHROPIC_BASE_URL" not in env
 

@@ -57,7 +57,6 @@ _GLOBAL_PROFILE = "init-user"
 _CLAUDE_HOOK_MARKER = "headroom-init-claude"
 _COPILOT_HOOK_MARKER = "headroom-init-copilot"
 _CODEX_HOOK_MARKER = "headroom-init-codex"
-_CODEX_RTK_REPORT_MARKER = "headroom-init-codex-rtk-report"
 _CODEX_PROVIDER_MARKER_START = "# --- Headroom Codex provider ---"
 _CODEX_PROVIDER_MARKER_END = "# --- end Headroom Codex provider ---"
 _LEGACY_CODEX_PROVIDER_MARKERS = (
@@ -94,21 +93,6 @@ def _command_string(parts: list[str]) -> str:
 
 def _hook_command(*parts: str) -> str:
     return _command_string([*resolve_headroom_config_command(), "init", "hook", "ensure", *parts])
-
-
-def _codex_rtk_report_command(proxy_url: str) -> str:
-    command = _command_string(
-        [
-            *resolve_headroom_config_command(),
-            "mcp",
-            "report-rtk",
-            "--proxy-url",
-            proxy_url,
-            "--scope",
-            "project",
-        ]
-    )
-    return f"{command} >/dev/null 2>&1 || true # {_CODEX_RTK_REPORT_MARKER}"
 
 
 def _powershell_matcher() -> str:
@@ -695,17 +679,11 @@ def _ensure_codex_hooks(path: Path, profile: str, proxy_url: str) -> None:
         if _proxy_url_uses_local_runtime(proxy_url)
         else None
     )
-    session_hooks = [
-        {
-            "type": "command",
-            "command": _codex_rtk_report_command(proxy_url),
-            "timeout": 15,
-        }
-    ]
-    if ensure_command:
-        session_hooks.insert(0, {"type": "command", "command": ensure_command, "timeout": 15})
+    session_hooks = (
+        [{"type": "command", "command": ensure_command, "timeout": 15}] if ensure_command else []
+    )
     desired_hooks: dict[str, tuple[str, list[dict[str, Any]]] | None] = {
-        "SessionStart": ("startup|resume", session_hooks),
+        "SessionStart": ("startup|resume", session_hooks) if session_hooks else None,
         "PreToolUse": (
             "Bash",
             [{"type": "command", "command": ensure_command, "timeout": 15}],
@@ -733,10 +711,7 @@ def _ensure_codex_hooks(path: Path, profile: str, proxy_url: str) -> None:
             has_headroom = any(
                 isinstance(item, dict)
                 and item.get("command")
-                and (
-                    _CODEX_HOOK_MARKER in str(item.get("command"))
-                    or _CODEX_RTK_REPORT_MARKER in str(item.get("command"))
-                )
+                and _CODEX_HOOK_MARKER in str(item.get("command"))
                 for item in hook_items
             )
             if not has_headroom:

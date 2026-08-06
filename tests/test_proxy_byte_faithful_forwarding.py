@@ -575,7 +575,7 @@ def test_anthropic_tools_canonical_order_preserves_byte_faithful_request() -> No
     )
 
 
-def test_anthropic_tools_unsorted_reordered_and_canonicalized() -> None:
+def test_anthropic_tools_preserve_caller_order_and_canonicalize() -> None:
     client, transport = _make_no_optimize_app()
     inbound_dict = {
         "model": "claude-sonnet-4-6",
@@ -586,15 +586,8 @@ def test_anthropic_tools_unsorted_reordered_and_canonicalized() -> None:
             {"name": "alpha"},
         ],
     }
-    expected_dict = {
-        **inbound_dict,
-        "tools": [
-            inbound_dict["tools"][1],
-            inbound_dict["tools"][0],
-        ],
-    }
     inbound_bytes = serialize_body_canonical(inbound_dict)
-    expected_bytes = serialize_body_canonical(expected_dict)
+    expected_bytes = serialize_body_canonical(inbound_dict)
 
     response = client.post(
         "/v1/messages",
@@ -608,7 +601,6 @@ def test_anthropic_tools_unsorted_reordered_and_canonicalized() -> None:
     assert response.status_code == 200, response.text
     upstream = transport.captured_body or b""
     assert upstream == expected_bytes
-    assert upstream != inbound_bytes
 
 
 def test_anthropic_presend_sorted_empty_tools_keeps_body_unmutated() -> None:

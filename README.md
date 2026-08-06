@@ -107,6 +107,8 @@ headroom dashboard                      # live savings dashboard (proxy must be 
 
 To use headroom, it is recommended you launch a wrapped agent session each time so that all necessary setup is completed. When wrapping a coding agent, headroom starts a local proxy, installs **Serena** for semantic code navigation, and launches a coding agent session configured to proxy requests through headroom.
 
+Serena is registered at **user scope** (for Claude Code, in `~/.claude.json`), so it stays available in your other projects until you run `headroom unwrap`. To skip it entirely, wrap with `--code-memory none`.
+
 The `headroom` CLI ships **only** via the PyPI package. The npm `headroom-ai` is the TypeScript SDK — a library you import (`import { compress } from 'headroom-ai'`), not a CLI, so it provides no `headroom` command.
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in `[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
@@ -231,6 +233,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 | Cursor       | Manual setup    | starts proxy and prints base URLs for Cursor settings |
 | Aider        | ✅              | starts proxy + launches          |
 | Copilot CLI  | ✅              | starts proxy + launches          |
+| VS Code Copilot | ✅           | transparent proxy; preserves selected model |
 | OpenClaw     | ✅              | installs as ContextEngine plugin |
 | OpenCode     | ✅              | injects config · starts proxy + launches |
 | Cline        | ✅              | starts proxy + injects config    |
@@ -281,6 +284,52 @@ override. Headroom uses GitHub's normal token-exchange endpoint and the Copilot
 API endpoint advertised for the signed-in account.
 
 Platform support note: macOS auth reuse via Copilot CLI Keychain storage has been smoke-tested. Windows Credential Manager, Linux Secret Service / `secret-tool`, and Docker/CI token-injection paths are implemented or planned as auth-discovery paths, but still need real OS validation before they should be considered fully vetted. For Docker and CI, prefer passing an explicit `GITHUB_COPILOT_TOKEN` or `GITHUB_COPILOT_GITHUB_TOKEN` rather than relying on host keychain access.
+
+### GitHub Copilot in Visual Studio Code
+
+Headroom transparently overrides Copilot's API proxy endpoint, so the normal VS
+Code model picker remains authoritative. GPT-5.5, GPT-5.6 Luna/Sol/Terra, Claude
+Sonnet/Opus, and other Copilot models keep their original model IDs while traffic
+passes through the local compression proxy. Headroom does not patch VS Code or
+change Codex settings:
+
+```bash
+headroom copilot-auth login
+headroom wrap vscode
+```
+
+Keep the command running and use Copilot normally. Headroom holds the short-lived
+upstream Copilot token only in the proxy process.
+See the [cross-platform VS Code Copilot guide](https://headroom-docs.vercel.app/docs/vscode-copilot)
+for paths, credential flow, remote-development notes, undo steps, and troubleshooting.
+
+### Claude Code in Visual Studio Code
+
+The official Claude Code extension embeds Claude Code and reads the same user
+settings as the CLI. Install Headroom's proxy dependencies, then run the wrapper
+from the project you plan to open in VS Code:
+
+```bash
+pip install "headroom-ai[proxy]"
+headroom wrap vscode-claude
+```
+
+On the first run, reload the VS Code window. Keep the wrapper terminal running
+while you use the Claude Code panel; inspect the dashboard or proxy log printed
+at startup to see requests and savings.
+Headroom preserves your Anthropic authentication and selected model.
+
+Press `Ctrl+C` to stop the proxy. Restart the same command before using Claude
+Code again, or completely restore the settings that existed before setup:
+
+```bash
+headroom unwrap vscode-claude
+```
+
+See the
+[VS Code Claude Code guide](https://headroom-docs.vercel.app/docs/vscode-claude-code)
+for verification, configuration paths, custom profiles, remote development, and
+troubleshooting.
 
 ## When to use · When to skip
 

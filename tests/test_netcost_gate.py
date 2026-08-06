@@ -148,8 +148,13 @@ class TestNetCostHelpers:
         assert _gain_bucket(float("inf")) == "nan"
 
     def test_message_tokens_block_list_beats_repr(self, tokenizer):
-        # str(content) over a block list counts repr punctuation/type names;
-        # the block-aware helper counts only the text-bearing payload.
+        # str(content) over a block list embeds the whole base64 payload; the
+        # block-aware helper prices the image at its pixel cost instead.
+        #
+        # This used to use a 500-char stub image, which is *smaller* than a
+        # single image's real token cost -- so repr looked cheap and the
+        # payload-scaling bug stayed invisible. Use a realistically sized
+        # payload, which is what actually occurs (screenshots).
         from headroom.transforms.content_router import _netcost_message_tokens
 
         text = "word " * 200
@@ -157,15 +162,17 @@ class TestNetCostHelpers:
             "role": "user",
             "content": [
                 {"type": "text", "text": text},
-                {"type": "image", "source": {"data": "x" * 500}},
+                {"type": "image", "source": {"data": "x" * 200_000}},
             ],
         }
         helper = _netcost_message_tokens(block_msg, tokenizer)
         text_only = tokenizer.count_text(text)
-        # Helper tracks the text payload closely; the image block adds only a
-        # small repr proxy, far less than stringifying the whole list.
-        assert abs(helper - text_only) < text_only * 0.5
-        assert helper < tokenizer.count_text(str(block_msg["content"]))
+        # The text payload is still counted in full, and the image adds a
+        # bounded pixel-based cost rather than a payload-scaled one.
+        assert helper >= text_only
+        assert helper - text_only <= 2000
+        # ...which is dramatically less than stringifying the whole list.
+        assert helper < tokenizer.count_text(str(block_msg["content"])) / 10
 
     def test_message_tokens_tool_result_blocks(self, tokenizer):
         from headroom.transforms.content_router import _netcost_message_tokens

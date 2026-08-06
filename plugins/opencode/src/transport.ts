@@ -5,6 +5,7 @@ const http = nodeRequire("node:http") as typeof import("node:http");
 const https = nodeRequire("node:https") as typeof import("node:https");
 const http2 = nodeRequire("node:http2") as typeof import("node:http2");
 const childProcess = nodeRequire("node:child_process") as typeof import("node:child_process");
+const fs = nodeRequire("node:fs") as typeof import("node:fs");
 
 const BASE_URL_HEADER = "x-headroom-base-url";
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
@@ -60,8 +61,15 @@ function setState(state: TransportState | undefined): void {
   (globalThis as GlobalWithHeadroomTransport)[STATE_KEY] = state;
 }
 
-function shimImportSpecifier(): string {
-  return new URL("../hook-shim/handler.js", import.meta.url).href;
+// ponytail: the shim only exists next to the checkout build
+// (plugins/opencode/dist/). The wheel ships entry.opencode.js alone, so
+// `--import=<missing file>` killed every Node child at startup — including
+// OpenCode's stdio MCP servers (issue #2798). No shim on disk, no injection:
+// children go direct instead of dying. Upgrade path is bundling the shim into
+// _dist/ so wheel installs get child-process routing back.
+function shimImportSpecifier(): string | undefined {
+  const shim = new URL("../hook-shim/handler.js", import.meta.url);
+  return fs.existsSync(shim) ? shim.href : undefined;
 }
 
 function withNodeImportOption(existing: string | undefined, shim: string): string {
@@ -78,13 +86,19 @@ function withNodeImportOption(existing: string | undefined, shim: string): strin
 function withShimEnv(env: NodeJS.ProcessEnv | Record<string, unknown> | undefined, proxyUrl: string): NodeJS.ProcessEnv {
   const nextEnv = { ...(env ?? process.env) } as NodeJS.ProcessEnv;
   nextEnv[PROXY_ENV] = proxyUrl;
-  nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shimImportSpecifier());
+  const shim = shimImportSpecifier();
+  if (shim) {
+    nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
+  }
   return nextEnv;
 }
 
 function installProcessEnv(proxyUrl: string): void {
   process.env[PROXY_ENV] = proxyUrl;
-  process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shimImportSpecifier());
+  const shim = shimImportSpecifier();
+  if (shim) {
+    process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
+  }
 }
 
 function isOptions(value: unknown): value is Record<string, unknown> {

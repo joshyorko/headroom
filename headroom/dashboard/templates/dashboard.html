@@ -4,9 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Headroom Dashboard</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-    <script src="https://unpkg.com/alpinejs@3.13.3/dist/cdn.min.js" defer></script>
+    <script src="/dashboard/static/tailwind.min.js"></script>
+    <script src="/dashboard/static/htmx.min.js"></script>
+    <script src="/dashboard/static/alpine.min.js" defer></script>
     <script>
         (function() {
             const saved = localStorage.getItem('headroom-theme');
@@ -217,7 +217,7 @@
 
                     <!-- Token Savings (%) -->
                     <div class="bg-surface rounded-lg p-4 border border-border">
-                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Token Savings</div>
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Tokens Saved</div>
                         <div class="flex items-baseline gap-2">
                             <span class="text-3xl font-light tabular-nums text-accent" x-text="formatNumber(stats.tokens?.saved || 0)"></span>
                             <!-- Active compression ratio: savings as a fraction of tokens we
@@ -290,10 +290,13 @@
                         </template>
                     </div>
 
-                    <!-- Tool-Schema Deferral (tool search) — only rendered when there's a saving to show -->
+                    <!-- Tool-schema deferral: a COMPONENT of the Tokens Saved headline above
+                         (stats.tokens.saved is all-layers), not a rival metric. Labelled as
+                         such so a tool-heavy session doesn't read as "0 saved + some other
+                         number". Only rendered when there's a saving to show. -->
                     <template x-if="(stats.savings?.by_layer?.tool_search?.tokens || 0) > 0">
                         <div class="bg-surface rounded-lg p-4 border border-border">
-                            <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Tool-Schema Deferral</div>
+                            <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Tokens Saved · Tool Schemas</div>
                             <div class="flex items-baseline gap-2">
                                 <span class="text-3xl font-light tabular-nums text-emerald-400" x-text="formatNumber(stats.savings?.by_layer?.tool_search?.tokens || 0)"></span>
                                 <span class="text-sm text-gray-400">tokens</span>

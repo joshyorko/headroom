@@ -536,11 +536,13 @@ def test_exception_inside_critical_section_releases_semaphore():
         anyio.run(_run)
 
 
-def test_acquire_timeout_returns_503_with_retry_after(stage_log_capture):
+def test_acquire_timeout_degrades_to_passthrough(stage_log_capture):
     async def _run() -> None:
         sem = asyncio.Semaphore(1)
         await sem.acquire()
         handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem)
+        handler.config.optimize = True
+        handler.anthropic_pipeline = SimpleNamespace(apply=MagicMock())
         handler.config.anthropic_pre_upstream_acquire_timeout_seconds = 0.01
         req = _build_request(
             {
@@ -551,11 +553,14 @@ def test_acquire_timeout_returns_503_with_retry_after(stage_log_capture):
         )
         try:
             response = await handler.handle_anthropic_messages(req)
-            assert response.status_code == 503
-            assert response.headers["retry-after"] == "1"
+            assert response.status_code == 200
             body = json.loads(response.body)
-            assert body["error"]["type"] == "service_unavailable"
-            assert sem._value == 0
+            assert body["id"] == "msg_test"
+            assert body["type"] == "message"
+            assert body["model"] == "claude-3-5-sonnet-latest"
+            assert body["stop_reason"] == "end_turn"
+            assert body["content"][0]["text"] == "ok"
+            assert not handler.anthropic_pipeline.apply.called
         finally:
             sem.release()
         assert sem._value == 1
@@ -565,6 +570,7 @@ def test_acquire_timeout_returns_503_with_retry_after(stage_log_capture):
 
     payloads = _parse_all_stage_logs(stage_log_capture)
     assert len(payloads) == 1
+    assert "pre_upstream_wait" in payloads[0]["stages"]
     assert payloads[0]["stages"]["pre_upstream_wait"] >= 10.0
 
 
@@ -846,6 +852,9 @@ class _CostTrackerBlock:
     def check_budget(self):
         return False, 0
 
+    def budget_denial_detail(self):
+        return "Budget exceeded for daily period"
+
     def record_tokens(self, *a, **k):
         return None
 
@@ -868,7 +877,7 @@ class _CacheHit:
     def __init__(self) -> None:
         self._entry = self._Entry()
 
-    async def get(self, _messages, _model):
+    async def get(self, _messages, _model, **_kwargs):
         return self._entry
 
     async def set(self, *a, **k):

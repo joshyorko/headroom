@@ -293,6 +293,7 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           files: coverage-${{ matrix.shard }}.xml
+          disable_search: true
           flags: python
           name: python-shard-${{ matrix.shard }}
           # Token is sent so uploads authenticate once the repo is activated on

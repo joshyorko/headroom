@@ -426,7 +426,36 @@ def check_budget(stats: dict[str, Any] | None) -> CheckResult:
             hint="set one: headroom proxy --budget 10 (env: HEADROOM_BUDGET)",
         )
     period = cost.get("budget_period", "daily")
-    return CheckResult(name=name, status=PASS, summary=f"${limit}/{period} budget enforced")
+    summary = f"${limit}/{period} budget enforced"
+    return CheckResult(name=name, status=PASS, summary=summary + _estimated_basis_note(cost))
+
+
+def _estimated_basis_note(cost: dict[str, Any]) -> str:
+    """Describe how much of the period's spend was booked from a token estimate.
+
+    Informational, never a WARN: a provider that simply never reports a usage
+    breakdown would otherwise sit at a permanent warning. Every read is
+    defensive so `doctor` still works against a proxy predating these fields.
+    """
+    note = ""
+
+    basis = cost.get("budget_basis")
+    if isinstance(basis, dict):
+        estimated_usd = basis.get("estimated_usd")
+        estimated_pct = basis.get("estimated_pct")
+        if isinstance(estimated_usd, (int, float)) and estimated_usd > 0:
+            pct = f"{estimated_pct:.0f}% " if isinstance(estimated_pct, (int, float)) else ""
+            note += (
+                f" — {pct}of period spend (${estimated_usd:.4f}) "
+                "booked from Headroom token estimates"
+            )
+
+    # Reported independently of the breakdown: a non-default policy changes how
+    # the budget is enforced and should surface even if the split is missing.
+    policy = cost.get("budget_estimated_basis")
+    if isinstance(policy, str) and policy and policy != "count":
+        note += f" — estimated-basis policy: {policy}"
+    return note
 
 
 def check_deployments(manifests: list[Any], probe: Any = probe_json) -> CheckResult | None:

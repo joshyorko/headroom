@@ -69,6 +69,21 @@ def _scrub_developer_headroom_env(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
 
 
+# The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON,
+# and the beacon defaults to ON. So scrubbing for hermeticity is precisely what
+# switches it on, and with HEADROOM_TELEMETRY_ENDPOINT scrubbed too it falls back
+# to the real production endpoint. Every test that reaches the outcome funnel
+# then POSTs a session event for real: observed writing into the live corpus
+# during a local run, and CI would do the same on every push.
+#
+# Depends on the scrub fixture so it is guaranteed to run after it rather than
+# relying on declaration order. A test that wants the beacon on just sets the
+# var itself — monkeypatch inside the test wins over this.
+@pytest.fixture(autouse=True)
+def _disable_telemetry_beacon(monkeypatch, _scrub_developer_headroom_env):
+    monkeypatch.setenv("HEADROOM_BEACON", "off")
+
+
 # The MCP install ledger defaults to ``~/.headroom/mcp_installs.json``, so any
 # test that registers a server (directly or through `wrap`) writes into the
 # developer's REAL ledger — observed adding a live `claude/serena` entry during a

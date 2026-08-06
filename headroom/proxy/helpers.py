@@ -75,9 +75,6 @@ from headroom.proxy.ccr_golden_policy import (
 from headroom.proxy.ccr_marker_policy import (
     has_new_ccr_markers as _has_new_ccr_markers,
 )
-from headroom.proxy.ccr_marker_policy import (
-    should_inject_ccr_tool as _should_inject_ccr_tool,
-)
 from headroom.proxy.ccr_session_tracker import SessionCcrTracker as _SessionCcrTracker
 from headroom.proxy.internal_header_policy import (
     INTERNAL_HEADER_PREFIX,
@@ -2411,35 +2408,6 @@ def has_new_ccr_markers(
     )
 
 
-def should_inject_ccr_tool(
-    *,
-    configured_inject_tool: bool,
-    frozen_message_count: int,
-    has_compressed_content: bool,
-) -> tuple[bool, bool]:
-    """Decide whether the ``headroom_retrieve`` tool must be injected this turn.
-
-    This is the decision the Anthropic handler used to inline. It is extracted
-    so the #1006 regression can be pinned at the decision point itself.
-
-    Tool injection is normally deferred when there is a frozen message prefix
-    (``frozen_message_count > 0``) to preserve the prompt cache. But if
-    compression emitted fresh markers this turn, deferring would hand the agent
-    a ``<<ccr:hash>>`` marker with no tool to redeem it — silent data loss. In
-    that case we override the deferral and inject anyway (one cache miss is
-    cheaper than dropped content).
-
-    Returns ``(should_inject, is_marker_override)``. ``is_marker_override`` is
-    True only when injection happens *because* of new markers despite a deferral,
-    so the caller can log the override distinctly.
-    """
-    return _should_inject_ccr_tool(
-        configured_inject_tool=configured_inject_tool,
-        frozen_message_count=frozen_message_count,
-        has_compressed_content=has_compressed_content,
-    )
-
-
 def apply_session_sticky_ccr_tool(
     *,
     provider: Literal["anthropic", "openai", "google"],
@@ -3093,6 +3061,117 @@ def inject_tool_search_deferral(
 
 
 # ---------------------------------------------------------------------------
+# Tool-search history repair (issue #2805).
+#
+# Once the deferral above is active, Anthropic answers with ``server_tool_use``
+# (the search) + ``tool_search_tool_result`` (a list of ``tool_reference``
+# entries) blocks, and the client writes them into its transcript permanently.
+# Anthropic validates every ``tool_reference`` in the history against the
+# request's ``tools`` array and 400s with
+# ``Tool reference 'X' not found in available tools`` when one is missing.
+#
+# That is fine for a client's main loop — the proxy re-injects the same tools
+# array every turn — but Claude Code also replays the SAME transcript on
+# side-requests that carry a different, smaller tools array (the prompt-type
+# Stop hook evaluator, /compact, …). The proxy cannot predict those tool sets,
+# so instead we repair the history: when the outbound request cannot support
+# the tool-search blocks, drop them. Deterministic (same request → same output,
+# so the prefix still caches), stateless (no session bookkeeping), and
+# self-healing for transcripts already poisoned before the fix.
+# ---------------------------------------------------------------------------
+
+_TOOL_SEARCH_RESULT_TYPE = "tool_search_tool_result"
+
+
+def _tool_search_reference_names(content: Any) -> list[str]:
+    """Return the ``tool_reference`` names carried by a tool-search result block.
+
+    Server-side results nest them (``content.tool_references``); a client-side
+    tool-search implementation returns the bare list. Accept both.
+    """
+    entries = content.get("tool_references") if isinstance(content, dict) else content
+    if not isinstance(entries, list):
+        return []
+    names = []
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("type") == "tool_reference":
+            # Server-side blocks use ``tool_name``; be liberal about ``name``.
+            name = entry.get("tool_name") or entry.get("name")
+            if name:
+                names.append(str(name))
+    return names
+
+
+def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
+    """Drop tool-search blocks this request's ``tools`` array cannot support.
+
+    A block pair is unsupportable when the request carries no ``tool_search_tool_*``
+    tool, or when a ``tool_reference`` names a tool absent from ``tools`` — the two
+    shapes Anthropic rejects. Both the ``tool_search_tool_result`` and its paired
+    ``server_tool_use`` are removed (an orphan of either 400s on its own), and a
+    message left with no content blocks is dropped rather than sent empty.
+
+    Returns ``(messages, blocks_removed)``, and the ORIGINAL ``messages`` object
+    when nothing was removed — callers rely on identity to skip the write-back.
+    """
+    if not isinstance(messages, list):
+        return messages, 0
+
+    tool_list = tools if isinstance(tools, list) else []
+    available = {str(t["name"]) for t in tool_list if isinstance(t, dict) and t.get("name")}
+    has_search_tool = any(
+        isinstance(t, dict) and str(t.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        for t in tool_list
+    )
+
+    out: list[Any] = []
+    removed = 0
+    changed = False
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+
+        drop_indexes: set[int] = set()
+        orphaned_ids: set[str] = set()
+        for index, block in enumerate(content):
+            if not isinstance(block, dict) or block.get("type") != _TOOL_SEARCH_RESULT_TYPE:
+                continue
+            names = _tool_search_reference_names(block.get("content"))
+            if has_search_tool and all(name in available for name in names):
+                continue
+            drop_indexes.add(index)
+            use_id = block.get("tool_use_id")
+            if use_id:
+                orphaned_ids.add(str(use_id))
+        # The search call itself precedes its result, so pair it up in a second
+        # pass. Only tool-search server calls are eligible — web_search and code
+        # execution use the same block type and must survive untouched.
+        for index, block in enumerate(content):
+            if not isinstance(block, dict) or block.get("type") != "server_tool_use":
+                continue
+            is_search_call = str(block.get("name", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+            if str(block.get("id", "")) in orphaned_ids or (is_search_call and not has_search_tool):
+                drop_indexes.add(index)
+
+        if not drop_indexes:
+            out.append(message)
+            continue
+
+        changed = True
+        removed += len(drop_indexes)
+        kept = [block for index, block in enumerate(content) if index not in drop_indexes]
+        if not kept:
+            continue  # the whole turn was tool-search bookkeeping
+        repaired = dict(message)
+        repaired["content"] = kept
+        out.append(repaired)
+
+    return (out, removed) if changed else (messages, 0)
+
+
+# ---------------------------------------------------------------------------
 # Server-side Tool Search injection — OpenAI Responses API (gpt-5.4+).
 #
 # The OpenAI-side analogue of inject_tool_search_deferral above. OpenAI shipped
@@ -3117,6 +3196,7 @@ def inject_tool_search_deferral(
 _OPENAI_TOOL_SEARCH_TYPE = "tool_search"
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
+_OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in
 # HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
@@ -3147,24 +3227,34 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
     return (major, minor) >= _OPENAI_TOOL_SEARCH_MIN_VERSION
 
 
+def openai_tool_search_client_supported(client: str | None) -> bool:
+    """Return whether OpenAI tool search deferral is safe for this client."""
+    normalized = client.strip().lower() if client else ""
+    return normalized not in _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS
+
+
 def inject_tool_search_deferral_openai(
     tools: Any,
     model: str | None,
     *,
+    client: str | None = None,
     core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
 ) -> Any:
     """Return a new Responses ``tools`` list with non-core function/MCP tools
     deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
     unchanged when injection doesn't apply.
 
-    No-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
+    No-op for Codex, whose round-trip structs drop deferred-call namespaces. Also
+    no-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
     is not a list, there are fewer than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a
     tool_search tool is already present (client already defers), or nothing would
     be deferred. Core coding tools and hosted/typed tools (web_search,
-    file_search, code_interpreter, computer, …) stay resident and unchanged, so
-    routine edit/read/run loops never pay a search round-trip and the request
+    file_search, code_interpreter, computer, ...) stay resident and unchanged,
+    so routine edit/read/run loops never pay a search round-trip and the request
     stays valid; the injected search tool is itself resident.
     """
+    if not openai_tool_search_client_supported(client):
+        return tools
     if not _model_supports_openai_tool_search(model):
         return tools
     if not isinstance(tools, list) or len(tools) < _OPENAI_TOOL_SEARCH_MIN_TOOLS:

@@ -1,9 +1,11 @@
+import os
 import sys
 
 from headroom.onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
     cpu_arena_enabled,
     create_cpu_session_options,
+    hf_entry_known_absent,
 )
 
 
@@ -104,3 +106,55 @@ def test_create_cpu_session_options_handles_older_session_options(monkeypatch):
 
     assert options.intra_op_num_threads is None
     assert options.inter_op_num_threads is None
+
+
+def _write_fake_hf_cache(
+    root: str, repo_id: str, revision: str, *, no_exist_files: list[str]
+) -> None:
+    """Build a minimal on-disk HF hub cache layout for a single repo/revision.
+
+    Mirrors the real cache structure closely enough for
+    ``huggingface_hub.try_to_load_from_cache`` to read it: a ``refs/<name>``
+    pointer file, a ``snapshots/<hash>`` directory, and a
+    ``.no_exist/<hash>/<filename>`` marker per file whose absence is cached.
+    """
+    from huggingface_hub.file_download import repo_folder_name
+
+    repo_folder = os.path.join(root, repo_folder_name(repo_id=repo_id, repo_type="model"))
+    os.makedirs(os.path.join(repo_folder, "refs"), exist_ok=True)
+    with open(os.path.join(repo_folder, "refs", revision), "w") as f:
+        f.write("abc123")
+    os.makedirs(os.path.join(repo_folder, "snapshots", "abc123"), exist_ok=True)
+    no_exist_dir = os.path.join(repo_folder, ".no_exist", "abc123")
+    os.makedirs(no_exist_dir, exist_ok=True)
+    for filename in no_exist_files:
+        open(os.path.join(no_exist_dir, filename), "w").close()
+
+
+def test_hf_entry_known_absent_true_when_404_was_cached(tmp_path, monkeypatch):
+    from huggingface_hub import constants
+
+    _write_fake_hf_cache(str(tmp_path), "acme/widget", "main", no_exist_files=["merged.pt"])
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.delenv("HEADROOM_HF_PIN", raising=False)
+
+    assert hf_entry_known_absent("acme/widget", "merged.pt") is True
+
+
+def test_hf_entry_known_absent_false_when_never_checked(tmp_path, monkeypatch):
+    from huggingface_hub import constants
+
+    _write_fake_hf_cache(str(tmp_path), "acme/widget", "main", no_exist_files=[])
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.delenv("HEADROOM_HF_PIN", raising=False)
+
+    assert hf_entry_known_absent("acme/widget", "merged.pt") is False
+
+
+def test_hf_entry_known_absent_false_when_repo_not_cached_at_all(tmp_path, monkeypatch):
+    from huggingface_hub import constants
+
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.delenv("HEADROOM_HF_PIN", raising=False)
+
+    assert hf_entry_known_absent("nobody/nothing", "merged.pt") is False

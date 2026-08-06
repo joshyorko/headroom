@@ -12,6 +12,42 @@ import pytest
 from headroom import copilot_auth
 
 
+def test_device_authorization_uses_form_encoded_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    captured = {}
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+        captured["request"] = request
+        return io.BytesIO(b'{"device_code":"d","user_code":"u"}')
+
+    monkeypatch.setattr(copilot_auth.urllib_request, "urlopen", fake_urlopen)
+    copilot_auth.start_copilot_device_authorization()
+
+    request = captured["request"]
+    assert request.headers["Content-type"] == "application/x-www-form-urlencoded"
+    assert b"client_id=" in request.data
+    assert not request.data.startswith(b"{")
+
+
+def test_device_poll_uses_form_encoded_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    captured = {}
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+        captured["request"] = request
+        return io.BytesIO(b'{"access_token":"gho-test"}')
+
+    monkeypatch.setattr(copilot_auth.urllib_request, "urlopen", fake_urlopen)
+    assert copilot_auth.poll_copilot_device_authorization("device-test") == "gho-test"
+
+    request = captured["request"]
+    assert request.headers["Content-type"] == "application/x-www-form-urlencoded"
+    assert b"device_code=device-test" in request.data
+    assert not request.data.startswith(b"{")
+
+
 @pytest.fixture(autouse=True)
 def _isolated_copilot_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Keep Copilot auth tests away from user secret stores and real auth files."""

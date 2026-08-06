@@ -204,6 +204,22 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Period the budget applies to.",
         tier="basic",
     ),
+    SettingField(
+        "HEADROOM_BUDGET_ESTIMATED_BASIS",
+        "budget_estimated_basis",
+        "Estimated-basis spend",
+        "Budget",
+        "enum",
+        default="count",
+        choices=("count", "ignore", "block"),
+        help=(
+            "What spend booked from Headroom's own token estimate does to the budget "
+            "when a provider response carries no input-token breakdown. count: it "
+            "consumes the budget. ignore: only provider-reported spend does. block: "
+            "refuse requests rather than enforce a hard limit on an estimate."
+        ),
+        tier="advanced",
+    ),
     # --- Networking (baked into the install manifest on supervised deploys) ---
     SettingField(
         "HEADROOM_HOST",

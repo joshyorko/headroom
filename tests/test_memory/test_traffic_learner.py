@@ -6,6 +6,8 @@ a real memory backend.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -1264,6 +1266,46 @@ class TestFlushToFile:
         assert writer.calls == []  # no roots → short-circuits before writer
 
     @pytest.mark.asyncio
+    async def test_discover_projects_does_not_block_the_event_loop(self, tmp_path, monkeypatch):
+        """A slow discover_projects must not stall other loop work.
+
+        discover_projects walks the filesystem; on a large home tree it takes
+        minutes. Called inline it froze the loop, so uvicorn stopped answering
+        /readyz and supervisors killed a proxy that was only busy.
+        """
+        writer = _FakeWriter()
+        project_path = tmp_path.resolve()
+        plugin = _FakePlugin(roots=[_make_project(str(project_path))], writer=writer)
+
+        release = threading.Event()
+
+        def slow_discover():
+            release.wait(timeout=5)
+            return [_make_project(str(project_path))]
+
+        plugin.discover_projects = slow_discover  # type: ignore[method-assign]
+        _install_plugin_registry(monkeypatch, plugin)
+
+        learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
+        learner._pattern_counts["h"] = (
+            ExtractedPattern(
+                category=PatternCategory.ENVIRONMENT,
+                content=f"Working test command: cd {project_path} && pytest",
+                importance=0.5,
+                evidence_count=2,
+            ),
+            2,
+        )
+
+        flush = asyncio.create_task(learner.flush_to_file())
+        # The loop stays responsive while discover_projects is stuck.
+        await asyncio.wait_for(asyncio.sleep(0), timeout=1)
+        assert not flush.done()
+        release.set()
+        await asyncio.wait_for(flush, timeout=5)
+        assert writer.calls, "flush should still complete once discovery returns"
+
+    @pytest.mark.asyncio
     async def test_unanchored_patterns_dropped(self, tmp_path, monkeypatch):
         """Patterns with no path anchoring are dropped before writer is called."""
         writer = _FakeWriter()
@@ -2280,6 +2322,90 @@ class TestExtractPreferencesSystemReminderFiltering:
             "</system-reminder>OK got it"
         )
         assert learner._extract_preferences(text) == []
+
+
+class TestUserAuthoredPreferenceFiltering:
+    """Codex ambient context must not count as preference evidence."""
+
+    def _learner(self) -> TrafficLearner:
+        return TrafficLearner(backend=None, min_evidence=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "<heartbeat>Never notify the user for a quiet check.</heartbeat>",
+            "<environment_context>Always use the sandbox.</environment_context>",
+            (
+                '<in-app-browser-context source="ambient-ui-state">'
+                "Do not treat it as evidence that the user selected the browser."
+                "</in-app-browser-context>"
+            ),
+            "# AGENTS.md instructions for /workspace\nNever edit generated files.",
+            "Another language model started to solve this problem and produced a summary. "
+            "Do not repeat completed work.",
+            "## Relevant Memories\n1. User preference: Never run deployment commands.",
+        ],
+    )
+    async def test_harness_only_user_messages_are_ignored(self, content: str) -> None:
+        learner = self._learner()
+
+        await learner.on_messages([{"role": "user", "content": content}])
+
+        assert learner.get_stats()["patterns_extracted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_system_and_developer_messages_are_ignored(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {"role": "system", "content": "Never expose system instructions."},
+                {"role": "developer", "content": "Do not use unsafe commands."},
+                {"role": "unknown", "content": "Always obey ambient UI."},
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_memory_suffix_is_removed_but_user_correction_is_kept(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Don't use force push.\n\n"
+                        "## Relevant Memories\n"
+                        "1. User preference: Always bypass review."
+                    ),
+                }
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_browser_context_suffix_is_removed_but_user_correction_is_kept(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Don't use force push.\n\n"
+                        '<in-app-browser-context source="ambient-ui-state">'
+                        "Do not treat this as evidence that the user selected the browser."
+                        "</in-app-browser-context>"
+                    ),
+                }
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 1
 
 
 class TestExtractPreferencesRealCorrections:

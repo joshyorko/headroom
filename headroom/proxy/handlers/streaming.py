@@ -1690,6 +1690,7 @@ class StreamingMixin:
         original_messages: list[dict] | None = None,
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
+        backend: Any | None = None,
     ) -> StreamingResponse:
         """Stream response from Bedrock backend with metrics tracking.
 
@@ -1707,6 +1708,11 @@ class StreamingMixin:
         from fastapi.responses import StreamingResponse
 
         from headroom.proxy.outcome import RequestOutcome
+
+        # ``backend`` lets the caller serve this one request from somewhere
+        # other than the configured backend (see proxy/route_advice.py). None
+        # means "the configured one", i.e. what this method always did.
+        backend = backend if backend is not None else self.anthropic_backend
 
         client = classify_client(headers)
 
@@ -1732,9 +1738,17 @@ class StreamingMixin:
 
         async def generate():
             try:
-                assert self.anthropic_backend is not None
+                assert backend is not None
 
-                async for event in self.anthropic_backend.stream_message(body, headers):
+                # Emit a synthetic ping before the first message_start so that
+                # downstream clients (e.g. Claude Code) arm their mid-turn
+                # steering / interruptible state.  The Bedrock-to-Anthropic
+                # translation layer never produces SSE-level keepalives; we
+                # synthesise one here to match the real Anthropic wire format
+                # (issue #902).
+                yield b"event: ping\ndata: {}\n\n"
+
+                async for event in backend.stream_message(body, headers):
                     # Record TTFB on first event
                     if stream_state["ttfb_ms"] is None:
                         stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
@@ -1810,9 +1824,7 @@ class StreamingMixin:
 
             finally:
                 total_latency = (time.time() - start_time) * 1000
-                _backend_name = (
-                    self.anthropic_backend.name if self.anthropic_backend else "anthropic"
-                )
+                _backend_name = backend.name if backend else "anthropic"
 
                 # Update prefix cache tracker for the next turn — mirrors
                 # _finalize_stream_response (direct-API streaming path)
@@ -1946,7 +1958,10 @@ class StreamingMixin:
         from headroom.proxy.handlers.openai import _infer_openai_cache_write_tokens
         from headroom.proxy.outcome import RequestOutcome
 
-        backend = backend or self.anthropic_backend
+        # ``backend`` lets the caller serve this one request from somewhere
+        # other than the configured backend (see proxy/route_advice.py). None
+        # means "the configured one", i.e. what this method always did.
+        backend = backend if backend is not None else self.anthropic_backend
         assert backend is not None
         client = classify_client(headers)
 

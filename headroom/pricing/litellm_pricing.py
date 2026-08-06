@@ -138,6 +138,13 @@ class LiteLLMModelPricing:
     max_output_tokens: int | None = None
     supports_vision: bool = False
     supports_function_calling: bool = False
+    # Prompt-cache traffic, where LiteLLM knows it. ``None`` means "not published
+    # for this model", which is distinct from 0.0 ("free"): the 1h write rate in
+    # particular is absent for most models, and a caller that needs it must either
+    # derive it (see :mod:`headroom.pricing.cache_ttl`) or report that it could not.
+    cache_read_per_1m: float | None = None
+    cache_write_5m_per_1m: float | None = None
+    cache_write_1h_per_1m: float | None = None
 
 
 def get_litellm_model_cost() -> dict[str, Any]:
@@ -187,7 +194,46 @@ def get_model_pricing(model: str) -> LiteLLMModelPricing | None:
         max_output_tokens=info.get("max_output_tokens"),
         supports_vision=info.get("supports_vision", False),
         supports_function_calling=info.get("supports_function_calling", False),
+        cache_read_per_1m=_per_1m(info.get("cache_read_input_token_cost")),
+        cache_write_5m_per_1m=_per_1m(info.get("cache_creation_input_token_cost")),
+        cache_write_1h_per_1m=_per_1m(info.get("cache_creation_input_token_cost_above_1hr")),
     )
+
+
+def _per_1m(cost_per_token: object) -> float | None:
+    """Scale a LiteLLM per-token cost to per-1M, preserving "not published".
+
+    ``None`` in, ``None`` out — the absence of a rate is information and must not
+    collapse into 0.0, which would read as free.
+    """
+    if not isinstance(cost_per_token, (int, float, str)):
+        return None
+    try:
+        return float(cost_per_token) * 1_000_000
+    except (TypeError, ValueError):
+        return None
+
+
+def pricing_per_1m(model: str) -> tuple[float, float] | None:
+    """``(input, output)`` USD per 1M tokens from LiteLLM, or ``None``.
+
+    The tuple shape providers already use for their own tables, so a provider can
+    prefer this over a hand-maintained copy with a single call. ``None`` means
+    "LiteLLM can't answer" — either it isn't installed (the dependency is gated
+    ``python_version < '3.14'``) or it doesn't know the model — which is the
+    provider's cue to fall back.
+
+    A found-but-zero price is returned as ``0.0`` rather than treated as missing:
+    some models genuinely are free, and ``savings_ledger`` already made this call
+    (see its note on "a legitimate 0.0 for genuinely free (0-priced) models").
+    """
+    pricing = get_model_pricing(model)
+    if pricing is None:
+        return None
+    # LiteLLM stores cost per token, so the x1e6 conversion leaves float noise
+    # ($0.4/1M arrives as 0.39999999999999997). Round at this boundary: 6 places
+    # is finer than any published rate and keeps the value printable.
+    return (round(pricing.input_cost_per_1m, 6), round(pricing.output_cost_per_1m, 6))
 
 
 def estimate_cost(

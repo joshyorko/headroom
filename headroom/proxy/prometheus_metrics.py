@@ -690,8 +690,17 @@ class PrometheusMetrics:
         project: str | None = None,
         client: str | None = None,
         tool_search_saved: int = 0,
+        local_input_tokens: int | None = None,
     ):
-        """Record metrics for a request."""
+        """Record metrics for a request.
+
+        ``input_tokens`` is the billed/volume figure and may be the provider's own
+        count. ``local_input_tokens`` is the same request measured with the SAME
+        tokenizer as ``tokens_saved``; it is used wherever a delta is derived, so
+        reduction/yield/ledger math never straddles two rulers. Defaults to
+        ``input_tokens`` when omitted, preserving pre-split behaviour.
+        """
+        ledger_input_tokens = input_tokens if local_input_tokens is None else local_input_tokens
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original — handlers revert any inflation before sending
         # (verified clean on the wire). So compression savings are >= 0; a negative
@@ -848,8 +857,14 @@ class PrometheusMetrics:
             # Reconstruct the original as forwarded + saved.
             await asyncio.to_thread(
                 savings_ledger.record_savings_event,
-                tokens_before=input_tokens + tokens_saved,
-                tokens_after=input_tokens,
+                # The ledger stores a DELTA, so both ends must be on one ruler.
+                # `input_tokens` is the billed/volume figure and may be the
+                # provider's own count; pairing it with a locally-counted
+                # `tokens_saved` yields a mixed-ruler before/after (local 10->6
+                # with the provider reporting 8 would record 12->8). Use the
+                # caller's local count when supplied.
+                tokens_before=ledger_input_tokens + tokens_saved,
+                tokens_after=ledger_input_tokens,
                 model=model,
                 client=client or "proxy",
                 source="proxy",

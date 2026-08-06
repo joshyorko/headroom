@@ -468,16 +468,25 @@ def format_report(report: PerfReport) -> str:
         total_after = sum(r.tokens_after for r in records)
         total_saved = sum(r.tokens_saved for r in records)
         total_tool_saved = sum(r.tool_saved for r in records)
+        total_headline_saved = total_saved + total_tool_saved
         pct = (total_saved / total_before * 100) if total_before > 0 else 0
+        # All-layers denominator: deferred tool schemas were never in tok_before (they
+        # don't reach count_messages), so the pre-Headroom world is tok_before + them.
+        # Same construction the proxy's /api/stats uses for total_before_compression —
+        # the headline number and the headline percent must share a numerator, or the
+        # tile reads "60,920 saved (0.1%)" off two different definitions of saved.
+        headline_before = total_before + total_tool_saved
+        headline_pct = (total_headline_saved / headline_before * 100) if headline_before > 0 else 0
 
         lines.append(f"Requests:     {len(records)}")
-        lines.append(f"Tokens:       {total_before:,} -> {total_after:,} ({pct:.1f}% reduction)")
-        lines.append(f"Total saved:  {total_saved:,} tokens (messages)")
-        # Tool-schema savings (deferral + turn-hook tool shrink) are counted apart
-        # from message compression — messages never include tool bytes — so surface
-        # them explicitly instead of hiding a tool-heavy turn's win behind tok_saved=0.
+        lines.append(f"Tokens:       {total_before:,} -> {total_after:,} ({pct:.1f}% messages)")
+        # ONE headline. Tool-schema deferral can't move tok_before/after (messages never
+        # include tool bytes), so it used to render as a rival "Tool saved" line — which
+        # read as a side metric and hid the win on tool-heavy turns where tok_saved=0.
+        lines.append(f"Tokens saved: {total_headline_saved:,} ({headline_pct:.1f}% reduction)")
         if total_tool_saved > 0:
-            lines.append(f"Tool saved:   {total_tool_saved:,} tokens (tool schemas, deferral)")
+            lines.append(f"  · messages       {max(0, total_saved):,}")
+            lines.append(f"  · tool schemas   {total_tool_saved:,}")
         lines.append("")
 
         # Per-model breakdown with list prices
@@ -963,6 +972,7 @@ def build_perf_summary(report: PerfReport) -> dict:
     total_after = sum(r.tokens_after for r in records)
     total_saved = sum(r.tokens_saved for r in records)
     total_tool_saved = sum(r.tool_saved for r in records)
+    total_headline_saved = total_saved + total_tool_saved
 
     total_cr = sum(r.cache_read for r in records)
     total_cw = sum(r.cache_write for r in records)
@@ -1018,6 +1028,11 @@ def build_perf_summary(report: PerfReport) -> dict:
         "total_requests": len(records),
         "total_tokens_before": total_before,
         "total_tokens_after": total_after,
+        # total_tokens_saved is the headline (messages + tool-schema deferral); the two
+        # components stay for consumers that break the number down. See
+        # headroom.proxy.tool_schema_savings_policy.
+        "total_tokens_saved": total_headline_saved,
+        "total_savings_pct": _pct(total_headline_saved, total_before + total_tool_saved),
         "tokens_saved": total_saved,
         "tool_saved": total_tool_saved,
         "savings_pct": _pct(total_saved, total_before),

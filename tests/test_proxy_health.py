@@ -87,6 +87,9 @@ def test_readyz_promotes_deferred_kompress_after_runtime_load(monkeypatch):
         "status": "healthy",
         "backend": "onnx",
     }
+    # The promotion must also clear the startup marker, otherwise the slot
+    # serializes as loaded-but-deferred in /debug/warmup.
+    assert proxy.warmup.kompress.info["source_status"] == "runtime"
 
 
 @pytest.mark.parametrize("attached", [False, True])

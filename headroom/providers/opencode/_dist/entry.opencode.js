@@ -12484,6 +12484,7 @@ var http = nodeRequire("node:http");
 var https = nodeRequire("node:https");
 var http2 = nodeRequire("node:http2");
 var childProcess = nodeRequire("node:child_process");
+var fs = nodeRequire("node:fs");
 var BASE_URL_HEADER = "x-headroom-base-url";
 var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
 var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
@@ -12495,7 +12496,8 @@ function setState(state) {
   globalThis[STATE_KEY] = state;
 }
 function shimImportSpecifier() {
-  return new URL("../hook-shim/handler.js", import.meta.url).href;
+  const shim = new URL("../hook-shim/handler.js", import.meta.url);
+  return fs.existsSync(shim) ? shim.href : void 0;
 }
 function withNodeImportOption(existing, shim) {
   const parts = existing?.trim() ? existing.trim().split(/\s+/) : [];
@@ -12510,12 +12512,18 @@ function withNodeImportOption(existing, shim) {
 function withShimEnv(env, proxyUrl) {
   const nextEnv = { ...env ?? process.env };
   nextEnv[PROXY_ENV] = proxyUrl;
-  nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shimImportSpecifier());
+  const shim = shimImportSpecifier();
+  if (shim) {
+    nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
+  }
   return nextEnv;
 }
 function installProcessEnv(proxyUrl) {
   process.env[PROXY_ENV] = proxyUrl;
-  process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shimImportSpecifier());
+  const shim = shimImportSpecifier();
+  if (shim) {
+    process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
+  }
 }
 function isOptions(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value) && !(value instanceof URL);

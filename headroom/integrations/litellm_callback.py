@@ -33,6 +33,10 @@ except ImportError:  # litellm not installed — fall back to plain object
 class HeadroomCallback(_CustomLogger):
     """LiteLLM callback that compresses messages before each API call.
 
+    Implements the LiteLLM callback hooks looked up by name:
+    ``async_pre_call_hook``, ``async_post_call_success_hook``,
+    ``async_success_handler`` and ``async_failure_handler``.
+
     Inherits from litellm.integrations.custom_logger.CustomLogger so that
     any hook LiteLLM adds in future versions (e.g. async_post_call_success_hook
     added in 1.89.x) has a no-op default and won't raise AttributeError (#1114).
@@ -191,6 +195,15 @@ class HeadroomCallback(_CustomLogger):
 
         result: dict[str, Any] = resp.json()
         return result
+
+    async def async_post_call_success_hook(
+        self,
+        data: dict[str, Any],
+        user_api_key_dict: Any,
+        response: Any,
+    ) -> Any:
+        """Called by the LiteLLM proxy after a successful call. Returns response unchanged."""
+        return response
 
     async def async_success_handler(
         self, kwargs: dict, response: Any, start_time: Any, end_time: Any

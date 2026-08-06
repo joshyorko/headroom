@@ -318,6 +318,9 @@ class ProxyConfig:
     cost_tracking_enabled: bool = True
     budget_limit_usd: float | None = None
     budget_period: Literal["hourly", "daily", "monthly"] = "daily"
+    # What spend booked from Headroom's own token estimate (provider returned no
+    # usage breakdown) does to budget enforcement. See budget_basis_policy.
+    budget_estimated_basis: Literal["count", "ignore", "block"] = "count"
 
     # Logging
     log_requests: bool = True

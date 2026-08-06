@@ -1,4 +1,5 @@
 import childProcess from "node:child_process";
+import fs from "node:fs";
 import http from "node:http";
 import http2 from "node:http2";
 import https from "node:https";
@@ -160,6 +161,35 @@ describe("Headroom OpenCode transport", () => {
       } else {
         process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL = originalProxyUrl;
       }
+      uninstallHeadroomTransport();
+    }
+  });
+
+  it("skips the shim preload when the bundle ships without it (#2798)", () => {
+    const originalNodeOptions = process.env.NODE_OPTIONS;
+    const originalSpawn = childProcess.spawn;
+    const spawnMock = vi.fn(() => ({ on: vi.fn(), kill: vi.fn(), pid: 123 }));
+    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
+    vi.spyOn(fs, "existsSync").mockReturnValue(false);
+
+    try {
+      process.env.NODE_OPTIONS = "--trace-warnings";
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+      // A missing --import target aborts the child before it speaks JSON-RPC,
+      // which OpenCode reports as `MCP error -32000: Connection closed`.
+      expect(process.env.NODE_OPTIONS).toBe("--trace-warnings");
+
+      childProcess.spawn("npx", ["-y", "firecrawl-mcp"]);
+      const options = (spawnMock.mock.calls[0] as unknown[])[2] as { env: NodeJS.ProcessEnv };
+      expect(options.env.NODE_OPTIONS).not.toContain("--import");
+    } finally {
+      if (originalNodeOptions === undefined) {
+        delete process.env.NODE_OPTIONS;
+      } else {
+        process.env.NODE_OPTIONS = originalNodeOptions;
+      }
+      childProcess.spawn = originalSpawn;
       uninstallHeadroomTransport();
     }
   });

@@ -299,3 +299,126 @@ def test_resident_real_tool_survives_pascal_case_surface() -> None:
     # own; Anthropic 400s when every real tool is deferred.
     out = inject_tool_search_deferral(_claude_code_tools())
     assert any(not t.get("type") and not t.get("defer_loading") for t in out)
+
+
+# ---------------------------------------------------------------------------
+# Tool-search history repair (#2805)
+#
+# Anthropic validates every tool_reference in the transcript against the
+# request's tools array. Claude Code replays one transcript across requests
+# with DIFFERENT tools arrays (main loop vs prompt-type Stop hook evaluator),
+# so the side-request 400s with "Tool reference 'X' not found in available
+# tools". The repair drops blocks a request cannot support.
+# ---------------------------------------------------------------------------
+
+from headroom.proxy.helpers import (  # noqa: E402
+    strip_unsupported_tool_search_blocks,
+)
+
+_SEARCH_TOOL = {"type": _TOOL_SEARCH_DEFAULT_TYPE, "name": _TOOL_SEARCH_DEFAULT_NAME}
+
+
+def _poisoned_transcript() -> list[dict]:
+    """A transcript as Claude Code stores it after one server-side tool search."""
+    return [
+        {"role": "user", "content": [{"type": "text", "text": "ask the user"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Searching for a tool."},
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_01ABC",
+                    "name": _TOOL_SEARCH_DEFAULT_NAME,
+                    "input": {"pattern": "question|ask"},
+                },
+                {
+                    "type": "tool_search_tool_result",
+                    "tool_use_id": "srvtoolu_01ABC",
+                    "content": {
+                        "type": "tool_search_tool_search_result",
+                        "tool_references": [
+                            {"type": "tool_reference", "tool_name": "AskUserQuestion"}
+                        ],
+                    },
+                },
+                {"type": "text", "text": "Found it."},
+            ],
+        },
+    ]
+
+
+def test_repair_drops_blocks_the_hook_evaluator_cannot_resolve() -> None:
+    # The Stop hook evaluator replays the transcript with a small tools array
+    # that has neither the search tool nor AskUserQuestion -> upstream 400.
+    messages, removed = strip_unsupported_tool_search_blocks(
+        _poisoned_transcript(), [{"name": "Read", "input_schema": {}}]
+    )
+    assert removed == 2  # server_tool_use + tool_search_tool_result
+    kinds = [b["type"] for b in messages[1]["content"]]
+    assert kinds == ["text", "text"]  # surrounding assistant text survives
+    assert messages[0]["content"][0]["text"] == "ask the user"
+
+
+def test_repair_is_noop_on_the_main_loop() -> None:
+    # Same transcript, but the request carries the injected search tool AND the
+    # referenced tool: nothing to repair, and the object is returned by identity
+    # so the outbound prefix (and its cache) is untouched.
+    transcript = _poisoned_transcript()
+    messages, removed = strip_unsupported_tool_search_blocks(
+        transcript,
+        [_SEARCH_TOOL, {"name": "AskUserQuestion", "input_schema": {}, "defer_loading": True}],
+    )
+    assert removed == 0
+    assert messages is transcript
+
+
+def test_repair_drops_a_turn_left_with_no_blocks() -> None:
+    # An assistant turn that was ONLY the search round-trip must be removed, not
+    # forwarded with an empty content array (which Anthropic also rejects).
+    transcript = _poisoned_transcript()
+    transcript[1]["content"] = transcript[1]["content"][1:3]
+    messages, removed = strip_unsupported_tool_search_blocks(transcript, [])
+    assert removed == 2
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+
+
+def test_repair_leaves_other_server_tools_alone() -> None:
+    # web_search / code execution use the same block type and stay untouched.
+    transcript = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_web",
+                    "name": "web_search",
+                    "input": {"query": "x"},
+                },
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_web", "content": []},
+            ],
+        }
+    ]
+    messages, removed = strip_unsupported_tool_search_blocks(transcript, [])
+    assert removed == 0
+    assert messages is transcript
+
+
+def test_repair_is_idempotent() -> None:
+    # Deterministic: repairing an already-repaired transcript is a no-op, so a
+    # session's forwarded prefix stays byte-stable turn over turn.
+    once, _ = strip_unsupported_tool_search_blocks(_poisoned_transcript(), [])
+    twice, removed = strip_unsupported_tool_search_blocks(once, [])
+    assert removed == 0
+    assert twice is once
+
+
+def test_repair_strips_search_history_when_only_the_tool_is_missing() -> None:
+    # References all resolve, but the request has no tool_search tool at all
+    # (e.g. deferral skipped below _TOOL_SEARCH_MIN_TOOLS) -- history still
+    # cannot be supported, so it goes.
+    _, removed = strip_unsupported_tool_search_blocks(
+        _poisoned_transcript(), [{"name": "AskUserQuestion", "input_schema": {}}]
+    )
+    assert removed == 2

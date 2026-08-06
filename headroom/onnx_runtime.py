@@ -95,6 +95,24 @@ def hf_hub_download_local_first(repo_id: str, filename: str, *, allow_network: b
         return str(hf_hub_download(repo_id, filename))
 
 
+def hf_entry_known_absent(repo_id: str, filename: str, *, revision: str | None = None) -> bool:
+    """True only if a prior network lookup already confirmed ``filename`` does
+    not exist in ``repo_id`` at the resolved revision.
+
+    Backed by ``huggingface_hub``'s own cache of negative lookups (the
+    ``.no_exist`` marker written after a real 404), so this never makes a
+    network call itself. Returns ``False`` both when the file is cached and
+    when nothing is known yet about it, on purpose: callers in a cache-only
+    (``allow_network=False``) code path can use this to tell "confirmed
+    missing upstream, safe to use a fallback file" apart from "just never
+    checked yet, do not guess."
+    """
+    from huggingface_hub import _CACHED_NO_EXIST, try_to_load_from_cache
+
+    result = try_to_load_from_cache(repo_id, filename, revision=revision)
+    return result is _CACHED_NO_EXIST
+
+
 def create_cpu_session_options(
     ort: Any,
     *,

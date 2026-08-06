@@ -444,6 +444,62 @@ class TestBudget:
         assert result.status == PASS
         assert "$10.0/daily" in result.summary
 
+    def test_estimated_basis_share_is_reported_without_warning(self):
+        """#2713: spend booked from a token estimate is surfaced, not warned on.
+
+        A provider that never reports a usage breakdown would otherwise sit at a
+        permanent WARN, so this stays informational.
+        """
+        result = check_budget(
+            {
+                "cost": {
+                    "budget_limit_usd": 10.0,
+                    "budget_period": "daily",
+                    "budget_estimated_basis": "count",
+                    "budget_basis": {"estimated_usd": 1.24, "estimated_pct": 62.3},
+                }
+            }
+        )
+        assert result.status == PASS
+        assert "62% of period spend ($1.2400)" in result.summary
+        assert "Headroom token estimates" in result.summary
+
+    def test_all_measured_spend_adds_no_note(self):
+        result = check_budget(
+            {
+                "cost": {
+                    "budget_limit_usd": 10.0,
+                    "budget_period": "daily",
+                    "budget_estimated_basis": "count",
+                    "budget_basis": {"estimated_usd": 0.0, "estimated_pct": 0.0},
+                }
+            }
+        )
+        assert result.summary == "$10.0/daily budget enforced"
+
+    def test_non_default_basis_policy_is_named(self):
+        result = check_budget(
+            {
+                "cost": {
+                    "budget_limit_usd": 10.0,
+                    "budget_period": "daily",
+                    "budget_estimated_basis": "block",
+                }
+            }
+        )
+        assert "estimated-basis policy: block" in result.summary
+
+    def test_missing_basis_fields_degrade_quietly(self):
+        """`doctor` must still work against a proxy predating these fields."""
+        result = check_budget({"cost": {"budget_limit_usd": 10.0, "budget_period": "daily"}})
+        assert result.status == PASS
+        assert result.summary == "$10.0/daily budget enforced"
+
+        malformed = check_budget(
+            {"cost": {"budget_limit_usd": 10.0, "budget_period": "daily", "budget_basis": "nope"}}
+        )
+        assert malformed.status == PASS
+
 
 @dataclass
 class _FakeManifest:

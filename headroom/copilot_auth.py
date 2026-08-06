@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from headroom import paths
 from headroom._subprocess import run
@@ -523,19 +523,15 @@ def start_copilot_device_authorization(
     """Start the GitHub Copilot OAuth device-code flow."""
 
     urls = _github_oauth_urls(domain)
-    body = json.dumps(
-        {
-            "client_id": COPILOT_CHAT_OAUTH_CLIENT_ID,
-            "scope": "read:user",
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
+    body = urlencode({"client_id": COPILOT_CHAT_OAUTH_CLIENT_ID, "scope": "read:user"}).encode(
+        "utf-8"
+    )
     request = urllib_request.Request(
         urls["device_code"],
         data=body,
         headers={
             "Accept": "application/json",
-            "Content-Type": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": _DEFAULT_USER_AGENT,
         },
         method="POST",
@@ -561,20 +557,19 @@ def poll_copilot_device_authorization(
     deadline = time.time() + max(1, expires_in)
     poll_interval = max(1, interval)
     while time.time() < deadline:
-        body = json.dumps(
+        body = urlencode(
             {
                 "client_id": COPILOT_CHAT_OAUTH_CLIENT_ID,
                 "device_code": device_code,
                 "grant_type": _DEVICE_CODE_GRANT_TYPE,
-            },
-            separators=(",", ":"),
+            }
         ).encode("utf-8")
         request = urllib_request.Request(
             urls["access_token"],
             data=body,
             headers={
                 "Accept": "application/json",
-                "Content-Type": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
                 "User-Agent": _DEFAULT_USER_AGENT,
             },
             method="POST",

@@ -9,6 +9,10 @@ from typing import Any
 from fastapi import FastAPI, Request, WebSocket
 
 from headroom.providers.cloudcode import normalize_cloudcode_passthrough_path
+from headroom.providers.codex.live import (
+    CODEX_LIVE_ROUTE_PATHS,
+    handle_codex_live_websocket,
+)
 from headroom.providers.codex.responses import handle_chatgpt_codex_responses_subpath
 from headroom.providers.model_metadata import (
     MODEL_METADATA_LIST_ENDPOINT,
@@ -177,6 +181,26 @@ def _register_openai_responses_routes(app: FastAPI, proxy: Any) -> None:
         _register_openai_responses_websocket_route(app, proxy, path)
     for spec in OPENAI_RESPONSES_SUBPATH_ROUTES:
         _register_openai_responses_subpath_route(app, proxy, spec)
+
+
+def _register_codex_live_routes(app: FastAPI, proxy: Any) -> None:
+    for path in CODEX_LIVE_ROUTE_PATHS:
+
+        def register_websocket_route(route_path: str) -> None:
+            async def codex_live_websocket(websocket: WebSocket):
+                await handle_codex_live_websocket(
+                    websocket,
+                    proxy,
+                    _api_target(proxy, "openai"),
+                    route_path,
+                )
+
+            codex_live_websocket.__name__ = (
+                route_path.strip("/").replace("/", "_") + "_live_websocket"
+            )
+            app.websocket(route_path)(codex_live_websocket)
+
+        register_websocket_route(path)
 
 
 def _register_openai_image_route(app: FastAPI, proxy: Any, endpoint: OpenAIImageEndpoint) -> None:
@@ -483,6 +507,8 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         )
 
     _register_openai_image_routes(app, proxy)
+
+    _register_codex_live_routes(app, proxy)
 
     _register_provider_passthrough_routes(app, proxy)
 

@@ -332,6 +332,36 @@ class CompressionStore:
             # deterministically under whichever function is in use.
             hash_key = hashlib.sha256(original.encode()).hexdigest()[:24]
 
+        # Refuse to persist a bare CCR marker as an entry's "original"
+        # (#2694). A marker is a *pointer* to content, never content: an
+        # entry like `hash=abc123 -> "<<ccr:abc123,base64,2.0KB>>"` answers a
+        # retrieve with the very placeholder the caller is trying to resolve,
+        # and (worse) can overwrite a good entry with a useless one. Any
+        # producer that gets here has lost the source bytes upstream, so fail
+        # loudly rather than silently converting "retrievable" into "gone".
+        # Narrow by design: only a *bare* marker is rejected. Legitimate
+        # originals may legally CONTAIN markers (nested offloads, a tool that
+        # echoed one), and refusing those would drop recoverable data.
+        #
+        # The rejected value is never echoed into the log. It is provably a
+        # bare marker here, but `original` is the store's credential-bearing
+        # payload in the general case (this issue was reported against an
+        # OAuth token), and an error path is exactly where that sort of leak
+        # survives review. `hash_key` already identifies the entry.
+        stripped = original.strip()
+        if stripped.startswith("<<ccr:") and stripped.endswith(">>") and "\n" not in stripped:
+            logger.error(
+                "CCR store: refusing to persist a bare retrieval marker as "
+                "original_content (hash=%s tool=%s strategy=%s len=%d) — the "
+                "producer lost the source bytes; retrieval for this hash will "
+                "miss instead of returning a placeholder",
+                hash_key,
+                tool_name,
+                compression_strategy,
+                len(stripped),
+            )
+            return hash_key
+
         entry = CompressionEntry(
             hash=hash_key,
             original_content=original,

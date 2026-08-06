@@ -8,7 +8,42 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
+
+#: Cap on the serialized form of a non-string tool-call field. A malformed
+#: upstream can put an arbitrarily large object where a JSON string belongs;
+#: serializing it unbounded would turn a token *estimate* into a multi-megabyte
+#: encode. Truncating keeps the estimate finite and the request alive.
+_MAX_COERCED_FIELD_CHARS = 200_000
+
+
+def coerce_countable_text(value: Any) -> str:
+    """Return *value* as text safe to pass to ``count_text``.
+
+    Tool-call fields (``function.name``, ``function.arguments``, ``id``) are
+    strings per the OpenAI spec, but OpenAI-compatible upstreams do emit
+    ``None`` or a raw object there. Passing those straight to
+    ``tiktoken.encode()`` raises ``TypeError: expected string or buffer``, which
+    failed the whole compression with a 503 — and kept failing on every later
+    request, because the malformed message stays in conversation history.
+
+    ``None`` counts as nothing; dicts/lists are JSON-serialized so an object
+    ``arguments`` is priced roughly like the JSON string it should have been;
+    anything else falls back to ``str()``.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, dict | list | tuple):
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    else:
+        text = str(value)
+    return text[:_MAX_COERCED_FIELD_CHARS]
 
 
 @runtime_checkable
@@ -310,20 +345,20 @@ class BaseTokenizer(ABC):
             total += 4  # Tool call overhead
 
             if "function" in call:
-                func = call["function"]
-                total += self.count_text(func.get("name", ""))
-                total += self.count_text(func.get("arguments", ""))
+                func = call["function"] or {}
+                total += self.count_text(coerce_countable_text(func.get("name")))
+                total += self.count_text(coerce_countable_text(func.get("arguments")))
 
             if "id" in call:
-                total += self.count_text(call["id"])
+                total += self.count_text(coerce_countable_text(call["id"]))
 
         return total
 
     def _count_function_call(self, function_call: dict[str, Any]) -> int:
         """Count tokens in legacy function call."""
         total = 4  # Function call overhead
-        total += self.count_text(function_call.get("name", ""))
-        total += self.count_text(function_call.get("arguments", ""))
+        total += self.count_text(coerce_countable_text(function_call.get("name")))
+        total += self.count_text(coerce_countable_text(function_call.get("arguments")))
         return total
 
     def encode(self, text: str) -> list[int]:
@@ -359,3 +394,39 @@ class BaseTokenizer(ABC):
             NotImplementedError: If decoding is not supported.
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not support decoding")
+
+
+class _DelegatingBlockCounter(BaseTokenizer):
+    """Adapter exposing :meth:`BaseTokenizer._count_content_parts` to non-subclasses.
+
+    The provider token counters in ``headroom/providers/`` are not
+    ``BaseTokenizer`` subclasses, and each grew its own shortened content-block
+    walker that handled only the shapes its provider was expected to send. The
+    result was that every one of them priced most modern blocks at ~0: measured
+    on a 6,800-char block, ``OpenAITokenCounter`` returned 8 tokens for
+    ``tool_result``/``thinking``/``document``/``mcp_tool_result`` and — its own
+    Responses shapes — ``output_text``/``refusal``; ``AnthropicTokenCounter``
+    returned 7 for ``thinking``/``document``, which are Anthropic's own.
+
+    Rather than add a fifth partial walker, this lets them borrow the audited one.
+    It is image-safe (base64 blobs get a pixel-based estimate instead of being
+    serialized and priced as text) and bounds oversized blobs, which a naive
+    ``count_text(str(block))`` catch-all does not.
+    """
+
+    __slots__ = ("_count_text_fn",)
+
+    def __init__(self, count_text_fn: Callable[[str], int]) -> None:
+        self._count_text_fn = count_text_fn
+
+    def count_text(self, text: str) -> int:
+        return self._count_text_fn(text)
+
+
+def count_content_blocks(parts: list[Any], count_text_fn: Callable[[str], int]) -> int:
+    """Count a multi-part content list using *count_text_fn* for text.
+
+    Shared entry point for provider counters. See
+    :class:`_DelegatingBlockCounter` for why this exists.
+    """
+    return _DelegatingBlockCounter(count_text_fn)._count_content_parts(parts)

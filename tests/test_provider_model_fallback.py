@@ -276,9 +276,23 @@ class TestOpenAIModelFallback:
         """Test fallback for unknown models."""
         provider = OpenAIProvider()
 
-        # Unknown model should get 128K default
-        limit = provider.get_context_limit("gpt-5-future")
+        # Unknown model should get 128K default. Deliberately a name that
+        # matches no known family prefix -- this used to say "gpt-5-future",
+        # which stopped being unknown once gpt-5 was added to _CONTEXT_LIMITS.
+        limit = provider.get_context_limit("gpt-9-imaginary")
         assert limit == 128000
+
+    def test_unknown_variant_inherits_its_family_limit(self):
+        """An unrecognized variant of a *known* family takes that family's limit.
+
+        This is the same prefix inheritance that gives "gpt-4o-2024-11-20" the
+        gpt-4o limit, and it is strictly better than dropping such a model to
+        the generic 128K default.
+        """
+        provider = OpenAIProvider()
+
+        assert provider.get_context_limit("gpt-5-future") == 272000
+        assert provider.get_context_limit("gpt-4.1-preview") == 1_047_576
 
     def test_no_exception_for_unknown_model(self):
         """Test that unknown models don't raise exceptions."""

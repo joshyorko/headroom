@@ -17,7 +17,7 @@ rtk find <pattern>      rtk diff <file>
 # Test (90-99% savings) — shows failures only
 rtk pytest tests/       rtk cargo test          rtk test <cmd>
 
-# Build & Lint (80-90% savings) — shows errors only
+# Build & Lint (80-90% savings)
 rtk tsc                 rtk lint                rtk cargo build
 rtk prettier --check    rtk mypy                rtk ruff check
 

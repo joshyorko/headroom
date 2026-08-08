@@ -43,16 +43,32 @@ def mixed_content_indicators(content: str) -> dict[str, bool]:
     }
 
 
+def _any_nonblank(lines: list[str], start: int, stop: int) -> bool:
+    """True when some line in [start, stop) has non-whitespace.
+
+    Equivalent to ``bool("\n".join(lines[start:stop]).strip())`` — a join of
+    lines is blank exactly when every line is blank — but it short-circuits
+    instead of building a copy of the whole body for each candidate.
+    """
+    return any(lines[i].strip() for i in range(start, stop))
+
+
 def _has_valid_json_block_with_text(content: str) -> bool:
     """Return true when prose or log text wraps a valid JSON block."""
     lines = content.split("\n")
+    # Built only after a scan has run to the end without balancing — see
+    # _extract_json_block. Content that balances promptly never allocates it and
+    # so pays nothing for it.
+    scan_cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None
 
     for index, line in enumerate(lines):
         if not line.strip().startswith(("[", "{")):
             continue
 
-        json_content, end_index = _extract_json_block(lines, index)
+        json_content, end_index = _extract_json_block(lines, index, cache=scan_cache)
         if json_content is None:
+            if scan_cache is None:
+                scan_cache = {}
             continue
 
         try:
@@ -60,9 +76,7 @@ def _has_valid_json_block_with_text(content: str) -> bool:
         except (TypeError, ValueError):
             continue
 
-        leading_text = "\n".join(lines[:index]).strip()
-        trailing_text = "\n".join(lines[end_index + 1 :]).strip()
-        if leading_text or trailing_text:
+        if _any_nonblank(lines, 0, index) or _any_nonblank(lines, end_index + 1, len(lines)):
             return True
 
     return False
@@ -72,6 +86,7 @@ def split_into_sections(content: str) -> list[ContentSection]:
     """Parse mixed content into typed sections."""
     sections: list[ContentSection] = []
     lines = content.split("\n")
+    scan_cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None
 
     i = 0
     while i < len(lines):
@@ -101,7 +116,11 @@ def split_into_sections(content: str) -> list[ContentSection]:
             continue
 
         if line.strip().startswith(("[", "{")):
-            json_content, end_i = _extract_json_block(lines, i)
+            json_content, end_i = _extract_json_block(lines, i, cache=scan_cache)
+            if json_content is None and scan_cache is None:
+                # First scan that ran to the end without balancing: from here on
+                # every later candidate would re-walk the same tail.
+                scan_cache = {}
             if json_content:
                 sections.append(
                     ContentSection(
@@ -159,41 +178,84 @@ def split_into_sections(content: str) -> list[ContentSection]:
     return sections
 
 
-def _extract_json_block(lines: list[str], start: int) -> tuple[str | None, int]:
-    """Extract a complete JSON object or array block from line-oriented content."""
+def _scan_line(line: str, in_string: bool, escaped: bool) -> tuple[int, int, bool, bool]:
+    """Bracket/brace deltas for one line, given the parser state entering it.
+
+    Split out so the per-line result can be memoised across scans: what a line
+    does to the counters is a pure function of the line and the two entry-state
+    flags, nothing else.
+    """
+    bracket = 0
+    brace = 0
+    for ch in line:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            if in_string:
+                escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "[":
+            bracket += 1
+        elif ch == "]":
+            bracket -= 1
+        elif ch == "{":
+            brace += 1
+        elif ch == "}":
+            brace -= 1
+    return bracket, brace, in_string, escaped
+
+
+def _extract_json_block(
+    lines: list[str],
+    start: int,
+    *,
+    cache: dict[tuple[int, bool, bool], tuple[int, int, bool, bool]] | None = None,
+) -> tuple[str | None, int]:
+    """Extract a complete JSON object or array block from line-oriented content.
+
+    ``cache`` memoises the per-line scan across repeated calls over the SAME
+    ``lines``. Callers that try every ``{``-leading line share one dict; without
+    it each candidate that never balances re-scans character-by-character to the
+    end of the content, which is quadratic.
+
+    Callers pass ``None`` until a scan has actually run to the end without
+    balancing, and only build the dict from then on. That matters: on content
+    that balances on the first try — pretty-printed JSON, the common case — the
+    memo has nothing to reuse and its per-line dict traffic made that shape ~2x
+    SLOWER. A failed scan is the signal that later candidates will re-walk the
+    same tail, and it is the only point at which the memo pays. MEASURED before the cache: 4643ms for
+    1200 lines of JS-style object logs and 3737ms for truncated JSONL, growing
+    exactly 4x per doubling. Ordinary shapes — pretty-printed JSON, valid JSONL,
+    source, stack traces, prose — were ~1-6ms and never hit it, which is why this
+    stayed invisible.
+
+    Keyed on the entry state as well as the line, so a cached entry is only
+    reused where the parser is in the same string/escape state. Same deltas,
+    same result: this is a memo, not a heuristic.
+    """
     bracket_count = 0
     brace_count = 0
-    json_lines = []
     in_string = False
     escaped = False
 
     for i in range(start, len(lines)):
-        line = lines[i]
-        json_lines.append(line)
+        key = (i, in_string, escaped)
+        step = cache.get(key) if cache is not None else None
+        if step is None:
+            step = _scan_line(lines[i], in_string, escaped)
+            if cache is not None:
+                cache[key] = step
+        d_bracket, d_brace, in_string, escaped = step
+        bracket_count += d_bracket
+        brace_count += d_brace
 
-        for ch in line:
-            if escaped:
-                escaped = False
-                continue
-            if ch == "\\":
-                if in_string:
-                    escaped = True
-                continue
-            if ch == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == "[":
-                bracket_count += 1
-            elif ch == "]":
-                bracket_count -= 1
-            elif ch == "{":
-                brace_count += 1
-            elif ch == "}":
-                brace_count -= 1
-
-        if bracket_count <= 0 and brace_count <= 0 and json_lines:
-            return "\n".join(json_lines), i
+        if bracket_count <= 0 and brace_count <= 0:
+            return "\n".join(lines[start : i + 1]), i
 
     return None, start

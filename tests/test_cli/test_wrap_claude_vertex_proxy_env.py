@@ -370,6 +370,36 @@ def test_start_proxy_clears_inherited_vertex_target_env(
     assert "VERTEX_TARGET_API_URL" not in proxy_env
 
 
+def test_start_proxy_sets_pythonsafepath_to_avoid_cwd_shadow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`python -m headroom.cli` prepends the launch cwd to sys.path, so running
+    wrap from a directory that contains a `headroom/` folder (a clone of this
+    repo) shadows the installed wheel with the raw source tree, which has no
+    compiled `headroom._core`, and the proxy dies importing it (#2793). The
+    subprocess env must set PYTHONSAFEPATH=1 to disable that cwd prepend."""
+    fake_proc = _FakeProxyProcess()
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProxyProcess:
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+    proc = wrap_mod._start_proxy(8787, agent_type="claude")
+
+    assert proc is fake_proc
+    assert captured["kwargs"]["env"]["PYTHONSAFEPATH"] == "1"
+    # Still launched as a module of the installed package.
+    assert captured["cmd"][:4] == [wrap_mod.sys.executable, "-m", "headroom.cli", "proxy"]
+
+
 def test_ensure_proxy_restarts_idle_proxy_for_vertex_api_url_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

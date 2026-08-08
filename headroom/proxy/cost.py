@@ -1070,6 +1070,39 @@ class CostTracker:
         except Exception:
             return None
 
+    def totals(self) -> tuple[int, float]:
+        """Return just ``(total_input_tokens, total_input_cost_usd)``.
+
+        The same two numbers ``stats()`` reports, computed without the rest of
+        it. ``stats()`` is called once per request by the metrics path, which
+        reads exactly these two fields and discards ``per_model``,
+        ``savings_usd``, ``cost_with_headroom_usd`` and — the expensive one —
+        ``budget_basis``, whose ``period_cost_breakdown()`` walks up to 31 days
+        of retained cost records. MEASURED 2.8ms at 20k records and 13.6ms at
+        100k, on the event loop and holding the metrics lock, so it degraded
+        with proxy uptime rather than with load.
+
+        This loop is over models, not records, so it is bounded by how many
+        models a deployment talks to.
+        """
+        total_input_tokens = 0
+        cost_with_headroom = 0.0
+        for model in self._tokens_saved_by_model:
+            sent = self._tokens_sent_by_model.get(model, 0)
+            cr = self._api_cache_read_by_model.get(model, 0)
+            cw = self._api_cache_write_by_model.get(model, 0)
+            uncached = self._api_uncached_by_model.get(model, 0)
+            total_input_tokens += sent
+
+            prices = self._get_cache_prices(model)
+            if prices:
+                cr_price, cw_price, uncached_price = prices
+                if cr + cw + uncached > 0:
+                    cost_with_headroom += cr * cr_price + cw * cw_price + uncached * uncached_price
+                else:
+                    cost_with_headroom += sent * uncached_price
+        return total_input_tokens, round(cost_with_headroom, 4)
+
     def stats(self) -> dict:
         """Get token statistics per model."""
         per_model = {}

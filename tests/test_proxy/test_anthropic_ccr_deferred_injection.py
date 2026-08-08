@@ -515,16 +515,17 @@ def test_cache_mode_compresses_delta_but_replays_cached_prefix_when_markers_are_
         assert response.status_code == 200
         assert len(captured.get("compression_calls", [])) == 1
         forwarded = captured["body"]
-        # Tool injection is deferred (no CCR tool this turn), but the frozen
-        # prefix was cached COMPRESSED last turn. Replay it byte-identical so the
-        # prompt cache still hits instead of busting on original bytes (#1850);
-        # the historical marker does not force tool injection back on. Tool absent
-        # AND cache intact.
+        # The frozen prefix was cached COMPRESSED last turn, so it is replayed
+        # byte-identical to keep the prompt cache warm. The replayed marker is
+        # still redeemable this turn, so `headroom_retrieve` MUST be present or
+        # Anthropic 400s "Tool reference 'headroom_retrieve' not found" (#2766);
+        # injecting it whenever a marker exists is itself cache-stable (toggling
+        # is what busts the tools segment). Message prefix replayed AND tool present.
         assert forwarded["messages"] == previous_forwarded_messages
-        assert "tools" not in forwarded
+        assert [tool["name"] for tool in forwarded["tools"]] == ["headroom_retrieve"]
 
 
-def test_cache_mode_exact_prefix_replay_forwards_cached_compressed_prefix_when_tool_injection_is_deferred(
+def test_cache_mode_exact_prefix_replay_forwards_cached_compressed_prefix_and_injects_retrieve_tool(
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -607,11 +608,13 @@ def test_cache_mode_exact_prefix_replay_forwards_cached_compressed_prefix_when_t
         assert response.status_code == 200
         assert captured.get("compression_calls", []) == []
         forwarded = captured["body"]
-        # Deferred injection (no CCR tool), single frozen message cached
-        # COMPRESSED last turn: replay it so the cache holds instead of busting
-        # on original bytes (#1850). Tool absent AND cache intact.
+        # Single frozen message cached COMPRESSED last turn: replay it
+        # byte-identical so the cache holds instead of busting on original bytes.
+        # The replayed marker is still redeemable, so `headroom_retrieve` must be
+        # present this turn or Anthropic 400s "Tool reference 'headroom_retrieve'
+        # not found" (#2766). Message prefix replayed AND tool present.
         assert forwarded["messages"] == previous_forwarded_messages
-        assert "tools" not in forwarded
+        assert [tool["name"] for tool in forwarded["tools"]] == ["headroom_retrieve"]
 
 
 def test_token_mode_cached_messages_skip_cache_update_when_pipeline_result_is_unchanged(

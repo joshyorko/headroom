@@ -417,13 +417,13 @@ class PrometheusMetrics:
             return total_input_tokens, total_input_cost_usd
 
         try:
-            cost_stats = self.cost_tracker.stats()
+            # totals() rather than stats(): identical numbers, without the
+            # 31-day cost-record walk that stats()["budget_basis"] performs and
+            # this caller throws away. See CostTracker.totals.
+            tracked_input_tokens, tracked_input_cost_usd = self.cost_tracker.totals()
         except Exception:
             logger.debug("Failed to read cost tracker totals for savings history", exc_info=True)
             return total_input_tokens, total_input_cost_usd
-
-        tracked_input_tokens = cost_stats.get("total_input_tokens")
-        tracked_input_cost_usd = cost_stats.get("total_input_cost_usd")
 
         if tracked_input_tokens is not None:
             try:

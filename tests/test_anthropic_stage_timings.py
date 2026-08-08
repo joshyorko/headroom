@@ -101,17 +101,23 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
                 get_last_original_messages=lambda: [],
                 get_last_forwarded_messages=lambda: [],
                 record_request=lambda *a, **k: None,
+                update_from_response=lambda *a, **k: None,
             ),
             resolve_tracker=lambda *a, **k: SimpleNamespace(
+                _cached_token_count=0,
                 get_frozen_message_count=lambda: 0,
                 get_last_original_messages=lambda: [],
                 get_last_forwarded_messages=lambda: [],
                 record_request=lambda *a, **k: None,
+                update_from_response=lambda *a, **k: None,
             ),
         )
 
     async def _next_request_id(self) -> str:
         return "req-anth-test"
+
+    async def _record_request_outcome(self, outcome) -> None:
+        return None
 
     def _extract_tags(self, headers):
         return {}
@@ -249,6 +255,86 @@ def test_anthropic_http_happy_path_emits_stage_timings(stage_log_capture):
     path, emitted = handler.metrics.stage_timings[-1]
     assert path == "anthropic_messages"
     assert "total_pre_upstream" in emitted
+
+
+def test_anthropic_no_optimize_preserves_client_tool_order():
+    tools = [
+        {
+            "name": "Read",
+            "description": "Read a file",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "Bash",
+            "description": "Run a shell command",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+    ]
+    request = _build_request(
+        {
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [{"role": "user", "content": "use a tool"}],
+            "tools": tools,
+        },
+        {"authorization": "Bearer sk-ant-api-test"},
+    )
+    handler = _DummyAnthropicHandler()
+
+    import headroom.tokenizers as _tk
+
+    orig_get = _tk.get_tokenizer
+    _tk.get_tokenizer = lambda model: _DummyTokenizer()
+    try:
+        anyio.run(handler.handle_anthropic_messages, request)
+    finally:
+        _tk.get_tokenizer = orig_get
+
+    _, _, _, forwarded_body = handler.captured
+    assert [tool["name"] for tool in forwarded_body["tools"]] == ["Read", "Bash"]
+
+
+def test_anthropic_third_party_upstream_strips_tool_search_tools():
+    tools = [
+        {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+        {
+            "name": "Bash",
+            "description": "run a command",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {"type": "web_search_20250305", "name": "web_search"},
+    ]
+    request = _build_request(
+        {
+            "model": "claude-3-5-sonnet-latest",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "use a tool"}],
+            "tools": tools,
+        },
+        {"authorization": "Bearer sk-ant-api-test"},
+    )
+    handler = _DummyAnthropicHandler()
+
+    import headroom.tokenizers as _tk
+
+    orig_get = _tk.get_tokenizer
+    _tk.get_tokenizer = lambda model: _DummyTokenizer()
+    try:
+        response = anyio.run(
+            handler.handle_anthropic_messages,
+            request,
+            "https://api.deepseek.com/anthropic",
+        )
+    finally:
+        _tk.get_tokenizer = orig_get
+
+    assert response.status_code == 200
+    _, forwarded_url, _, forwarded_body = handler.captured
+    assert forwarded_url == "https://api.deepseek.com/anthropic/v1/messages"
+    assert forwarded_body["tools"] == [tools[1], tools[2]]
+    assert not any(
+        str(tool.get("type", "")).startswith("tool_search_tool_")
+        for tool in forwarded_body["tools"]
+    )
 
 
 def test_anthropic_http_invalid_body_still_emits_stage_timings(stage_log_capture):

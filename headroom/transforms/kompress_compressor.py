@@ -746,15 +746,27 @@ def _load_kompress_onnx(
 
 
 def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> Any:
-    """Load the ModernBERT tokenizer, cache-only when ``allow_download`` is False."""
+    """Load the ModernBERT tokenizer, cache-only when ``allow_download`` is False.
+
+    Always tries the local cache FIRST, even when downloading is allowed. With
+    ``local_files_only=False`` transformers re-validates against the Hub on every
+    load — a tree listing plus a HEAD per tokenizer file — even when the repo is
+    fully cached. MEASURED ~900ms warm-cache versus ~150ms local-only, i.e. ~750ms
+    of pure network round-trip on every process start, and it is also what makes
+    a cold start slow on a bad network rather than merely offline.
+
+    Same files, same tokenizer, so the loaded object is identical; this only
+    changes whether the Hub is consulted to confirm what is already on disk.
+    Mirrors ``onnx_runtime.hf_hub_download_local_first``, which the ONNX half of
+    this loader already uses.
+    """
     try:
-        return auto_tokenizer.from_pretrained(
-            "answerdotai/ModernBERT-base", local_files_only=not allow_download
-        )
+        return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=True)
     except _NOT_CACHED_ERRORS as exc:
         if not allow_download:
             raise KompressModelNotCached("answerdotai/ModernBERT-base") from exc
-        raise
+    # Genuine cache miss and downloading is permitted: fetch it.
+    return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=False)
 
 
 # Sub-state-dict keys inside a merged v2-style checkpoint (see
@@ -1032,6 +1044,45 @@ def unload_kompress_model(model_id: str | None = None) -> bool:
 _download_threads: dict[str, threading.Thread] = {}
 _download_threads_lock = threading.Lock()
 
+#: Retry backoff for a FAILED background download, in seconds. A finished-or-failed
+#: thread is replaced on the next call so a transient network blip recovers, but
+#: without a floor an unreachable Hub means every request spawns a fresh download
+#: thread for the life of the process — each one importing transformers and
+#: resolving the Hub, all holding the GIL against the event loop. The window grows
+#: per consecutive failure and resets on success, so the happy path and the
+#: transient-failure path are both unchanged; only the permanently-broken case is
+#: bounded.
+_DOWNLOAD_RETRY_BASE_SECONDS = 5.0
+_DOWNLOAD_RETRY_MAX_SECONDS = 300.0
+_download_failures: dict[str, tuple[int, float]] = {}
+
+
+def _record_download_failure(model_id: str) -> None:
+    with _download_threads_lock:
+        failures, _ = _download_failures.get(model_id, (0, 0.0))
+        _download_failures[model_id] = (failures + 1, time.monotonic())
+
+
+def _clear_download_failures(model_id: str) -> None:
+    with _download_threads_lock:
+        _download_failures.pop(model_id, None)
+
+
+def _download_retry_blocked(model_id: str) -> bool:
+    """True when the last attempt failed and the backoff window has not elapsed.
+
+    Caller must hold ``_download_threads_lock``.
+    """
+    entry = _download_failures.get(model_id)
+    if entry is None:
+        return False
+    failures, last_attempt = entry
+    window = min(
+        _DOWNLOAD_RETRY_MAX_SECONDS,
+        _DOWNLOAD_RETRY_BASE_SECONDS * (2 ** (failures - 1)),
+    )
+    return bool((time.monotonic() - last_attempt) < window)
+
 
 def _background_download(model_id: str, device: str) -> None:
     try:
@@ -1039,7 +1090,10 @@ def _background_download(model_id: str, device: str) -> None:
         _load_kompress(model_id, device, allow_download=True)
         logger.info("Kompress: background model download complete for %s", model_id)
     except Exception as exc:
+        _record_download_failure(model_id)
         logger.warning("Kompress: background model download failed for %s: %s", model_id, exc)
+    else:
+        _clear_download_failures(model_id)
 
 
 def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto") -> None:
@@ -1047,7 +1101,9 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
 
     Idempotent and non-blocking: at most one download thread runs per model_id,
     and a finished or failed thread is replaced on the next call so a transient
-    network failure can be retried by a later request. Once the download
+    network failure can be retried by a later request — subject to a growing
+    backoff after consecutive failures, so an unreachable Hub cannot turn every
+    request into another download thread. Once the download
     completes the deep path activates on subsequent requests without ever
     blocking one on the network.
     """
@@ -1058,6 +1114,8 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
             return
         existing = _download_threads.get(model_id)
         if existing is not None and existing.is_alive():
+            return
+        if _download_retry_blocked(model_id):
             return
         thread = threading.Thread(
             target=_background_download,

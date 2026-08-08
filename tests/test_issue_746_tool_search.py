@@ -176,7 +176,9 @@ from headroom.proxy.helpers import (  # noqa: E402
     _TOOL_SEARCH_DEFAULT_NAME,
     _TOOL_SEARCH_DEFAULT_TYPE,
     _TOOL_SEARCH_MIN_TOOLS,
+    anthropic_first_party_tool_search_supported,
     inject_tool_search_deferral,
+    strip_first_party_tool_search_tools_for_third_party_upstream,
 )
 
 
@@ -257,6 +259,53 @@ def test_non_dict_and_typed_tools_stay_resident() -> None:
     out = inject_tool_search_deferral(tools)
     typed = [t for t in out if t.get("type") == "web_search_20250305"]
     assert len(typed) == 1 and typed[0].get("defer_loading") is None
+
+
+def test_third_party_upstream_strips_first_party_tool_search_from_headroom_issue_2526() -> None:
+    tools = [
+        {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+        {"name": "Bash", "description": "run a command", "input_schema": {}},
+        {"type": "web_search_20250305", "name": "web_search"},
+    ]
+    out = strip_first_party_tool_search_tools_for_third_party_upstream(
+        tools,
+        "https://api.deepseek.com/anthropic",
+    )
+    assert out is not tools
+    assert [tool.get("name") for tool in out if isinstance(tool, dict)] == ["Bash", "web_search"]
+    assert all(
+        not str(tool.get("type", "")).startswith("tool_search_tool_")
+        for tool in out
+        if isinstance(tool, dict)
+    )
+
+
+def test_first_party_anthropic_preserves_client_tool_search_entry() -> None:
+    tools = [
+        {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+        {"name": "Bash", "description": "run a command", "input_schema": {}},
+    ]
+    assert anthropic_first_party_tool_search_supported("https://api.anthropic.com")
+    assert (
+        strip_first_party_tool_search_tools_for_third_party_upstream(
+            tools,
+            "https://api.anthropic.com",
+        )
+        is tools
+    )
+
+
+@pytest.mark.parametrize(
+    ("api_base_url", "expected_supported"),
+    [
+        ("https://api.anthropic.com", True),
+        ("https://api.anthropic.com/v1", True),
+        ("https://api.deepseek.com/anthropic", False),
+        ("http://127.0.0.1:8787", False),
+    ],
+)
+def test_third_party_or_first_party_matrix(api_base_url: str, expected_supported: bool) -> None:
+    assert anthropic_first_party_tool_search_supported(api_base_url) is expected_supported
 
 
 # ---------------------------------------------------------------------------

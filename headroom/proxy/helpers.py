@@ -2980,6 +2980,31 @@ _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 _TOOL_SEARCH_MIN_TOOLS = 12
 
 
+def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
+    """Return whether Anthropic server-side tool search is valid for this upstream."""
+    from headroom.providers.claude.runtime import is_custom_anthropic_base_url
+
+    return not is_custom_anthropic_base_url(api_base_url)
+
+
+def strip_first_party_tool_search_tools_for_third_party_upstream(
+    tools: Any,
+    api_base_url: str | None,
+) -> Any:
+    """Remove first-party Anthropic tool-search tools when forwarding to a custom upstream."""
+    if not isinstance(tools, list) or anthropic_first_party_tool_search_supported(api_base_url):
+        return tools
+    filtered = [
+        tool
+        for tool in tools
+        if not (
+            isinstance(tool, dict)
+            and str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        )
+    ]
+    return filtered if len(filtered) != len(tools) else tools
+
+
 def inject_tool_search_deferral(
     tools: Any,
     *,
@@ -3181,7 +3206,11 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
 # (only name+description remain) until the model searches for one — while every
 # tool stays callable and the prompt cache is preserved. Same win as Anthropic
 # (~15-25k tool-schema tokens -> ~200) for clients that ship a big tool surface
-# and never opt into tool search themselves (opencode, plain API clients).
+# and never opt into tool search themselves (plain API clients).
+#
+# Two harnesses are excluded. Codex drops deferred-call namespaces during its
+# round trip, while GH #2660 reports OpenCode rejecting the injected
+# `tool_search` tool as unavailable. Their tools therefore stay resident.
 #
 # Differences from the Anthropic path that require a separate function:
 #   * Responses function tools carry ``type: "function"`` (Anthropic real tools
@@ -3196,7 +3225,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
 _OPENAI_TOOL_SEARCH_TYPE = "tool_search"
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
-_OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex"})
+_OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in
 # HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
@@ -3244,8 +3273,9 @@ def inject_tool_search_deferral_openai(
     deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
     unchanged when injection doesn't apply.
 
-    No-op for Codex, whose round-trip structs drop deferred-call namespaces. Also
-    no-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
+    No-op for Codex and OpenCode, whose harnesses cannot safely execute the
+    injected search tool. Also no-op when: the model doesn't support tool search
+    (gpt-5.4+ only), ``tools``
     is not a list, there are fewer than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a
     tool_search tool is already present (client already defers), or nothing would
     be deferred. Core coding tools and hosted/typed tools (web_search,

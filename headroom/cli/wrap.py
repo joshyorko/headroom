@@ -639,6 +639,15 @@ def _start_proxy(
     proxy_env = os.environ.copy()
     _scrub_copilot_proxy_seed_env(proxy_env)
     proxy_env["PYTHONIOENCODING"] = "utf-8"
+    # `python -m headroom.cli` prepends the launch cwd to sys.path, so running
+    # `wrap` from a directory that contains a `headroom/` folder (most commonly a
+    # clone of this repo, whose package lives at <root>/headroom/) shadows the
+    # installed wheel with the raw source tree, which has no compiled
+    # `headroom._core`. The proxy then dies with "No module named 'headroom._core'"
+    # and wrap silently falls back to launching the client unwrapped (#2793).
+    # PYTHONSAFEPATH disables that cwd prepend (Python 3.11+; a harmless no-op on
+    # 3.10) so the subprocess always resolves the installed package.
+    proxy_env["PYTHONSAFEPATH"] = "1"
     # Vertex AI RST_STREAMs HTTP/2 connections (error_code:2). Force HTTP/1.1
     # when wrapping a Vertex-mode client so upstream requests succeed.
     if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"):

@@ -1133,6 +1133,55 @@ class TestEvidencePersistence:
 
         assert backend.saved_user_ids == ["alice", "bob"]
 
+    @pytest.mark.asyncio
+    async def test_scoped_lru_eviction_preserves_targets_and_persistence_scope(self, tmp_path):
+        """LRU eviction must remove scoped targets without misrouting later saves."""
+        db_one = tmp_path / "one.db"
+        db_two = tmp_path / "two.db"
+        _init_db(db_one)
+        _init_db(db_two)
+        backend_one = _FakeBackend(db_one)
+        backend_two = _FakeBackend(db_two)
+        learner = TrafficLearner(
+            backend=backend_one,
+            user_id="default",
+            min_evidence=2,
+            max_pending_patterns=2,
+        )
+        await learner.start()
+
+        def mk(content: str) -> ExtractedPattern:
+            return ExtractedPattern(
+                category=PatternCategory.PREFERENCE,
+                content=content,
+                importance=0.7,
+            )
+
+        first = mk("first scoped preference")
+        surviving_one = mk("surviving preference in backend one")
+        surviving_two = mk("surviving preference in backend two")
+
+        await learner._accumulate(first, user_id="alice", backend=backend_one)
+        await learner._accumulate(surviving_one, user_id="carol", backend=backend_one)
+        await learner._accumulate(surviving_two, user_id="bob", backend=backend_two)
+        first_scope = learner._dedup_hash(first.content_hash, user_id="alice", backend=backend_one)
+        assert first_scope not in learner._pattern_counts
+        assert first_scope not in learner._pattern_targets
+
+        await learner._accumulate(surviving_one, user_id="carol", backend=backend_one)
+        await learner._accumulate(surviving_two, user_id="bob", backend=backend_two)
+        await _wait_for_saved(learner, 1, db_one)
+        await _wait_for_saved(learner, 1, db_two)
+
+        # The evicted scoped pattern can re-enter and must retain its new scope.
+        await learner._accumulate(first, user_id="alice", backend=backend_one)
+        await learner._accumulate(first, user_id="alice", backend=backend_one)
+        await _wait_for_saved(learner, 2, db_one)
+        await learner.stop()
+
+        assert backend_one.saved_user_ids == ["carol", "alice"]
+        assert backend_two.saved_user_ids == ["bob"]
+
 
 # =============================================================================
 # flush_to_file end-to-end + early-return paths

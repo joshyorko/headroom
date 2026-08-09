@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib
 import json
 import os
@@ -399,7 +400,17 @@ def test_init_copilot_honors_remote_proxy_url(monkeypatch, tmp_path: Path) -> No
         proxy_url="http://10.10.10.89",
     )
 
-    assert captured_env["COPILOT_PROVIDER_BASE_URL"] == "http://10.10.10.89/c/copilot/v1"
+    encoded_upstream = (
+        base64.urlsafe_b64encode(b"https://api.githubcopilot.com").decode("ascii").rstrip("=")
+    )
+    assert captured_env == {
+        "COPILOT_PROVIDER_TYPE": "openai",
+        "COPILOT_PROVIDER_BASE_URL": (
+            f"http://10.10.10.89/c/copilot/_copilot/{encoded_upstream}/v1"
+        ),
+        "COPILOT_PROVIDER_WIRE_API": "completions",
+        "COPILOT_PROVIDER_BEARER_TOKEN": "headroom-proxy",
+    }
 
 
 def test_init_hook_ensure_prefers_local_profile(monkeypatch) -> None:

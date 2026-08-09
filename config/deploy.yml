@@ -108,12 +108,14 @@ env:
   secret:
     - HEADROOM_NEO4J_PASSWORD
     - GITHUB_TOKEN
+    - GITHUB_COPILOT_TOKEN
     - OPENAI_API_KEY
     - OPENROUTER_API_KEY
   clear:
     HEADROOM_HOST: 0.0.0.0
     HEADROOM_PORT: "<%= headroom_port %>"
     HEADROOM_MODE: token
+    GITHUB_COPILOT_USE_TOKEN_EXCHANGE: "true"
     HEADROOM_SAVINGS_PROFILE: "<%= headroom_savings_profile %>"
     HEADROOM_AGENT_TYPE: codex
     HEADROOM_WORKSPACE_DIR: /home/nonroot/.headroom

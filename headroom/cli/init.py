@@ -26,6 +26,7 @@ try:
 except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
+from headroom.copilot_auth import DEFAULT_API_URL as DEFAULT_COPILOT_API_URL
 from headroom.install.models import ConfigScope, InstallPreset, RuntimeKind, SupervisorKind
 from headroom.install.paths import claude_settings_path, codex_config_path, validate_profile_name
 from headroom.install.planner import build_manifest
@@ -45,7 +46,7 @@ from headroom.install.supervisors import start_supervisor
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom
-from headroom.proxy.project_context import with_client_prefix
+from headroom.proxy.project_context import with_client_prefix, with_copilot_upstream_prefix
 
 from .main import main
 
@@ -847,6 +848,16 @@ def _apply_user_env(values: dict[str, str]) -> None:
 
 def _resolve_copilot_env(port: int, backend: str, proxy_url: str | None = None) -> dict[str, str]:
     root_url = _normalize_proxy_url(proxy_url, port)
+    if proxy_url is not None:
+        provider_url = with_copilot_upstream_prefix(
+            _proxy_v1_url(root_url), DEFAULT_COPILOT_API_URL
+        )
+        return {
+            "COPILOT_PROVIDER_TYPE": "openai",
+            "COPILOT_PROVIDER_BASE_URL": with_client_prefix(provider_url, "copilot"),
+            "COPILOT_PROVIDER_WIRE_API": "completions",
+            "COPILOT_PROVIDER_BEARER_TOKEN": "headroom-proxy",
+        }
     if backend == "anthropic":
         return {
             "COPILOT_PROVIDER_TYPE": "anthropic",

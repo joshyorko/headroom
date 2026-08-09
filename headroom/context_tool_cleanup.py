@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -109,10 +110,29 @@ def purge_context_tool_artifacts() -> list[str]:
 
     # 5. Marker-fenced guidance in every hint file the wrap harnesses wrote to.
     for hint_file in _instruction_files(home, project):
+        if _is_git_tracked(hint_file):
+            continue
         report += _purge_fenced_block(hint_file)
     report += _purge_continue_system_messages(project / ".continue" / "config.json")
 
     return report
+
+
+def _is_git_tracked(path: Path) -> bool:
+    """Return whether Git tracks ``path`` in its enclosing worktree."""
+    if not path.exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path.parent), "ls-files", "--error-unmatch", "--", path.name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def _instruction_files(home: Path, project: Path) -> list[Path]:

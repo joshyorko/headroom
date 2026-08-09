@@ -42,11 +42,8 @@ def _load_handler_module(monkeypatch: pytest.MonkeyPatch, module_name: str, rela
     handlers_pkg.__path__ = [str(ROOT / "headroom" / "proxy" / "handlers")]
     monkeypatch.setitem(sys.modules, "headroom.proxy.handlers", handlers_pkg)
 
-    httpx_mod = types.ModuleType("httpx")
-    httpx_mod.ConnectError = type("ConnectError", (Exception,), {})
-    httpx_mod.ConnectTimeout = type("ConnectTimeout", (Exception,), {})
-    httpx_mod.PoolTimeout = type("PoolTimeout", (Exception,), {})
-    httpx_mod.ReadTimeout = type("ReadTimeout", (Exception,), {})
+    import httpx as httpx_mod
+
     monkeypatch.setitem(sys.modules, "httpx", httpx_mod)
 
     responses_mod = types.ModuleType("fastapi.responses")

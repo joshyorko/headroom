@@ -11,6 +11,7 @@ else.
 from __future__ import annotations
 
 import json
+import subprocess
 
 import pytest
 
@@ -134,6 +135,23 @@ def test_strips_guidance_fence_but_keeps_surrounding_prose(home):
     assert "rtk" not in content
     assert "My own notes." in content
     assert content.startswith("# My project")
+
+
+def test_preserves_tracked_instruction_file(home):
+    project = home / "project"
+    agents = _write(
+        project / "AGENTS.md",
+        "<!-- headroom:rtk-instructions -->\n"
+        "Always prefix with rtk.\n"
+        "<!-- /headroom:rtk-instructions -->\n",
+    )
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+    subprocess.run(["git", "add", "AGENTS.md"], cwd=project, check=True)
+
+    context_tool_cleanup.purge_context_tool_artifacts()
+
+    assert agents.exists()
+    assert "Always prefix with rtk." in agents.read_text()
 
 
 def test_skips_malformed_json_instead_of_clobbering_it(home):

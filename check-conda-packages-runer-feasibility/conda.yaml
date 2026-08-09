@@ -1,0 +1,11 @@
+# For more details on the format and content:
+# https://github.com/joshyorko/rcc/blob/master/docs/recipes.md#what-is-in-condayaml
+# Tip: Adding a link to the release notes of the packages helps maintenance and security.
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.14.6                 # https://pyreadiness.org/3.10
+  - uv=0.12.3                      # https://github.com/astral-sh/uv
+  - rtk-cli=0.44.2

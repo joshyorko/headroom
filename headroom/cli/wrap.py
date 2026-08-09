@@ -5246,7 +5246,12 @@ def copilot(
             _with_project_prefix(
                 _with_copilot_upstream_prefix(
                     f"{proxy_root or f'http://127.0.0.1:{port}'}/v1",
-                    openai_api_url if subscription and openai_api_url != DEFAULT_API_URL else None,
+                    (
+                        openai_api_url
+                        if proxy_root is not None
+                        or (subscription and openai_api_url != DEFAULT_API_URL)
+                        else None
+                    ),
                 ),
                 _project_name_from_cwd(),
             ),

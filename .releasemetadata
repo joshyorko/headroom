@@ -4,6 +4,7 @@
     "pypi": "0.34.0",
     "npm-sdk": "0.34.0",
     "npm-openclaw": "0.34.0",
+    "npm-opencode": "0.34.0",
     "agent-hooks-plugin": "0.34.0"
   }
 }

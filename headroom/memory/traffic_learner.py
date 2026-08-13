@@ -1458,10 +1458,10 @@ class TrafficLearner:
 
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        def _bump() -> None:
+        def _bump() -> bool:
             conn = sqlite3.connect(str(db_path))
             try:
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE memories SET metadata = json_set("
                     "metadata, '$.evidence_count', "
                     "COALESCE(json_extract(metadata, '$.evidence_count'), 0) + 1, "
@@ -1470,13 +1470,26 @@ class TrafficLearner:
                     (now_iso, memory_id),
                 )
                 conn.commit()
+                return cursor.rowcount > 0
             finally:
                 conn.close()
 
         try:
-            await asyncio.to_thread(_bump)
+            updated = await asyncio.to_thread(_bump)
         except Exception as e:
             logger.debug("Traffic learner evidence bump failed for %s: %s", memory_id, e)
+            return
+
+        refresh = getattr(self._backend, "refresh_memory_indexes", None)
+        if updated and refresh is not None:
+            try:
+                await refresh(memory_id)
+            except Exception as e:
+                logger.debug(
+                    "Traffic learner evidence index refresh failed for %s: %s",
+                    memory_id,
+                    e,
+                )
 
     # =========================================================================
     # Convenience: Extract from Anthropic messages format
@@ -1532,6 +1545,11 @@ class TrafficLearner:
                         "input": tool_use.get("input", {}),
                         "output": str(result_content),
                         "is_error": block.get("is_error", False) or _is_error(str(result_content)),
+                        # Stable per-turn identity (the tool_use/tool_result id).
+                        # Lets a caller dedup a replayed transcript so the same
+                        # result is not counted as evidence twice — used by the
+                        # Codex WebSocket ingestion path.
+                        "call_id": tool_use_id,
                     }
                 )
 

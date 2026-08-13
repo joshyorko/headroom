@@ -36,6 +36,14 @@ def _usage_int(value: Any, default: int = 0) -> int:
     return int(value)
 
 
+class _GeminiContinuationError(Exception):
+    def __init__(self, status_code: int, content: bytes, headers: dict[str, str]) -> None:
+        super().__init__(f"Gemini continuation failed with HTTP {status_code}")
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers
+
+
 class GeminiHandlerMixin:
     """Mixin providing Gemini API handler methods for HeadroomProxy."""
 
@@ -630,6 +638,68 @@ class GeminiHandlerMixin:
             except Exception as e:
                 logger.warning(f"[{request_id}] Memory injection failed (gemini): {e}")
 
+        query_params = dict(request.query_params)
+        is_streaming = query_params.get("alt") == "sse" or request.url.path.endswith(
+            ":streamGenerateContent"
+        )
+        native_tools = body.get("tools")
+        native_function_declarations = None
+
+        def rebuild_tools(function_declarations: list[dict]) -> list[dict]:
+            rebuilt_tools = []
+            replaced = False
+            declaration_tools = [
+                tool for tool in body.get("tools") or [] if "functionDeclarations" in tool
+            ]
+            later_names = {
+                declaration.get("name")
+                for tool in declaration_tools[1:]
+                for declaration in tool["functionDeclarations"]
+            }
+            first_declarations = [
+                declaration
+                for declaration in function_declarations
+                if declaration.get("name") not in later_names
+            ]
+            for tool in body.get("tools") or []:
+                if "functionDeclarations" in tool and not replaced:
+                    rebuilt_tools.append({**tool, "functionDeclarations": first_declarations})
+                    replaced = True
+                else:
+                    rebuilt_tools.append(tool)
+            if not replaced:
+                rebuilt_tools.append({"functionDeclarations": function_declarations})
+            return rebuilt_tools
+
+        ccr_inject_tool = getattr(self.config, "ccr_inject_tool", True)
+        ccr_inject_system_instructions = getattr(
+            self.config, "ccr_inject_system_instructions", False
+        )
+        if ccr_inject_tool and tokens_saved > 0 and not is_streaming:
+            from headroom.ccr import CCRToolInjector
+
+            seen_names = set()
+            native_function_declarations = []
+            for tool in native_tools or []:
+                for declaration in tool.get("functionDeclarations", []):
+                    name = declaration.get("name")
+                    if name not in seen_names:
+                        native_function_declarations.append(declaration)
+                        seen_names.add(name)
+            injector = CCRToolInjector(
+                provider="google",
+                inject_tool=True,
+                inject_system_instructions=ccr_inject_system_instructions,
+            )
+            optimized_messages, injected_funcs, was_injected = injector.process_request(
+                optimized_messages, native_function_declarations
+            )
+            if was_injected:
+                native_function_declarations = injected_funcs
+                body["tools"] = rebuild_tools(injected_funcs)
+            elif native_function_declarations is not None:
+                native_function_declarations = list(native_function_declarations)
+
         # Convert back to Gemini format if optimized
         if optimized_messages != messages:
             optimized_contents, optimized_system = self._messages_to_gemini_contents(
@@ -643,12 +713,6 @@ class GeminiHandlerMixin:
                 body["systemInstruction"] = optimized_system
             elif "systemInstruction" in body:
                 del body["systemInstruction"]
-
-        # Check if streaming requested via query param
-        query_params = dict(request.query_params)
-        is_streaming = query_params.get("alt") == "sse" or request.url.path.endswith(
-            ":streamGenerateContent"
-        )
 
         # Build URL - model is extracted from path. Vertex publisher
         # routes use the request's full path under the Vertex base URL;
@@ -703,6 +767,8 @@ class GeminiHandlerMixin:
                 total_input_tokens = optimized_tokens  # fallback
                 output_tokens = 0
                 cache_read_tokens = 0
+                resp_json = None
+                response_content = response.content
                 try:
                     resp_json = response.json()
                     usage = resp_json.get("usageMetadata", {})
@@ -735,6 +801,77 @@ class GeminiHandlerMixin:
                     logger.debug(
                         f"[{request_id}] Failed to extract cached tokens from Gemini response: {e}"
                     )
+
+                if (
+                    response.status_code == 200
+                    and isinstance(resp_json, dict)
+                    and self.ccr_response_handler
+                    and getattr(getattr(self.ccr_response_handler, "config", None), "enabled", True)
+                    and self.ccr_response_handler.has_ccr_tool_calls(resp_json, "google")
+                ):
+
+                    async def api_call_fn(
+                        native_contents: list[dict],
+                        function_declarations: list[dict] | None,
+                    ) -> dict[str, Any]:
+                        continuation_body = {**body, "contents": native_contents}
+                        if function_declarations is not None:
+                            continuation_body["tools"] = rebuild_tools(function_declarations)
+                        continuation_headers = {
+                            key: value
+                            for key, value in headers.items()
+                            if key.lower()
+                            not in ("accept-encoding", "content-encoding", "content-length")
+                        }
+                        continuation = await self._retry_request(
+                            "POST", url, continuation_headers, continuation_body
+                        )
+                        if continuation.status_code >= 400:
+                            return {
+                                "_headroom_continuation_error": {
+                                    "status_code": continuation.status_code,
+                                    "content": continuation.content,
+                                    "headers": dict(continuation.headers),
+                                }
+                            }
+                        try:
+                            return continuation.json()
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            return {
+                                "_headroom_continuation_error": {
+                                    "status_code": continuation.status_code,
+                                    "content": continuation.content,
+                                    "headers": dict(continuation.headers),
+                                }
+                            }
+
+                    final_resp_json = await self.ccr_response_handler.handle_response(
+                        resp_json,
+                        body.get("contents", []),
+                        native_function_declarations,
+                        api_call_fn,
+                        provider="google",
+                    )
+                    continuation_error = final_resp_json.get("_headroom_continuation_error")
+                    if isinstance(continuation_error, dict):
+                        raise _GeminiContinuationError(
+                            continuation_error["status_code"],
+                            continuation_error["content"],
+                            continuation_error["headers"],
+                        )
+                    from headroom.ccr.response_handler import RESIDUAL_CCR_ERROR
+
+                    if (
+                        self.ccr_response_handler.residual_ccr_status(final_resp_json, "google")
+                        == RESIDUAL_CCR_ERROR
+                    ):
+                        raise RuntimeError("Gemini CCR continuation left an unresolved retrieval")
+                    resp_json = final_resp_json
+                    response_content = json.dumps(resp_json).encode()
+                    usage = resp_json.get("usageMetadata", {})
+                    total_input_tokens = usage.get("promptTokenCount", total_input_tokens)
+                    output_tokens = usage.get("candidatesTokenCount", output_tokens)
+                    cache_read_tokens = usage.get("cachedContentTokenCount", cache_read_tokens)
 
                 uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
@@ -822,10 +959,16 @@ class GeminiHandlerMixin:
                     response_headers["x-headroom-compression-failed"] = "true"
 
                 return Response(
-                    content=response.content,
+                    content=response_content,
                     status_code=response.status_code,
                     headers=response_headers,
                 )
+        except _GeminiContinuationError as e:
+            await self.metrics.record_failed(provider=provider_name)
+            response_headers = dict(e.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            return Response(content=e.content, status_code=e.status_code, headers=response_headers)
         except Exception as e:
             await self.metrics.record_failed(provider=provider_name)
             logger.error(f"[{request_id}] Gemini request failed: {type(e).__name__}: {e}")

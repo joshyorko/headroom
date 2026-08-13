@@ -362,3 +362,133 @@ def test_anthropic_backend_nonstreaming_perf_zeros_when_upstream_omits_cache_usa
     handler = log_handle[0]
     cr, cw, chp = _find_perf_record(handler.records)
     assert (cr, cw, chp) == (0, 0, 0)
+
+
+def test_anthropic_backend_nonstreaming_uncached_from_usage_input_tokens() -> None:
+    """The buffered anthropic-backend path must report uncached input tokens
+    from the backend's ``usage.input_tokens`` (which is already prompt minus
+    cache), not re-derive it from the live-zone tokenizer count.
+
+    The old code computed ``uncached = attempted_input_tokens - cache_read -
+    cache_write``, where ``attempted_input_tokens`` is the small live-zone token
+    count kept for the compression-ratio denominator. On any turn whose cached
+    prefix is larger than the new turn that underflows to 0, so uncached input
+    was reported as 0. Here ``usage.input_tokens=1000`` while the live zone is a
+    couple of tokens, so the two behaviours are distinguishable.
+    """
+    from headroom.proxy.server import HeadroomProxy
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        backend="anyllm",
+        anyllm_provider="anthropic",
+    )
+    body = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-3-5-sonnet-20241022",
+        "content": [{"type": "text", "text": "hi"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 1000,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 500,
+            "cache_creation_input_tokens": 200,
+        },
+    }
+    backend = _make_anthropic_backend(body)
+
+    captured: list[Any] = []
+    orig_record = HeadroomProxy._record_request_outcome
+
+    async def _spy(self, outcome):  # noqa: ANN001, ANN202
+        captured.append(outcome)
+        return await orig_record(self, outcome)
+
+    with (
+        patch("headroom.proxy.server.AnyLLMBackend", return_value=backend),
+        patch.object(HeadroomProxy, "_record_request_outcome", _spy),
+    ):
+        app = create_app(config)
+        with TestClient(app) as client:
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3-5-sonnet-20241022",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 64,
+                },
+                headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+            )
+            assert resp.status_code == 200, resp.text[:200]
+
+    assert captured, "expected a recorded RequestOutcome"
+    outcome = captured[-1]
+    assert outcome.uncached_input_tokens == 1000
+    assert outcome.cache_read_tokens == 500
+    assert outcome.cache_write_tokens == 200
+
+
+def test_anthropic_backend_nonstreaming_uncached_falls_back_when_input_tokens_absent() -> None:
+    """When the backend omits ``input_tokens``, uncached must NOT collapse to 0.
+
+    ``usage.input_tokens`` is authoritative when present, but a backend that
+    does not report it must fall back to the live-zone derivation rather than
+    silently record uncached=0 (which is what ``usage.get("input_tokens", 0)``
+    would do). With no cache counters the derivation is just the live-zone
+    tokenizer count, so the recorded value is a positive estimate, not 0.
+    """
+    from headroom.proxy.server import HeadroomProxy
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        backend="anyllm",
+        anyllm_provider="anthropic",
+    )
+    # No ``input_tokens`` in usage — only output. A real backend that fails to
+    # translate the prompt-token field lands here.
+    body = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-3-5-sonnet-20241022",
+        "content": [{"type": "text", "text": "hi"}],
+        "stop_reason": "end_turn",
+        "usage": {"output_tokens": 50},
+    }
+    backend = _make_anthropic_backend(body)
+
+    captured: list[Any] = []
+    orig_record = HeadroomProxy._record_request_outcome
+
+    async def _spy(self, outcome):  # noqa: ANN001, ANN202
+        captured.append(outcome)
+        return await orig_record(self, outcome)
+
+    with (
+        patch("headroom.proxy.server.AnyLLMBackend", return_value=backend),
+        patch.object(HeadroomProxy, "_record_request_outcome", _spy),
+    ):
+        app = create_app(config)
+        with TestClient(app) as client:
+            resp = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3-5-sonnet-20241022",
+                    "messages": [{"role": "user", "content": "hello there"}],
+                    "max_tokens": 64,
+                },
+                headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+            )
+            assert resp.status_code == 200, resp.text[:200]
+
+    assert captured, "expected a recorded RequestOutcome"
+    outcome = captured[-1]
+    # No input_tokens reported and no cache: the live-zone derivation yields the
+    # non-zero token count of the new turn, never the 0 the naive default gave.
+    assert outcome.uncached_input_tokens > 0

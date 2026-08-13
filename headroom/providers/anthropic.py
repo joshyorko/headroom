@@ -402,13 +402,14 @@ class AnthropicTokenCounter(TokenCounter):
             # str(block) catch-all would produce.
             tokens += count_content_blocks(content, self.count_text)
 
-        # OpenAI format tool calls
-        if "tool_calls" in message:
-            for tool_call in message.get("tool_calls", []):
-                if isinstance(tool_call, dict):
-                    func = tool_call.get("function") or {}
-                    tokens += self.count_text(coerce_countable_text(func.get("name")))
-                    tokens += self.count_text(coerce_countable_text(func.get("arguments")))
+        # OpenAI format tool calls. Guard the value, not just the key: an
+        # OpenAI-format assistant message often carries `tool_calls: null` on a
+        # no-tool turn, and `for ... in None` would raise TypeError.
+        for tool_call in message.get("tool_calls") or []:
+            if isinstance(tool_call, dict):
+                func = tool_call.get("function") or {}
+                tokens += self.count_text(coerce_countable_text(func.get("name")))
+                tokens += self.count_text(coerce_countable_text(func.get("arguments")))
 
         return tokens
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -16,6 +17,7 @@ from headroom.observability import (
     set_otel_metrics,
 )
 from headroom.proxy.prometheus_metrics import PrometheusMetrics
+from headroom.telemetry.context import MAX_DISTINCT_MODELS
 from headroom.transforms.pipeline import TransformPipeline
 
 
@@ -49,6 +51,7 @@ def test_headroom_otel_metrics_records_proxy_and_pipeline_metrics() -> None:
         input_tokens=120,
         output_tokens=30,
         tokens_saved=45,
+        tool_search_saved=15,
         latency_ms=18.5,
         cached=True,
         overhead_ms=4.0,
@@ -81,6 +84,32 @@ def test_headroom_otel_metrics_records_proxy_and_pipeline_metrics() -> None:
         cached=True,
     )
     assert request_point.value == 1
+
+    saved_tokens = metrics["headroom.proxy.tokens.saved"]
+    saved_point = _find_point(
+        saved_tokens,
+        provider="anthropic",
+        model="claude-opus-4-6",
+        cached=True,
+    )
+    assert saved_point.value == 60
+
+    tool_schema_saved = metrics["headroom.proxy.tokens.tool_schema_saved"]
+    tool_schema_point = _find_point(
+        tool_schema_saved,
+        provider="anthropic",
+        model="claude-opus-4-6",
+        cached=True,
+    )
+    assert tool_schema_point.value == 15
+
+    compression_saved = metrics["headroom.compression.tokens.saved"]
+    compression_saved_point = _find_point(
+        compression_saved,
+        provider="anthropic",
+        model="claude-opus-4-6",
+    )
+    assert compression_saved_point.value == 45
 
     latency = metrics["headroom.proxy.request.duration"]
     latency_point = _find_point(
@@ -236,3 +265,108 @@ async def test_prometheus_metrics_clamps_negative_token_savings() -> None:
 
     assert metrics.tokens_saved_total == 0
     assert metrics.savings_history[-1][1] == 0
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_caps_model_cardinality() -> None:
+    """A client sending unbounded distinct models cannot grow the per-model dicts
+    past MAX_DISTINCT_MODELS + the "other" sentinel, while accounting stays exact."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: str) -> None:
+        await metrics.record_request(
+            provider="anthropic",
+            model=model,
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=1,
+            latency_ms=1.0,
+            cache_read_tokens=1,  # enter the prefix-cache block -> _cache_requests_by_model
+        )
+
+    # Fill exactly to the cap with distinct models: no bucketing yet.
+    for i in range(MAX_DISTINCT_MODELS):
+        await record(f"model_{i}")
+    assert len(metrics.requests_by_model) == MAX_DISTINCT_MODELS
+    assert len(metrics._cache_requests_by_model) == MAX_DISTINCT_MODELS
+    assert "other" not in metrics.requests_by_model
+
+    # New distinct models past the cap bucket into "other", never their own key.
+    for i in range(5):
+        await record(f"overflow_{i}")
+    assert "overflow_0" not in metrics.requests_by_model
+    assert metrics.requests_by_model["other"] == 5
+    assert metrics._cache_requests_by_model["other"] == 5
+    assert len(metrics.requests_by_model) == MAX_DISTINCT_MODELS + 1
+    assert len(metrics._cache_requests_by_model) == MAX_DISTINCT_MODELS + 1
+
+    # An already-tracked model keeps incrementing after the cap is reached.
+    await record("model_0")
+    assert metrics.requests_by_model["model_0"] == 2
+
+    # Accounting is preserved: every request is counted somewhere.
+    total_calls = MAX_DISTINCT_MODELS + 5 + 1
+    assert metrics.requests_total == total_calls
+    assert sum(metrics.requests_by_model.values()) == total_calls
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_model_cardinality_warns_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Bucketing into "other" logs exactly one warning, not one per request."""
+    metrics = PrometheusMetrics(stateless=True)
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        for i in range(MAX_DISTINCT_MODELS + 10):
+            await metrics.record_request(
+                provider="openai",
+                model=f"model_{i}",
+                input_tokens=10,
+                output_tokens=1,
+                tokens_saved=1,
+                latency_ms=1.0,
+            )
+    cap_warnings = [r for r in caplog.records if "cardinality cap" in r.getMessage()]
+    assert len(cap_warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_reset_rearms_cardinality_warning() -> None:
+    """reset_runtime clears the model dicts and re-arms the one-shot cap warning."""
+    metrics = PrometheusMetrics(stateless=True)
+    for i in range(MAX_DISTINCT_MODELS + 5):
+        await metrics.record_request(
+            provider="openai",
+            model=f"model_{i}",
+            input_tokens=1,
+            output_tokens=1,
+            tokens_saved=1,
+            latency_ms=1.0,
+            cache_read_tokens=1,
+        )
+    assert metrics._model_cardinality_warned is True
+
+    await metrics.reset_runtime()
+
+    assert metrics._model_cardinality_warned is False
+    assert len(metrics.requests_by_model) == 0
+    assert len(metrics._cache_requests_by_model) == 0
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_export_bounds_model_series() -> None:
+    """export() emits at most MAX_DISTINCT_MODELS model series plus the 'other' bucket."""
+    metrics = PrometheusMetrics(stateless=True)
+    for i in range(MAX_DISTINCT_MODELS + 20):
+        await metrics.record_request(
+            provider="openai",
+            model=f"model_{i}",
+            input_tokens=1,
+            output_tokens=1,
+            tokens_saved=1,
+            latency_ms=1.0,
+        )
+    text = await metrics.export()
+    series = text.count("headroom_requests_by_model{")
+    assert series <= MAX_DISTINCT_MODELS + 1
+    assert 'headroom_requests_by_model{model="other"}' in text

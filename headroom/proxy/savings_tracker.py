@@ -16,6 +16,7 @@ import tempfile
 import threading
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -164,6 +165,23 @@ def _normalize_model(value: Any) -> str:
     return cleaned or MODEL_UNKNOWN
 
 
+# `_resolve_litellm_model` is called on every savings-tracking update (i.e.
+# every request), and `model` is client-controlled — it comes straight off
+# the request body. For a model LiteLLM can't price (a custom / local /
+# gateway name), the uncached fallback below calls `litellm.cost_per_token`
+# purely to probe resolvability, which prints LiteLLM's noisy "Provider
+# List: https://docs.litellm.ai/docs/providers" banner on every failed probe
+# (#2851). Cache the resolution per model name so that probe runs at most
+# once per distinct model — bounded, not a plain dict: a request-facing
+# proxy must not let a caller grow an unbounded cache for free by sending a
+# fresh model string on every request. `maxsize` caps memory; LRU eviction
+# means a model that stops being sent eventually falls out and simply
+# re-probes if it's ever sent again — never a correctness issue, only
+# whether the probe (and its noisy failure banner) reruns.
+_MODEL_RESOLUTION_CACHE_MAXSIZE = 256
+
+
+@lru_cache(maxsize=_MODEL_RESOLUTION_CACHE_MAXSIZE)
 def _resolve_litellm_model(model: str) -> str:
     """Resolve model name to one LiteLLM recognizes.
 
@@ -173,6 +191,12 @@ def _resolve_litellm_model(model: str) -> str:
     "claude-opus" identically to the live /stats path. Uses the shared result
     only when it maps to a priced model_cost key; otherwise falls through to the
     bare-prefix logic below. Fail-soft: pricing never breaks bookkeeping.
+
+    Bounded LRU cache, keyed by model name — see
+    ``_MODEL_RESOLUTION_CACHE_MAXSIZE`` above. Tests that mock the LiteLLM
+    module across calls with the same model name must call
+    ``_resolve_litellm_model.cache_clear()`` between cases, or results from
+    an earlier case leak in.
     """
     litellm = _get_litellm_module()
     if litellm is None:

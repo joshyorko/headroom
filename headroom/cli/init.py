@@ -675,13 +675,30 @@ def _ensure_codex_feature_flag(path: Path) -> None:
 
 def _ensure_codex_hooks(path: Path, profile: str, proxy_url: str) -> None:
     logger.debug("ensure codex hooks: %s (profile=%s)", path, profile)
+    uses_local_runtime = _proxy_url_uses_local_runtime(proxy_url)
     ensure_command = (
         f"{_hook_command('--profile', profile)} --marker {_CODEX_HOOK_MARKER}"
-        if _proxy_url_uses_local_runtime(proxy_url)
+        if uses_local_runtime
         else None
     )
+    report_command = (
+        None
+        if uses_local_runtime
+        else _command_string(
+            [
+                *resolve_headroom_config_command(),
+                "mcp",
+                "report-rtk",
+                "--proxy-url",
+                proxy_url.rstrip("/"),
+            ]
+        )
+    )
+    session_command = ensure_command or report_command
     session_hooks = (
-        [{"type": "command", "command": ensure_command, "timeout": 15}] if ensure_command else []
+        [{"type": "command", "command": session_command, "timeout": 15}]
+        if session_command
+        else []
     )
     desired_hooks: dict[str, tuple[str, list[dict[str, Any]]] | None] = {
         "SessionStart": ("startup|resume", session_hooks) if session_hooks else None,
@@ -712,7 +729,10 @@ def _ensure_codex_hooks(path: Path, profile: str, proxy_url: str) -> None:
             has_headroom = any(
                 isinstance(item, dict)
                 and item.get("command")
-                and _CODEX_HOOK_MARKER in str(item.get("command"))
+                and (
+                    _CODEX_HOOK_MARKER in str(item.get("command"))
+                    or "mcp report-rtk" in str(item.get("command"))
+                )
                 for item in hook_items
             )
             if not has_headroom:

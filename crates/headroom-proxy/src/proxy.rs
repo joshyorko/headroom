@@ -17,6 +17,7 @@ use futures_util::{StreamExt as _, TryStreamExt};
 use http_body_util::BodyExt;
 
 use crate::cache_stabilization;
+use crate::cache_stabilization::beta_sticky::BetaProvider;
 use crate::cache_stabilization::drift_detector::{
     compute_structural_hash, derive_session_key, observe_drift, ApiKind, DriftState,
 };
@@ -66,6 +67,13 @@ pub struct AppState {
     /// request body — so this can be cloned freely into every handler
     /// path that buffers the body.
     pub drift_state: DriftState,
+    /// Session-sticky beta-header tracker (parity port of the Python
+    /// `SessionBetaTracker`, PR-A6): per-`(provider, session)` LRU of
+    /// `anthropic-beta` / `openai-beta` tokens, unioned across turns
+    /// so a client dropping a token mid-conversation doesn't rotate
+    /// the upstream prefix-cache key. Shares the drift detector's
+    /// session identity (same `derive_session_key` output).
+    pub beta_sticky: cache_stabilization::beta_sticky::BetaStickyState,
     /// PR-D4: GCP ADC bearer-token source for Vertex routes. Default:
     /// [`crate::vertex::adc::GcpAdcTokenSource`] constructed lazily;
     /// the actual ADC chain is only resolved when the first Vertex
@@ -111,6 +119,9 @@ impl AppState {
             client,
             bedrock_credentials: None,
             drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
+            beta_sticky: cache_stabilization::beta_sticky::BetaStickyState::new(
+                cache_stabilization::beta_sticky::BETA_TRACKER_CAPACITY,
+            ),
             vertex_token_source,
         })
     }
@@ -707,6 +718,41 @@ pub(crate) async fn forward_http(
                 let session_key = derive_session_key(headers, &client_addr, &parsed, kind);
                 let hash = compute_structural_hash(&parsed, kind);
                 observe_drift(&state.drift_state, &session_key, hash);
+
+                // Session-sticky provider beta headers — port of the
+                // Python PR-A6 `SessionBetaTracker`. Beta headers are
+                // part of the bytes that determine the upstream
+                // prefix-cache key; a client dropping a token between
+                // turns rotates the key and re-writes the whole
+                // prefix at the customer's cost. Forward the
+                // per-conversation union instead. See
+                // `cache_stabilization::beta_sticky` for the behavior
+                // contract, the auth-mode rationale (applies to every
+                // mode, like the Python handler), and the one
+                // documented divergence from Python (per-conversation
+                // keying). Reuses the drift detector's `session_key`
+                // so both cache-stability subsystems agree on
+                // conversation identity. Mutates upstream-bound
+                // HEADERS only; body bytes stay untouched (Phase-A
+                // cache-safety invariant).
+                if state.config.beta_header_sticky.is_enabled() {
+                    let provider = match endpoint {
+                        compression::CompressibleEndpoint::AnthropicMessages => {
+                            BetaProvider::Anthropic
+                        }
+                        compression::CompressibleEndpoint::OpenAiChatCompletions
+                        | compression::CompressibleEndpoint::OpenAiResponses => {
+                            BetaProvider::OpenAi
+                        }
+                    };
+                    cache_stabilization::beta_sticky::apply_sticky_betas(
+                        &state.beta_sticky,
+                        provider,
+                        &session_key,
+                        &mut outgoing_headers,
+                        &request_id,
+                    );
+                }
             }
         }
         let outcome = match endpoint {

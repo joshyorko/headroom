@@ -225,7 +225,14 @@ def test_init_codex_merges_feature_flag_into_existing_table(monkeypatch, tmp_pat
     assert provider["model_provider"] == "headroom"
     assert provider["model_providers"]["headroom"]["base_url"] == "http://headroom.example.test/v1"
     hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    assert "SessionStart" not in hooks["hooks"]
+    session_commands = [
+        hook["command"]
+        for entry in hooks["hooks"]["SessionStart"]
+        for hook in entry["hooks"]
+    ]
+    assert session_commands == [
+        "headroom mcp report-rtk --proxy-url http://headroom.example.test"
+    ]
     assert "PreToolUse" not in hooks["hooks"]
 
 
@@ -253,6 +260,88 @@ def test_init_codex_local_proxy_keeps_runtime_ensure_hook(
         for entry in hooks["hooks"]["PreToolUse"]
         for hook in entry["hooks"]
     )
+
+
+def test_init_codex_remote_proxy_writes_only_rtk_report_hook(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    user_config_path = tmp_path / "user-codex" / "config.toml"
+    monkeypatch.setattr(init_cli, "codex_config_path", lambda: user_config_path)
+
+    init_cli._init_codex(
+        global_scope=False,
+        profile="init-local-demo",
+        port=9000,
+        proxy_url="http://10.10.10.89",
+    )
+
+    hooks_path = tmp_path / ".codex" / "hooks.json"
+    first = hooks_path.read_text(encoding="utf-8")
+    hooks = json.loads(first)
+    session_commands = [
+        hook["command"] for entry in hooks["hooks"]["SessionStart"] for hook in entry["hooks"]
+    ]
+    assert len(session_commands) == 1
+    assert "mcp report-rtk" in session_commands[0]
+    assert "--proxy-url http://10.10.10.89" in session_commands[0]
+    assert "PreToolUse" not in hooks["hooks"]
+
+    init_cli._init_codex(
+        global_scope=False,
+        profile="init-local-demo",
+        port=9000,
+        proxy_url="http://10.10.10.89",
+    )
+    assert hooks_path.read_text(encoding="utf-8") == first
+
+
+def test_remote_codex_rtk_report_hook_preserves_unrelated_hooks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "hooks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "notify": True,
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup",
+                            "hooks": [{"type": "command", "command": "echo keep"}],
+                        }
+                    ],
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{"type": "command", "command": "echo user-pretool"}],
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    init_cli._ensure_codex_hooks(path, "init-user", "http://10.10.10.89")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["notify"] is True
+    session_commands = [
+        item["command"]
+        for entry in payload["hooks"]["SessionStart"]
+        for item in entry["hooks"]
+    ]
+    assert "echo keep" in session_commands
+    assert sum("mcp report-rtk" in command for command in session_commands) == 1
+    pretool_commands = [
+        item["command"]
+        for entry in payload["hooks"]["PreToolUse"]
+        for item in entry["hooks"]
+    ]
+    assert pretool_commands == ["echo user-pretool"]
 
 
 def test_init_codex_creates_hooks_feature_flag_on_first_init(

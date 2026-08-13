@@ -1202,7 +1202,12 @@ class SmartCrusher(Transform):
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for tc in msg.get("tool_calls", []):
                     if isinstance(tc, dict):
-                        func = tc.get("function", {})
+                        # `tc.get("function", {})` returns None for an explicit
+                        # {"function": null} (the default only applies to a
+                        # missing key), and `.get` on None raises AttributeError,
+                        # crashing apply(). Use the null-safe form the sibling
+                        # `_build_tool_name_index` already uses (line ~118).
+                        func = tc.get("function") or {}
                         args = func.get("arguments", "")
                         if isinstance(args, str) and args:
                             context_parts.append(args)

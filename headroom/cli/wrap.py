@@ -33,6 +33,8 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any, cast
 
@@ -88,6 +90,7 @@ from headroom.providers.claude import (
 from headroom.providers.claude import (
     proxy_base_url as _claude_proxy_base_url,
 )
+from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom, retag_to_native
@@ -279,13 +282,14 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 # Issue #746: Claude Code disables on-demand tool loading (deferral) when
 # ANTHROPIC_BASE_URL is a custom host and ENABLE_TOOL_SEARCH is unset, which
 # inflates the local context window by tens of K tokens. Setting the env var
-# when we launch Claude Code keeps deferral on. Default to "true" — defer the
-# MCP/system tools for maximum context savings, matching native first-party
-# behaviour (core built-ins like Read/Edit/Bash are never deferred by Claude
-# Code, so the agent loop is unaffected). The key/default are shared with
-# `init` and `install` via the Claude provider package to prevent drift.
+# when we launch Claude Code keeps deferral on. The generic default stays
+# "true" for non-Foundry sessions, while Foundry uses a dedicated compatibility
+# default of "false" because its upstream does not support the deferred-tool
+# shape. The key/defaults are shared with `init` and `install` via the Claude
+# provider package to prevent drift.
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
+_TOOL_SEARCH_FOUNDRY_DEFAULT = TOOL_SEARCH_FOUNDRY_DEFAULT
 _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
@@ -311,6 +315,33 @@ def _resolve_1m_model(current: str | None) -> str:
     """
     base = (current or "").strip() or _DEFAULT_1M_MODEL
     return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
+
+
+def _apply_1m_to_claude_args(args: tuple[str, ...]) -> tuple[tuple[str, ...], str | None]:
+    """Add the ``[1m]`` suffix to an explicit ``--model`` in pass-through args.
+
+    Claude Code gives the ``--model`` CLI flag precedence over the
+    ``ANTHROPIC_MODEL`` env var, so when a user passes both ``--1m`` and
+    ``--model X`` the env-var suffix is silently shadowed and the session caps at
+    200k (#2915). Rewriting the flag's value the same way ``_resolve_1m_model``
+    rewrites the env var keeps ``--1m`` effective on the higher-precedence flag.
+
+    Handles ``--model VALUE`` and ``--model=VALUE`` (the first occurrence only, as
+    Claude Code honours the first). Idempotent via ``_resolve_1m_model``. Returns
+    ``(new_args, rewritten_value)``; ``rewritten_value`` is ``None`` when no
+    ``--model`` was present (the env-var path already covers that case).
+    """
+    out = list(args)
+    for i, arg in enumerate(out):
+        if arg == "--model" and i + 1 < len(out):
+            rewritten = _resolve_1m_model(out[i + 1])
+            out[i + 1] = rewritten
+            return tuple(out), rewritten
+        if arg.startswith("--model="):
+            rewritten = _resolve_1m_model(arg.split("=", 1)[1])
+            out[i] = f"--model={rewritten}"
+            return tuple(out), rewritten
+    return tuple(out), None
 
 
 def _normalize_tool_search_mode(value: str) -> str:
@@ -341,7 +372,8 @@ def _configure_tool_search_env(env: dict[str, str], flag_value: str | None) -> s
     1. explicit ``--tool-search`` flag — wins (the user asked for it on the CLI),
     2. a pre-existing ``ENABLE_TOOL_SEARCH`` in the environment — respected and
        left untouched (the user's own Claude Code knob),
-    3. the built-in default (``true``).
+    3. the built-in mode-specific default (``true`` normally, ``false`` on
+       Foundry).
 
     Returns the value written, or ``None`` when an existing environment value
     was deliberately left in place.
@@ -356,8 +388,11 @@ def _configure_tool_search_env(env: dict[str, str], flag_value: str | None) -> s
     existing = env.get(_TOOL_SEARCH_ENV)
     if existing is not None and existing.strip():
         return None
-    env[_TOOL_SEARCH_ENV] = _TOOL_SEARCH_DEFAULT
-    return _TOOL_SEARCH_DEFAULT
+    default = (
+        _TOOL_SEARCH_FOUNDRY_DEFAULT if env.get("CLAUDE_CODE_USE_FOUNDRY") else _TOOL_SEARCH_DEFAULT
+    )
+    env[_TOOL_SEARCH_ENV] = default
+    return default
 
 
 # ENABLE_TOOL_SEARCH modes that turn deferral OFF. Everything else Claude Code
@@ -1725,8 +1760,10 @@ def _index_serena_project(*, verbose: bool = False) -> None:
         result = run(
             [
                 "uvx",
+                # PyPI (prebuilt wheels), not the git source that fails to build
+                # under proot-based filesystems (#2871).
                 "--from",
-                "git+https://github.com/oraios/serena",
+                "serena-agent",
                 "serena",
                 "project",
                 "index",
@@ -3548,7 +3585,7 @@ def _push_runtime_env(port: int, no_proxy: bool) -> None:
     click.echo(f"  Synced output settings to proxy: {', '.join(sorted(payload))}")
 
 
-def _ensure_proxy(
+def _ensure_proxy_unlocked(
     port: int,
     no_proxy: bool,
     *,
@@ -3567,7 +3604,13 @@ def _ensure_proxy(
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
 ) -> tuple[subprocess.Popen | None, int]:
-    """Start or verify proxy. Returns (process_handle, actual_port)."""
+    """Start or verify proxy. Returns (process_handle, actual_port).
+
+    The public ``_ensure_proxy`` wrapper serializes callers per port before
+    entering this function. Keeping the implementation separate makes the
+    lock boundary explicit and ensures every health/configuration check runs
+    under the same startup critical section.
+    """
     helpers = _live_wrap_module()
     copilot_subscription_seed_requested = (
         bool(copilot_api_token)
@@ -3932,6 +3975,81 @@ def _ensure_proxy(
                     "to the proxy's existing Vertex upstream."
                 )
         return None, port
+
+
+@contextmanager
+def _proxy_start_lock(port: int) -> Any:
+    """Serialize wrap proxy startup across processes sharing a port.
+
+    A proxy can spend tens of seconds loading optional ML components before it
+    binds its socket. Without this lock, two concurrent ``headroom wrap``
+    commands both see an unavailable health endpoint, choose the same port,
+    and race to spawn a listener. The lock is deliberately held through the
+    health/configuration checks and startup, then released once the proxy is
+    ready (or startup fails). Lock files are retained so an interrupted
+    process cannot create an inode-replacement race for another waiter.
+    """
+    from headroom import paths as _paths
+
+    lock_path = _paths.proxy_start_lock_path(port)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a+b")  # noqa: SIM115
+    except OSError:
+        # Locking is a race-prevention enhancement, not a reason to make wrap
+        # unusable when a read-only/custom workspace cannot hold state. The
+        # existing port bind remains the final safety check in that degraded
+        # environment.
+        yield
+        return
+    with lock_file:
+        if sys.platform == "win32":
+            import msvcrt
+
+            # msvcrt.locking operates on bytes from the current file position.
+            lock_file.seek(0)
+            if lock_file.read(1) == b"":
+                lock_file.seek(0)
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            # LK_LOCK has implementation-dependent retry limits. A proxy may
+            # legitimately take longer than that to load ML components, so
+            # use the non-blocking primitive in a loop instead.
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@wraps(_ensure_proxy_unlocked)
+def _ensure_proxy(
+    port: int,
+    no_proxy: bool,
+    **kwargs: Any,
+) -> tuple[subprocess.Popen | None, int]:
+    """Start or reuse a proxy without racing another wrap on the same port."""
+    if no_proxy:
+        return _ensure_proxy_unlocked(port, no_proxy, **kwargs)
+    with _proxy_start_lock(port):
+        # Re-checking is part of the lock boundary: a concurrent wrapper may
+        # have finished startup while this caller was waiting for the lock.
+        return _ensure_proxy_unlocked(port, no_proxy, **kwargs)
 
 
 def _client_marker_path(port: int) -> Path:
@@ -4858,10 +4976,18 @@ def claude(
         # force it via ANTHROPIC_MODEL on the launched process.
         if context_1m:
             env[_ANTHROPIC_MODEL_ENV] = _resolve_1m_model(env.get(_ANTHROPIC_MODEL_ENV))
-            click.echo(
-                f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
-                "(1M context window; issue #1158)"
-            )
+            # An explicit pass-through --model outranks ANTHROPIC_MODEL in Claude
+            # Code, so add the suffix there too or the env var is silently
+            # shadowed and the window stays 200k (#2915). Report what will
+            # actually take effect rather than the shadowed env value.
+            claude_args, _model_flag_1m = _apply_1m_to_claude_args(claude_args)
+            if _model_flag_1m is not None:
+                click.echo(f"  --model {_model_flag_1m} (1M context window; issue #1158)")
+            else:
+                click.echo(
+                    f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
+                    "(1M context window; issue #1158)"
+                )
 
         result = subprocess.run([claude_bin, *claude_args], env=env)
         raise SystemExit(result.returncode)
@@ -5231,8 +5357,11 @@ def copilot(
                 "automatic model selection."
             )
 
+        env_wire_api = env.get("COPILOT_PROVIDER_WIRE_API")
         effective_wire_api = wire_api or (
-            _copilot_default_wire_api_for_model(selected_model) if subscription else "completions"
+            env_wire_api
+            if env_wire_api in {"completions", "responses"}
+            else _copilot_default_wire_api_for_model(selected_model)
         )
         openai_api_url = (
             subscription_resolution.api_url
@@ -7195,6 +7324,20 @@ def opencode(
             )
         subscription_resolution = _require_copilot_subscription_resolution()
 
+    # Verify the opencode binary exists BEFORE mutating any config. Otherwise a
+    # missing binary leaves headroom MCP/Serena/memory entries in the user's
+    # opencode config and an injected AGENTS.md, then errors with no cleanup --
+    # the config-before-verify anti-pattern (#1614). Siblings (claude, codex,
+    # goose, omp) already check first. `--prepare-only` intentionally writes
+    # config without launching, so it is exempt.
+    opencode_bin: str | None = None
+    if not prepare_only:
+        opencode_bin = shutil.which("opencode")
+        if not opencode_bin:
+            click.echo("Error: 'opencode' not found in PATH.")
+            click.echo("Install OpenCode: https://opencode.ai")
+            raise SystemExit(1)
+
     # Snapshot OpenCode config.json BEFORE any wrap-time mutation so
     # `headroom unwrap opencode` can restore the user's pre-wrap state.
     _opencode_config_file, _opencode_backup_file = opencode_config_paths()
@@ -7235,11 +7378,9 @@ def opencode(
         inject_opencode_provider_config(port)
         return
 
-    opencode_bin = shutil.which("opencode")
-    if not opencode_bin:
-        click.echo("Error: 'opencode' not found in PATH.")
-        click.echo("Install OpenCode: https://opencode.ai")
-        raise SystemExit(1)
+    # Past the prepare-only return the launch path always ran the binary check
+    # above, so opencode_bin is resolved.
+    assert opencode_bin is not None
 
     # Register our proxy client marker BEFORE _ensure_proxy so that another
     # wrapper's cleanup sees us as an active client and doesn't terminate a

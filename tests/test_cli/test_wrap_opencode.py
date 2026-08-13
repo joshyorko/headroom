@@ -364,6 +364,35 @@ def test_wrap_opencode_missing_binary_errors_clearly(
     assert "'opencode' not found in PATH" in result.output
 
 
+def test_wrap_opencode_missing_binary_does_not_mutate_config(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing opencode binary must not leave memory side-effects behind (#1614 class).
+
+    The MCP/Serena registrations are already gated on ``registrar.detect()``, but
+    the ``--memory`` injections (AGENTS.md, the .headroom dir, the memory MCP
+    config) are not -- they ran unconditionally before the binary check. Verify
+    the binary first, like claude/codex/goose/omp, so an absent tool cannot write
+    those and then error with nothing launched.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    agents_md = tmp_path / "AGENTS.md"
+    headroom_dir = tmp_path / ".headroom"
+
+    with patch.object(wrap_mod.shutil, "which", return_value=None):
+        result = runner.invoke(main, ["wrap", "opencode", "--memory"])
+
+    assert result.exit_code == 1
+    assert "'opencode' not found in PATH" in result.output
+    assert not agents_md.exists(), "AGENTS.md was created before the missing-binary check"
+    assert not headroom_dir.exists(), ".headroom dir was created before the missing-binary check"
+
+
 def test_wrap_opencode_prepare_only_injects_config(
     runner: CliRunner,
     tmp_path: Path,

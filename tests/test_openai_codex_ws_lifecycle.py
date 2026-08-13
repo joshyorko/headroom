@@ -116,6 +116,14 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         await emit_request_outcome(self, outcome)
 
 
+class _CapturingLogger:
+    def __init__(self) -> None:
+        self.entries = []
+
+    def log(self, entry) -> None:  # noqa: ANN001
+        self.entries.append(entry)
+
+
 class _FakeWebSocketDisconnect(Exception):
     """Mirrors the ``WebSocketDisconnect`` type-name check in the handler.
 
@@ -1031,6 +1039,145 @@ async def test_ws_session_metrics_include_dashboard_performance_timings():
     assert (
         recorded["pipeline_timing"]["codex_ws.compression_unit_router_strategy_passthrough"] == 3.0
     )
+
+
+@pytest.mark.asyncio
+async def test_ws_multi_turn_request_ids_are_unique():
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "usage": {
+                        "input_tokens": 100,
+                        "input_tokens_details": {"cached_tokens": 75},
+                        "output_tokens": 12,
+                    },
+                },
+            }
+        ),
+        json.dumps({"type": "response.created", "response": {"id": "r_2"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_2",
+                    "usage": {
+                        "input_tokens": 160,
+                        "input_tokens_details": {"cached_tokens": 120},
+                        "output_tokens": 20,
+                    },
+                },
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+    handler.logger = _CapturingLogger()
+
+    counter = 0
+
+    async def _next_request_id() -> str:
+        nonlocal counter
+        counter += 1
+        return f"req-ws-{counter}"
+
+    handler._next_request_id = _next_request_id  # type: ignore[method-assign]
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    logged = handler.logger.entries
+    assert len(logged) == 2
+    request_ids = [entry.request_id for entry in logged]
+    assert len(set(request_ids)) == len(request_ids)
+    assert [entry.input_tokens_optimized for entry in logged] == [100, 160]
+    assert [entry.output_tokens for entry in logged] == [12, 20]
+
+
+@pytest.mark.asyncio
+async def test_ws_no_delta_turn_emits_no_extra_request_log():
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+    handler.logger = _CapturingLogger()
+
+    counter = 0
+
+    async def _next_request_id() -> str:
+        nonlocal counter
+        counter += 1
+        return f"req-ws-{counter}"
+
+    handler._next_request_id = _next_request_id  # type: ignore[method-assign]
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert len(handler.logger.entries) == 1
+    assert all(entry.input_tokens_optimized == 0 for entry in handler.logger.entries)
+    assert all(entry.output_tokens == 0 for entry in handler.logger.entries)
+
+
+@pytest.mark.asyncio
+async def test_ws_session_log_prefix_uses_session_id(caplog: pytest.LogCaptureFixture):
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "usage": {
+                        "input_tokens": 100,
+                        "input_tokens_details": {"cached_tokens": 75},
+                        "output_tokens": 12,
+                    },
+                },
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+    handler.logger = _CapturingLogger()
+
+    counter = 0
+
+    async def _next_request_id() -> str:
+        nonlocal counter
+        counter += 1
+        return f"req-ws-{counter}"
+
+    handler._next_request_id = _next_request_id  # type: ignore[method-assign]
+    caplog.set_level(logging.INFO, logger="headroom.proxy")
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert handler.logger.entries
+    turn_request_id = handler.logger.entries[0].request_id
+    assert turn_request_id != "req-ws-1"
+    # Session lifecycle and PERF lines keep the session id so a session's log
+    # lines stay greppable together. The dashboard feed row retains its fresh
+    # per-turn id independently.
+    assert "[req-ws-1] WS /v1/responses accepted" in caplog.text
+    assert "[req-ws-1] WS /v1/responses completed" in caplog.text
+    assert "[req-ws-1] PERF" in caplog.text
+    assert f"[{turn_request_id}] PERF" not in caplog.text
 
 
 @pytest.mark.asyncio

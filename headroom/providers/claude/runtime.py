@@ -15,6 +15,7 @@ DEFAULT_API_URL = "https://api.anthropic.com"
 # single source of truth shared by `wrap`, `init`, and `install`.
 TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 TOOL_SEARCH_DEFAULT = "true"
+TOOL_SEARCH_FOUNDRY_DEFAULT = "false"
 REMOTE_CONTROL_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
 REMOTE_CONTROL_FEATURE = "Remote Control"
 

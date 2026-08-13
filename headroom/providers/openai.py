@@ -32,12 +32,7 @@ _UNKNOWN_MODEL_WARNINGS: set[str] = set()
 # Models whose price came from the built-in table rather than LiteLLM.
 _PRICING_FALLBACK_WARNINGS: set[str] = set()
 
-try:
-    import tiktoken
-
-    TIKTOKEN_AVAILABLE = True
-except ImportError:
-    TIKTOKEN_AVAILABLE = False
+TIKTOKEN_AVAILABLE = importlib.util.find_spec("tiktoken") is not None
 
 LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 
@@ -285,12 +280,21 @@ def _check_pricing_staleness() -> str | None:
 
 @lru_cache(maxsize=8)
 def _get_encoding(encoding_name: str) -> Any:
-    """Get tiktoken encoding, cached."""
+    """Get tiktoken encoding, cached.
+
+    Routes through the bounded loader so a stalled vocab download raises
+    :class:`~headroom.tokenizers.tiktoken_counter.TiktokenLoadError` after a
+    timeout instead of hanging the caller indefinitely — ``tiktoken`` fetches
+    vocabularies with no network timeout, and this runs on whatever thread
+    first counts tokens for a model, including proxy startup (GH #956).
+    """
     if not TIKTOKEN_AVAILABLE:
         raise RuntimeError(
             "tiktoken is required for OpenAI provider. Install with: pip install tiktoken"
         )
-    return tiktoken.get_encoding(encoding_name)
+    from ..tokenizers.tiktoken_counter import load_encoding
+
+    return load_encoding(encoding_name)
 
 
 def _lookup_encoding_name(model: str, custom_encodings: dict[str, str] | None = None) -> str | None:
@@ -343,6 +347,8 @@ class OpenAITokenCounter:
 
         Raises:
             RuntimeError: If tiktoken is not installed.
+            TiktokenLoadError: If the encoding's vocabulary can't be loaded
+                within the bounded timeout (e.g. stalled download).
         """
         self.model = model
         encoding_name = _get_encoding_name_for_model(model, custom_encodings)
@@ -507,7 +513,9 @@ class OpenAIProvider(Provider):
         the proxy pipeline resolves its tokenizer through this provider while
         handlers resolve through the tokenizer registry, the two disagree about
         the same request — savings become a difference of two rulers. Defer to
-        the registry so each model has exactly one tokenizer.
+        the registry so each model has exactly one tokenizer. For OpenAI models,
+        fall back to estimation when a vocabulary cannot load within the bounded
+        timeout; the cached fallback prevents subsequent requests from blocking.
         """
         if model not in self._token_counters:
             if _lookup_encoding_name(model, self._encodings) is None:
@@ -515,9 +523,19 @@ class OpenAIProvider(Provider):
 
                 self._token_counters[model] = cast(Any, get_tokenizer(model))
             else:
-                self._token_counters[model] = OpenAITokenCounter(
-                    model=model, custom_encodings=self._encodings
-                )
+                from ..tokenizers.tiktoken_counter import TiktokenLoadError
+
+                try:
+                    self._token_counters[model] = OpenAITokenCounter(
+                        model=model, custom_encodings=self._encodings
+                    )
+                except TiktokenLoadError as exc:
+                    logger.warning(
+                        "tiktoken unavailable for %s (%s); using estimation.", model, exc
+                    )
+                    from ..tokenizers.estimator import EstimatingTokenCounter
+
+                    self._token_counters[model] = EstimatingTokenCounter()
         return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:

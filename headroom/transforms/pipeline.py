@@ -163,7 +163,13 @@ class TransformPipeline:
         # - Logs -> LogCompressor
         # - Search results -> SearchCompressor
         # - HTML -> HTMLExtractor
-        transforms.append(ContentRouter())
+        # observer: the proxy passes PrometheusMetrics; this bare pipeline is
+        # used by the library/adapter paths, which would otherwise report
+        # tokens.saved with an empty by_strategy. Imported here rather than at
+        # module scope — transforms sits below telemetry in the import graph.
+        from headroom.telemetry.session import BeaconCompressionObserver
+
+        transforms.append(ContentRouter(observer=BeaconCompressionObserver()))
         logger.info("Pipeline using ContentRouter for intelligent content-aware compression")
 
         return transforms

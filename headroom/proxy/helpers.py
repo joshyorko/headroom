@@ -19,6 +19,7 @@ import shutil
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -346,6 +347,395 @@ def log_outbound_request(
         ",".join(mutation_reasons) if mutation_reasons else "",
         source,
         request_id or "",
+    )
+
+
+def count_cache_breakpoints(
+    system: Any,
+    messages: Any,
+    tools: Any,
+) -> dict[str, int]:
+    """Count client ``cache_control`` breakpoints per request section.
+
+    Besides raw counts, records how far from the END of the message list the
+    last marker sits (``last_marker_tail`` = messages after the last marked
+    one). A dropped or backward-moved final breakpoint — the signature of a
+    "large uncached tail next to a healthy cache read" billing regression —
+    shows up as ``last_marker_tail`` growing between inbound and outbound.
+    Nested markers inside ``tool_result`` list content are counted too, so a
+    transform that rewrites sub-blocks can't lose one invisibly.
+    """
+    system_count = 0
+    if isinstance(system, list):
+        system_count = sum(1 for b in system if isinstance(b, dict) and "cache_control" in b)
+
+    tools_count = 0
+    if isinstance(tools, list):
+        tools_count = sum(1 for t in tools if isinstance(t, dict) and "cache_control" in t)
+
+    message_count = 0
+    messages_total = 0
+    last_marker_index = -1
+    if isinstance(messages, list):
+        message_count = len(messages)
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            found = 1 if "cache_control" in msg else 0
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if "cache_control" in block:
+                        found += 1
+                    inner = block.get("content")
+                    if isinstance(inner, list):
+                        found += sum(
+                            1 for sub in inner if isinstance(sub, dict) and "cache_control" in sub
+                        )
+            if found:
+                messages_total += found
+                last_marker_index = i
+
+    last_marker_tail = message_count - 1 - last_marker_index if last_marker_index >= 0 else -1
+    return {
+        "system": system_count,
+        "tools": tools_count,
+        "messages": messages_total,
+        "total": system_count + tools_count + messages_total,
+        "message_count": message_count,
+        "last_marker_tail": last_marker_tail,
+    }
+
+
+# --------------------------------------------------------------------------
+# cache_control TTL lanes (issues #2939, #2767).
+#
+# Anthropic reads cache breakpoints in ONE global walk -- `tools`, then
+# `system`, then `messages` -- and requires every ``ttl="1h"`` marker to appear
+# before every 5-minute one. A bare ``{"type": "ephemeral"}`` marker IS 5m. Get
+# it wrong and the whole turn dies with
+#
+#   messages.15.content.1.cache_control.ttl: a ttl='1h' cache_control block must
+#   not come after a ttl='5m' cache_control block.
+#
+# The rule is already modelled in ``crates/headroom-core/src/cache_control.rs``
+# (``TtlOrderingWalk``), but that walker is instantiated once per field list, so
+# it only sees violations *within* `tools`, `system` or `messages` -- never
+# across them -- and it only warns. The helpers below are the cross-section
+# Python counterpart, and they repair rather than warn, because by the time the
+# body reaches the forwarder any violation in it is one Headroom introduced.
+#
+# No Headroom code ever invents a ``ttl`` value: every marker we re-place is
+# copied from some client marker. So an outbound 1h marker on a request whose
+# client sent none can only have leaked in from an EARLIER turn (via
+# ``overlay_cached_prefix`` replaying the previous turn's forwarded bytes), and
+# the fix is to drop the leaked ttl rather than to spread it.
+# --------------------------------------------------------------------------
+
+CACHE_TTL_1H = "1h"
+CACHE_TTL_5M = "5m"
+#: Any other ``ttl`` value is a lane we don't model; markers carrying one are
+#: reported but never rewritten, so a future Anthropic TTL can't be mangled by
+#: guesswork here. Mirrors ``TtlOrderingWalk::observe`` in headroom-core.
+CACHE_TTL_OTHER = "other"
+
+_TTL_GUARD_ENV = "HEADROOM_CACHE_CONTROL_TTL_GUARD"
+
+
+def cache_control_ttl_lane(marker: Any) -> str:
+    """Return ``"1h"``, ``"5m"`` or ``"other"`` for one ``cache_control`` marker.
+
+    A marker with no ``ttl`` key is 5m -- that is Anthropic's default lane, and
+    treating it as "unknown" instead would make every ordinary Claude Code
+    request look like a violation.
+    """
+    if not isinstance(marker, dict):
+        return CACHE_TTL_OTHER
+    ttl = marker.get("ttl")
+    if ttl is None:
+        return CACHE_TTL_5M
+    ttl = str(ttl)
+    return ttl if ttl in (CACHE_TTL_1H, CACHE_TTL_5M) else CACHE_TTL_OTHER
+
+
+def _revisit_holder(
+    holder: Any,
+    section: str,
+    visit: Callable[[str, dict[str, Any]], dict[str, Any] | None],
+) -> tuple[Any, bool]:
+    """Offer ``holder``'s marker to ``visit``; return a copy only if replaced."""
+    if not isinstance(holder, dict):
+        return holder, False
+    marker = holder.get("cache_control")
+    if not isinstance(marker, dict):
+        return holder, False
+    replacement = visit(section, marker)
+    if replacement is None:
+        return holder, False
+    return {**holder, "cache_control": replacement}, True
+
+
+def walk_cache_control(
+    system: Any,
+    messages: Any,
+    tools: Any,
+    visit: Callable[[str, dict[str, Any]], dict[str, Any] | None],
+) -> tuple[Any, Any, Any, bool]:
+    """Visit every ``cache_control`` marker in Anthropic's evaluation order.
+
+    ``visit(section, marker)`` returns a replacement marker, or ``None`` to
+    leave it alone -- so the same traversal serves both a read-only survey and a
+    rewrite. Sections are rebuilt copy-on-write and the untouched originals are
+    returned by identity: the forwarded body shares structure with the prefix
+    tracker's snapshot of what we sent, so mutating a marker in place would
+    rewrite history the next turn compares against.
+
+    Traversal matches :func:`count_cache_breakpoints`, nested ``tool_result``
+    sub-blocks included, so the guard and the diagnostic can never disagree
+    about what counts as a breakpoint.
+    """
+    changed = False
+
+    new_tools = tools
+    if isinstance(tools, list):
+        rebuilt_tools: list[Any] = []
+        hit = False
+        for tool in tools:
+            out, did = _revisit_holder(tool, "tools", visit)
+            hit = hit or did
+            rebuilt_tools.append(out)
+        if hit:
+            new_tools = rebuilt_tools
+            changed = True
+
+    new_system = system
+    if isinstance(system, list):
+        rebuilt_system: list[Any] = []
+        hit = False
+        for block in system:
+            out, did = _revisit_holder(block, "system", visit)
+            hit = hit or did
+            rebuilt_system.append(out)
+        if hit:
+            new_system = rebuilt_system
+            changed = True
+
+    new_messages = messages
+    if isinstance(messages, list):
+        rebuilt_messages: list[Any] = []
+        any_message_hit = False
+        for msg in messages:
+            if not isinstance(msg, dict):
+                rebuilt_messages.append(msg)
+                continue
+            # Message-level markers are non-standard but Headroom's own
+            # diagnostics count them, so keep the two traversals in step.
+            new_msg, message_hit = _revisit_holder(msg, "messages", visit)
+            content = new_msg.get("content")
+            if isinstance(content, list):
+                rebuilt_blocks: list[Any] = []
+                block_hit = False
+                for block in content:
+                    new_block, did = _revisit_holder(block, "messages", visit)
+                    inner = new_block.get("content") if isinstance(new_block, dict) else None
+                    if isinstance(inner, list):
+                        rebuilt_inner: list[Any] = []
+                        inner_hit = False
+                        for sub in inner:
+                            new_sub, sub_did = _revisit_holder(sub, "messages", visit)
+                            inner_hit = inner_hit or sub_did
+                            rebuilt_inner.append(new_sub)
+                        if inner_hit:
+                            new_block = {**new_block, "content": rebuilt_inner}
+                            did = True
+                    block_hit = block_hit or did
+                    rebuilt_blocks.append(new_block)
+                if block_hit:
+                    new_msg = {**new_msg, "content": rebuilt_blocks}
+                    message_hit = True
+            any_message_hit = any_message_hit or message_hit
+            rebuilt_messages.append(new_msg)
+        if any_message_hit:
+            new_messages = rebuilt_messages
+            changed = True
+
+    return new_system, new_messages, new_tools, changed
+
+
+def cache_control_ttl_lanes(system: Any, messages: Any, tools: Any) -> set[str]:
+    """Return the distinct TTL lanes the request's markers ask for."""
+    lanes: set[str] = set()
+
+    def _survey(_section: str, marker: dict[str, Any]) -> None:
+        lanes.add(cache_control_ttl_lane(marker))
+        return None
+
+    walk_cache_control(system, messages, tools, _survey)
+    return lanes
+
+
+def enforce_cache_control_ttl_order(
+    system: Any,
+    messages: Any,
+    tools: Any,
+    *,
+    client_uses_1h: bool,
+    request_id: str = "",
+) -> tuple[Any, Any, Any, dict[str, Any]]:
+    """Make the outbound body satisfy Anthropic's cache_control TTL ordering.
+
+    Two repairs, in this order:
+
+    1. **Lane containment.** When the client's own request carried no 1h marker
+       anywhere (``client_uses_1h`` is False), strip ``ttl`` from every outbound
+       1h marker. Headroom never authors a ttl, so such a marker is a previous
+       turn's value replayed into this one -- and a client that did not ask for
+       the 1h lane has not sent the ``extended-cache-ttl`` beta header either,
+       so promoting the rest of the request to match it is not an option. This
+       is the ``/btw`` case in #2939: Claude Code forks a side question into the
+       5m lane, and the replayed prefix drags a 1h marker in behind the fork's
+       own 5m ``tools``/``system`` breakpoints.
+    2. **Ordering.** Any 5m marker still sitting before the last 1h marker is
+       promoted to 1h. Here the client *is* in the 1h lane, so the beta header
+       is present and the promotion is safe. This covers the mirror-image bug
+       where a transform downgrades an early breakpoint -- e.g.
+       ``inject_tool_search_deferral`` losing a 1h marker off a deferred tool
+       (#2767) -- leaving the client's later 1h message breakpoints illegal.
+
+    Demoting the later 1h instead would also make the request legal, but it
+    throws away 1h caching the client asked and paid for, which is the exact
+    regression #2375 / #2382 / #2651 were filed to stop.
+
+    Returns ``(system, messages, tools, stats)``. When nothing needed repairing
+    the three sections are the objects that were passed in.
+    """
+    stats: dict[str, Any] = {
+        "violation": False,
+        "demoted": 0,
+        "promoted": 0,
+        "first_short_section": "",
+        "first_long_section": "",
+    }
+    if os.environ.get(_TTL_GUARD_ENV, "1").strip().lower() in ("0", "false", "no", "off"):
+        return system, messages, tools, stats
+
+    if not client_uses_1h:
+
+        def _contain(section: str, marker: dict[str, Any]) -> dict[str, Any] | None:
+            if cache_control_ttl_lane(marker) != CACHE_TTL_1H:
+                return None
+            stats["demoted"] += 1
+            if not stats["first_long_section"]:
+                stats["first_long_section"] = section
+            return {k: v for k, v in marker.items() if k != "ttl"}
+
+        system, messages, tools, contained = walk_cache_control(system, messages, tools, _contain)
+        if contained:
+            stats["violation"] = True
+            logger.warning(
+                "event=cache_control_ttl_order request_id=%s repair=lane_containment "
+                "demoted=%d leaked_from_section=%s; the client sent no 1h marker, so a "
+                "replayed 1h breakpoint would have been rejected upstream",
+                request_id,
+                stats["demoted"],
+                stats["first_long_section"],
+            )
+        return system, messages, tools, stats
+
+    # Ordering pass. Survey first so we know how far the violation reaches, then
+    # rewrite only the markers ahead of the last 1h one.
+    lanes: list[tuple[int, str, str]] = []
+    index = 0
+
+    def _survey(section: str, marker: dict[str, Any]) -> None:
+        nonlocal index
+        lanes.append((index, section, cache_control_ttl_lane(marker)))
+        index += 1
+        return None
+
+    walk_cache_control(system, messages, tools, _survey)
+
+    last_long = max((i for i, _s, lane in lanes if lane == CACHE_TTL_1H), default=-1)
+    offenders = [
+        (i, section) for i, section, lane in lanes if lane == CACHE_TTL_5M and i < last_long
+    ]
+    if not offenders:
+        return system, messages, tools, stats
+
+    stats["violation"] = True
+    stats["first_short_section"] = offenders[0][1]
+    stats["first_long_section"] = next(s for i, s, lane in lanes if lane == CACHE_TTL_1H)
+    offending_indices = {i for i, _section in offenders}
+    cursor = 0
+
+    def _promote(_section: str, marker: dict[str, Any]) -> dict[str, Any] | None:
+        nonlocal cursor
+        position = cursor
+        cursor += 1
+        if position not in offending_indices:
+            return None
+        stats["promoted"] += 1
+        return {**marker, "ttl": CACHE_TTL_1H}
+
+    system, messages, tools, _ = walk_cache_control(system, messages, tools, _promote)
+    logger.warning(
+        "event=cache_control_ttl_order request_id=%s repair=promote_to_1h promoted=%d "
+        "first_short_section=%s first_long_section=%s; a 5m breakpoint preceded a 1h one, "
+        "which Anthropic rejects outright",
+        request_id,
+        stats["promoted"],
+        stats["first_short_section"],
+        stats["first_long_section"],
+    )
+    return system, messages, tools, stats
+
+
+def log_cache_breakpoints(
+    *,
+    request_id: str | None,
+    inbound: dict[str, int],
+    outbound: dict[str, int],
+) -> None:
+    """One structured line per request: client breakpoints in vs forwarded out.
+
+    Per realignment build constraints: every cache-affecting decision is
+    logged. Escalates to WARNING when the forwarded request has fewer
+    breakpoints than the client sent, or the last marker moved further from
+    the end of the message list — either one silently un-caches the tail.
+    """
+    dropped = outbound["total"] < inbound["total"]
+    tail_grew = (
+        inbound["last_marker_tail"] >= 0
+        and outbound["last_marker_tail"] != inbound["last_marker_tail"]
+        and (
+            outbound["last_marker_tail"] < 0
+            or outbound["last_marker_tail"] > inbound["last_marker_tail"]
+        )
+    )
+    log = logger.warning if (dropped or tail_grew) else logger.info
+    log(
+        "event=cache_breakpoints request_id=%s "
+        "in_total=%d out_total=%d in_system=%d out_system=%d "
+        "in_tools=%d out_tools=%d in_messages=%d out_messages=%d "
+        "in_msg_count=%d out_msg_count=%d in_last_tail=%d out_last_tail=%d "
+        "dropped=%s tail_grew=%s",
+        request_id or "",
+        inbound["total"],
+        outbound["total"],
+        inbound["system"],
+        outbound["system"],
+        inbound["tools"],
+        outbound["tools"],
+        inbound["messages"],
+        outbound["messages"],
+        inbound["message_count"],
+        outbound["message_count"],
+        inbound["last_marker_tail"],
+        outbound["last_marker_tail"],
+        "true" if dropped else "false",
+        "true" if tail_grew else "false",
     )
 
 

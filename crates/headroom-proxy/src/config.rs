@@ -181,6 +181,48 @@ impl CompressionMode {
     }
 }
 
+/// Session-sticky provider beta headers (parity port of the Python
+/// proxy's `HEADROOM_BETA_HEADER_STICKY`; see
+/// `cache_stabilization::beta_sticky`).
+///
+/// When `enabled` (default), the proxy unions each request's
+/// `anthropic-beta` / `openai-beta` tokens with the tokens previously
+/// seen for the same conversation and forwards the union, so a client
+/// dropping a beta token mid-conversation doesn't rotate the upstream
+/// prefix-cache key.
+///
+/// When `disabled`, the client header is forwarded verbatim and no
+/// per-session token state is kept. Diagnostic operator opt-in — NOT
+/// a fallback per realignment build constraint #4.
+///
+/// Source priority: CLI flag → `HEADROOM_PROXY_BETA_HEADER_STICKY`
+/// env var → default (`enabled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "snake_case")]
+pub enum BetaHeaderSticky {
+    /// Union beta tokens per conversation and forward the union.
+    /// Default. Matches the Python proxy's default behaviour.
+    Enabled,
+    /// Forward the client's beta header verbatim; keep no state.
+    /// Diagnostic-only.
+    Disabled,
+}
+
+impl BetaHeaderSticky {
+    /// Stable snake_case name suitable for log fields.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BetaHeaderSticky::Enabled => "enabled",
+            BetaHeaderSticky::Disabled => "disabled",
+        }
+    }
+
+    /// Convenience: is the sticky union switched on?
+    pub fn is_enabled(self) -> bool {
+        matches!(self, BetaHeaderSticky::Enabled)
+    }
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "headroom-proxy",
@@ -319,6 +361,28 @@ pub struct CliArgs {
         default_value_t = StripInternalHeaders::Enabled,
     )]
     pub strip_internal_headers: StripInternalHeaders,
+
+    /// Session-sticky provider beta headers: union `anthropic-beta` /
+    /// `openai-beta` tokens per conversation so a client dropping a
+    /// token mid-conversation doesn't bust the upstream prefix cache.
+    /// Parity port of the Python proxy's `SessionBetaTracker` (PR-A6).
+    /// Default `enabled`; `disabled` is a diagnostic operator opt-in.
+    ///
+    /// Active only when the compression interceptor is on
+    /// (`--compression` / `HEADROOM_PROXY_COMPRESSION=1`): with the
+    /// interceptor off the proxy is a strict byte-pipe and never
+    /// mutates headers. Startup logs a warning when this is `enabled`
+    /// while `--compression` is off.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_BETA_HEADER_STICKY`
+    /// env var → default (`enabled`).
+    #[arg(
+        long = "beta-header-sticky",
+        env = "HEADROOM_PROXY_BETA_HEADER_STICKY",
+        value_enum,
+        default_value_t = BetaHeaderSticky::Enabled,
+    )]
+    pub beta_header_sticky: BetaHeaderSticky,
 
     /// Phase C PR-C4: enable the `/v1/responses` SSE streaming
     /// pipeline. When `true` (default), `Accept: text/event-stream`
@@ -517,6 +581,9 @@ pub struct Config {
     /// upstream-bound requests. PR-A5 default-on guard against
     /// fingerprinting / leakage of internal flags.
     pub strip_internal_headers: StripInternalHeaders,
+    /// Session-sticky provider beta headers (parity port of the
+    /// Python `SessionBetaTracker`, PR-A6). Default `enabled`.
+    pub beta_header_sticky: BetaHeaderSticky,
     /// PR-C4: enable the `/v1/responses` streaming pipeline (SSE
     /// state-machine + telemetry tee). Default `true`.
     pub enable_responses_streaming: bool,
@@ -578,6 +645,7 @@ impl Config {
             cache_control_auto_frozen: args.cache_control_auto_frozen,
             auth_mode_policy_enforcement: args.auth_mode_policy_enforcement,
             strip_internal_headers: args.strip_internal_headers,
+            beta_header_sticky: args.beta_header_sticky,
             enable_responses_streaming: args.enable_responses_streaming,
             enable_conversations_passthrough: args.enable_conversations_passthrough,
             enable_bedrock_native: args.enable_bedrock_native,
@@ -621,6 +689,9 @@ impl Config {
             // from upstream-bound requests. Tests opt out per-case via
             // `start_proxy_with`.
             strip_internal_headers: StripInternalHeaders::Enabled,
+            // Production default: sticky beta-header union per
+            // conversation (Python-parity). Tests opt out per-case.
+            beta_header_sticky: BetaHeaderSticky::Enabled,
             // PR-C4: streaming pipeline + conversations passthrough
             // both default-on so tests exercise the same paths
             // production traffic will hit.

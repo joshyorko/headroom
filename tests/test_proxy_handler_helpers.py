@@ -887,7 +887,8 @@ def test_resolve_ccr_workspace_explicit_project_id_wins() -> None:
     request = _fake_request({"x-headroom-project-id": "my-cool-project"})
     body = {}
     key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
-    assert key == "my-cool-project"
+    assert key.startswith("my-cool-project-")
+    assert len(key.split("-")[-1]) == 16
     assert label == "my-cool-project"
 
 

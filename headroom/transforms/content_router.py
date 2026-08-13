@@ -1394,11 +1394,12 @@ class RouterCompressionResult:
             LOG fallback chain it's three. Lets log readers see *how*
             we got to the final compressor without parsing the
             decision_reason string.
-        cache_hit: True when this result came from the router's
-            result_cache (no fresh compression ran). Currently the
-            single-content compress() path doesn't populate the cache,
-            so this is False in practice — placeholder for the
-            cache-wire-up follow-up.
+        cache_hit: True when this result was reused from a cache
+            instead of a fresh compression run. compress() itself
+            never sets this (only apply() has the router-internal
+            two-tier cache); it is set by callers that cache unit
+            results — e.g. the OpenAI Responses handler marks reused
+            units via ``replace(router_result, cache_hit=True)``.
     """
 
     compressed: str
@@ -2406,7 +2407,24 @@ class ContentRouter(Transform):
         Returns:
             RouterCompressionResult with reassembled content.
         """
-        sections = split_into_sections(content)
+        from .tag_protector import protect_tags, restore_tags
+
+        # Protect custom-tag blocks BEFORE splitting into sections. Section
+        # boundaries (code fences, blank lines) split a
+        # ``<system-reminder>...</system-reminder>`` pair across sections, so
+        # the per-section tag protection inside ``_try_ml_compressor`` never
+        # sees a matched pair (an unmatched tag protects nothing) and
+        # instruction blocks — Claude Code ships CLAUDE.md inside
+        # <system-reminder> — leak into lossy ML compression and arrive
+        # word-dropped. Protecting here keeps the whole block as one
+        # placeholder that spans sections intact.
+        cleaned, protected = protect_tags(
+            content,
+            compress_tagged_content=self.config.compress_tagged_content,
+        )
+        sections_source = cleaned if protected else content
+
+        sections = split_into_sections(sections_source)
         if logger.isEnabledFor(logging.DEBUG):
             _log_router_debug(
                 "content_router_mixed_sections",
@@ -2422,10 +2440,32 @@ class ContentRouter(Transform):
                 strategy_used=CompressionStrategy.PASSTHROUGH,
             )
 
+        # Placeholders must survive byte-exact: ``restore_tags`` DISCARDS a
+        # protected block whose placeholder was stripped or rewritten
+        # (Hotfix-A9), so a compressor eating a placeholder would silently
+        # drop the whole tag block — worse than the mangling this fixes.
+        # Any section carrying a placeholder is passed through verbatim
+        # instead of ever entering a compressor.
+        placeholders = [placeholder for placeholder, _ in protected]
+
         compressed_sections: list[str] = []
         routing_log: list[RoutingDecision] = []
 
         for i, section in enumerate(sections):
+            if placeholders and any(ph in section.content for ph in placeholders):
+                section_tokens = _estimate_tokens(section.content)
+                compressed_sections.append(section.content)
+                routing_log.append(
+                    RoutingDecision(
+                        content_type=section.content_type,
+                        strategy=CompressionStrategy.PASSTHROUGH,
+                        original_tokens=section_tokens,
+                        compressed_tokens=section_tokens,
+                        section_index=i,
+                    )
+                )
+                continue
+
             # Get strategy for this section
             strategy = self._strategy_from_detection_type(section.content_type)
 
@@ -2455,8 +2495,12 @@ class ContentRouter(Transform):
                 )
             )
 
+        compressed = "\n\n".join(compressed_sections)
+        if protected:
+            compressed = restore_tags(compressed, protected)
+
         return RouterCompressionResult(
-            compressed="\n\n".join(compressed_sections),
+            compressed=compressed,
             original=content,
             strategy_used=CompressionStrategy.MIXED,
             routing_log=routing_log,

@@ -54,6 +54,18 @@ class TestAnthropicTokenCounting:
         count = counter.count_messages(messages)
         assert count > 0
 
+    def test_count_messages_tolerates_null_tool_calls(self, anthropic_provider):
+        # OpenAI-format assistant messages routinely carry `tool_calls: null`
+        # (and occasionally `function: null`) on a no-tool turn. The estimated
+        # counter iterated the value after only a key-presence check, so it
+        # raised `TypeError: 'NoneType' object is not iterable`.
+        counter = anthropic_provider.get_token_counter("claude-3-5-sonnet-20241022")
+        messages = [
+            {"role": "assistant", "content": "hi", "tool_calls": None},
+            {"role": "assistant", "content": "x", "tool_calls": [{"id": "a", "function": None}]},
+        ]
+        assert counter.count_messages(messages) > 0
+
     def test_count_text_allows_literal_special_tokens(self, anthropic_provider):
         counter = anthropic_provider.get_token_counter("claude-3-5-sonnet-20241022")
         count = counter.count_text("prefix <|fim_suffix|> suffix")

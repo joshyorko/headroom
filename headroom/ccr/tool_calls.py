@@ -15,6 +15,7 @@ class CCRToolCall:
     tool_call_id: str
     hash_key: str
     query: str | None = None
+    tool_name: str | None = None
 
 
 def extract_tool_calls(response: dict[str, Any], provider: str) -> list[dict[str, Any]]:
@@ -89,6 +90,8 @@ def tool_call_id_for_provider(tool_call: dict[str, Any], provider: str) -> str:
     if provider == "google":
         function_call = tool_call.get("functionCall", {})
         if isinstance(function_call, dict):
+            if function_call.get("id"):
+                return str(function_call["id"])
             name = function_call.get("name", CCR_TOOL_NAME)
             return str(name)
         return CCR_TOOL_NAME
@@ -119,11 +122,18 @@ def parse_ccr_tool_calls(
             other_calls.append(tool_call)
             continue
 
+        tool_name = None
+        tool_call_id = tool_call_id_for_provider(tool_call, provider)
+        if provider == "google":
+            function_call = tool_call.get("functionCall", {})
+            if isinstance(function_call, dict) and function_call.get("id"):
+                tool_name = str(function_call.get("name", CCR_TOOL_NAME))
         ccr_calls.append(
             CCRToolCall(
-                tool_call_id=tool_call_id_for_provider(tool_call, provider),
+                tool_call_id=tool_call_id,
                 hash_key=hash_key,
                 query=query,
+                tool_name=tool_name,
             )
         )
 

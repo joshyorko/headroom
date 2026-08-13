@@ -314,6 +314,19 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--ccr-inline-resolve",
+    is_flag=True,
+    envvar="HEADROOM_CCR_INLINE_RESOLVE",
+    help=(
+        "Resolve <<ccr:...>> markers inline on the response path instead of "
+        "relying on the model to call headroom_retrieve. For callers with no "
+        "tool-call round-trip to redeem a marker (e.g. Headroom running as a "
+        "LiteLLM guardrail/proxy hop, see issue #2509). Applies to non-streaming "
+        "responses only. Off by default. "
+        "Env: HEADROOM_CCR_INLINE_RESOLVE."
+    ),
+)
+@click.option(
     "--no-ccr-proactive-expansion",
     is_flag=True,
     envvar="HEADROOM_NO_CCR_PROACTIVE_EXPANSION",
@@ -965,6 +978,7 @@ def proxy(
     tpm: int | None,
     no_ccr: bool,
     lossless: bool,
+    ccr_inline_resolve: bool,
     no_ccr_proactive_expansion: bool,
     proxy_extension: tuple[str, ...],
     compressor: tuple[str, ...],
@@ -1247,6 +1261,7 @@ def proxy(
         # CCR fully on.
         ccr_inject_tool=not no_ccr,
         ccr_inject_marker=not no_ccr,
+        ccr_resolve_markers_inline=ccr_inline_resolve,
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.

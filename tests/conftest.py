@@ -130,6 +130,29 @@ def _reset_copilot_routing_flag():
     reset_request_routed_to_copilot()
 
 
+# `savings_tracker._resolve_litellm_model` is an `lru_cache`d, module-global,
+# process-lifetime cache keyed by model name (bounded — see #2860). Many test
+# files monkeypatch `savings_tracker.litellm` to a fake with different
+# `model_cost`/`cost_per_token` behavior per test, but reuse common model
+# names like "gpt-4o" across them. Without a reset, whichever test resolves
+# "gpt-4o" first "wins" the cache entry for the rest of the run, and later
+# tests silently stop exercising their own fake — a real-not-hypothetical
+# order-dependence bug once the cache is process-lifetime instead of per-call.
+# Clear before AND after so a test's own within-test resolutions never leak
+# in from, or leak out to, a neighboring test either.
+@pytest.fixture(autouse=True)
+def _reset_litellm_model_resolution_cache():
+    try:
+        from headroom.proxy.savings_tracker import _resolve_litellm_model
+    except ModuleNotFoundError:
+        yield
+        return
+
+    _resolve_litellm_model.cache_clear()
+    yield
+    _resolve_litellm_model.cache_clear()
+
+
 # =============================================================================
 # Global test hooks
 # =============================================================================

@@ -484,6 +484,12 @@ class LocalBackend:
         assert self._hierarchical_memory is not None
         return await self._hierarchical_memory.record_access(memory_ids)
 
+    async def refresh_memory_indexes(self, memory_id: str) -> Memory | None:
+        """Refresh vector metadata and cache state from the primary store."""
+        await self._ensure_initialized()
+        assert self._hierarchical_memory is not None
+        return await self._hierarchical_memory.refresh_memory_indexes(memory_id)
+
     async def update_memory(
         self,
         memory_id: str,

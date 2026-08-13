@@ -36,6 +36,19 @@ function Ensure-PathEntry {
 function Ensure-ProfileBlock {
     param([string]$PathEntry)
 
+    # $PROFILE is empty when PowerShell cannot resolve the profile path for the
+    # current user (a fresh account with no Documents folder, a service/CI
+    # context, a redirected profile). Split-Path below would then throw
+    # "Cannot bind argument to parameter 'Path' because it is an empty string",
+    # and with $ErrorActionPreference = 'Stop' that aborts the whole installer
+    # AFTER the wrapper and persistent User PATH were already written. Skip the
+    # profile convenience block instead: Ensure-PathEntry has already persisted
+    # the PATH for new sessions.
+    if ([string]::IsNullOrEmpty($PROFILE)) {
+        Write-Info 'Skipping PowerShell profile update: $PROFILE is not set in this environment (PATH was still updated for new sessions).'
+        return
+    }
+
     $markerStart = '# >>> headroom docker-native >>>'
     $markerEnd = '# <<< headroom docker-native <<<'
     $escapedPathEntry = $PathEntry.Replace("'", "''")
@@ -346,6 +359,29 @@ function Get-PersistentDockerArgs {
     return ,$args.ToArray()
 }
 
+function Add-DashboardGatewayEnv {
+    param([System.Collections.Generic.List[string]]$ArgsList)
+
+    # This default is safe only because the published dashboard port is bound
+    # to the host loopback interface below. A host request published through
+    # Docker's default bridge reaches the
+    # container from the bridge gateway (for example, 172.17.0.1), not from
+    # 127.0.0.1. Trust only that exact gateway by default so the dashboard's
+    # metadata gate works for the first-party persistent Docker preset while
+    # preserving an explicitly configured allowlist.
+    if (Test-Path Env:HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS) {
+        return
+    }
+
+    $gateway = (& docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0 -and $gateway) {
+        $ArgsList.Add('--env')
+        $ArgsList.Add("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS=$gateway/32")
+    } else {
+        Write-Warning 'Could not determine Docker bridge gateway; dashboard metadata remains restricted'
+    }
+}
+
 function Get-ManifestProxyArgs {
     param(
         [int]$Port,
@@ -492,8 +528,9 @@ function Start-PersistentDockerInstall {
     docker rm -f $containerName | Out-Null 2>$null
 
     $dockerArgs = New-Object System.Collections.Generic.List[string]
-    $dockerArgs.AddRange([string[]]@('run','-d','--restart','unless-stopped','--name',$containerName,'-p',"$Port`:$Port"))
+    $dockerArgs.AddRange([string[]]@('run','-d','--restart','unless-stopped','--name',$containerName,'-p',"127.0.0.1`:$Port`:$Port"))
     $dockerArgs.AddRange((Get-PersistentDockerArgs))
+    Add-DashboardGatewayEnv -ArgsList $dockerArgs
     $dockerArgs.AddRange([string[]]@(
         '--env',"HEADROOM_DEPLOYMENT_PROFILE=$Profile",
         '--env','HEADROOM_DEPLOYMENT_PRESET=persistent-docker',

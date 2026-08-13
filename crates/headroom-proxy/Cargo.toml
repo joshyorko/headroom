@@ -38,7 +38,7 @@ http-body-util = "0.1"
 hyper = "1"
 url = "2"
 humantime = "2"
-bytesize = "1"
+bytesize = "2"
 tokio-util = { version = "0.7" }
 headroom-core = { path = "../headroom-core" }
 # Phase D PR-D1: native Bedrock InvokeModel route. SigV4 + AWS

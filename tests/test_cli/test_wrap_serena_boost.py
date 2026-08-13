@@ -122,7 +122,9 @@ def test_preindex_runs_serena_in_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyP
     cmd = args[0]
     assert cmd[0] == "uvx"
     assert cmd[-3:] == ["serena", "project", "index"]
-    assert "git+https://github.com/oraios/serena" in cmd
+    # PyPI package with prebuilt wheels, not the git source (#2871).
+    assert "serena-agent" in cmd
+    assert "git+https://github.com/oraios/serena" not in cmd
     assert kwargs["cwd"] == str(tmp_path)  # invoked in the project cwd
     assert "timeout" in kwargs  # timeout-guarded
 

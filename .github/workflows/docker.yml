@@ -193,6 +193,7 @@ jobs:
   # Tag the one self-hosted image digest that Kamal pulls from GHCR.
   docker-manifest:
     needs: docker-build
+    if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -271,6 +272,11 @@ jobs:
             echo "ERROR: no digests downloaded for variant '${{ matrix.variant.name || 'root' }}'" >&2
             exit 1
           fi
+          digest_count="$(find "${DIGEST_DIR}" -maxdepth 1 -type f | wc -l)"
+          if [ "${digest_count}" -ne 2 ]; then
+            echo "ERROR: expected both architecture digests for variant '${{ matrix.variant.name || 'root' }}', found ${digest_count}" >&2
+            exit 1
+          fi
           digest_refs=()
           for f in "${DIGEST_DIR}"/*; do
             digest="$(basename "$f")"
@@ -339,3 +345,15 @@ jobs:
             echo "cosign signing failed on attempt ${attempt}; retrying in ${sleep_for}s" >&2
             sleep "$sleep_for"
           done
+      - name: Re-tag root image as :latest
+        if: steps.manifest.outputs.index_digest != '' && matrix.variant.name == '' && steps.version.outputs.version != ''
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Add a unique annotation so GHCR records a fresh root package version.
+          promoted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          docker buildx imagetools create \
+            --annotation "index:io.headroom.promoted-at=${promoted_at}" \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}:${VERSION}"

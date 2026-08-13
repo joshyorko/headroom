@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
+from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.config import unwrap_tool_call_name
 from headroom.copilot_auth import (
     apply_copilot_api_auth,
@@ -94,6 +96,45 @@ _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
 _CODEX_WS_COMPRESSION_TIMEOUT_SECONDS = 5.0
+_CCR_HASH_RE = re.compile(
+    r"(?:Retrieve (?:more|original): hash=|<<ccr:)([a-fA-F0-9]{12,24})(?=[^a-fA-F0-9]|$)"
+)
+_BARE_CCR_HASH_RE = re.compile(r"[a-fA-F0-9]{12,24}")
+
+
+def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> list[str]:
+    """Return the distinct retrievable CCR hashes exposed by a response.
+
+    ``TransformResult.markers_inserted`` is not a hash-only collection: it can
+    also contain tool-digest and stable-prefix metadata. Extract only supported
+    CCR retrieval markers, then scan the rendered messages because row-drop and
+    recursive JSON paths can embed a marker without registering it separately.
+    """
+    hashes: list[str] = []
+    seen: set[str] = set()
+
+    def collect(value: Any, *, allow_bare_hash: bool = False) -> None:
+        if isinstance(value, str):
+            candidates = [value] if allow_bare_hash and _BARE_CCR_HASH_RE.fullmatch(value) else []
+            candidates.extend(match.group(1) for match in _CCR_HASH_RE.finditer(value))
+            for candidate in candidates:
+                normalized = candidate.lower()
+                if normalized not in seen:
+                    seen.add(normalized)
+                    hashes.append(normalized)
+            return
+        if isinstance(value, dict):
+            for child in value.values():
+                collect(child)
+            return
+        if isinstance(value, list):
+            for child in value:
+                collect(child)
+
+    for marker in markers:
+        collect(marker, allow_bare_hash=True)
+    collect(messages)
+    return hashes
 
 
 def _codex_ws_compression_timeout_seconds() -> float:
@@ -186,6 +227,101 @@ def _header_get(headers: dict[str, str], name: str) -> str | None:
         if key.lower() == lowered:
             return value
     return None
+
+
+#: Usage field names per OpenAI surface. Same three quantities, two spellings.
+CHAT_USAGE_KEYS = {
+    "input_key": "prompt_tokens",
+    "output_key": "completion_tokens",
+    "details_key": "prompt_tokens_details",
+}
+RESPONSES_USAGE_KEYS = {
+    "input_key": "input_tokens",
+    "output_key": "output_tokens",
+    "details_key": "input_tokens_details",
+}
+
+
+class TurnHookUsage:
+    """Upstream calls a turn hook caused that nothing else will account for.
+
+    A hook that re-drives the model (``call_model``) makes real, billed requests.
+    The handler's usage block reads exactly ONE response — the original, or
+    whichever the hook returned in its place, because the handler swaps
+    ``response`` for it. Every other upstream call on that turn is spend no
+    surface records.
+
+    The protocol is therefore two-sided, and both halves are required:
+
+    * :meth:`record` every upstream response as it arrives, original included.
+    * :meth:`settle` with the response the usage block will read.
+
+    ``settle`` removes that one response's contribution, so what remains is
+    exactly the delta the handler must add. Recording only the re-drives and
+    adding them unconditionally — the first version of this — double-counted the
+    re-drive the handler had just promoted to ``response`` and dropped the
+    original entirely: one re-drive billed ``B + B`` instead of ``A + B``.
+
+    Matching is by object identity, because the handler hands back the very
+    object it recorded. A hook that synthesises a brand new response matches
+    nothing and nothing is subtracted, which over-counts rather than under —
+    the safe direction for a bill.
+    """
+
+    __slots__ = ("_seen", "input_tokens", "output_tokens", "cache_read_tokens", "extra_calls")
+
+    def __init__(self) -> None:
+        self._seen: list[tuple[int, Any, int, int, int]] = []
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cache_read_tokens = 0
+        self.extra_calls = 0
+
+    def record(
+        self,
+        payload: Any,
+        *,
+        input_key: str,
+        output_key: str,
+        details_key: str,
+    ) -> None:
+        """Note one upstream response. Never raises: a hook must not be able to
+        500 a request by returning an odd shape."""
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+
+        def _int(value: Any) -> int:
+            try:
+                return max(int(value), 0)
+            except (TypeError, ValueError):
+                return 0
+
+        if isinstance(usage, dict):
+            details = usage.get(details_key)
+            cached = _int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+            entry = (
+                id(payload),
+                payload,
+                _int(usage.get(input_key)),
+                _int(usage.get(output_key)),
+                cached,
+            )
+        else:
+            entry = (id(payload), payload, 0, 0, 0)
+        self._seen.append(entry)
+
+    def settle(self, final: Any) -> None:
+        """Total everything except ``final``, which the usage block will read."""
+        self.input_tokens = self.output_tokens = self.cache_read_tokens = 0
+        self.extra_calls = 0
+        dropped = False
+        for _ident, payload, tin, tout, cached in self._seen:
+            if not dropped and payload is final:
+                dropped = True
+                continue
+            self.extra_calls += 1
+            self.input_tokens += tin
+            self.output_tokens += tout
+            self.cache_read_tokens += cached
 
 
 def _sanitize_forwarded_response_headers(
@@ -930,6 +1066,18 @@ def _should_buffer_openai_responses_stream_ccr(
     )
 
 
+def _should_inject_openai_chat_ccr_tool(*, ccr_inject_tool: bool, stream: bool) -> bool:
+    """Return whether chat-completions can redeem an injected CCR tool.
+
+    The chat streaming path forwards SSE events immediately and deliberately
+    does not run the response continuation loop. Injecting ``headroom_retrieve``
+    there makes OpenAI-compatible clients attempt an unknown tool call. The
+    non-streaming path can intercept and resolve it; Responses streaming has a
+    separate buffered-CCR path and is unaffected by this predicate.
+    """
+    return bool(ccr_inject_tool and not stream)
+
+
 def _responses_input_to_items(input_data: Any) -> list[dict[str, Any]]:
     """Normalize a Responses ``input`` field into an item list for CCR continuation.
 
@@ -1496,6 +1644,72 @@ class OpenAIHandlerMixin:
             await traffic_learner.on_messages(messages)
         except Exception as exc:
             logger.debug("[%s] Traffic learner (chat): %s", request_id, exc)
+
+    async def _observe_openai_ws_response_create(
+        self,
+        inner_payload: dict[str, Any],
+        *,
+        seen_call_ids: set[str],
+        baseline: bool,
+        request_id: str,
+    ) -> None:
+        """Feed one Codex WS ``response.create`` turn into the traffic learner.
+
+        A long-lived Codex WebSocket resends the full transcript on every
+        ``response.create`` (and replays it wholesale on reconnect/resume), so
+        the HTTP one-shot ingestion would count the same tool results as new
+        evidence over and over. This dedups per connection by tool-call id:
+
+        * ``baseline=True`` (the first frame) records the already-present
+          transcript as seen WITHOUT learning from it, so a reconnect that
+          replays old turns adds no spurious evidence.
+        * later frames learn only the tool results whose call id first appears
+          after the baseline, then mark them seen.
+
+        Preference extraction (:meth:`on_messages`) is skipped on the baseline
+        frame and runs on later frames, where it already looks only at the most
+        recent messages (the new turn).
+        """
+        traffic_learner = getattr(self, "traffic_learner", None)
+        if traffic_learner is None:
+            return
+        try:
+            memory_handler = getattr(self, "memory_handler", None)
+            if (
+                traffic_learner._backend is None
+                and memory_handler
+                and memory_handler.initialized
+                and memory_handler.backend
+            ):
+                traffic_learner.set_backend(memory_handler.backend)
+
+            learner_messages = _responses_input_to_learner_messages(
+                inner_payload.get("instructions"),
+                inner_payload.get("input", ""),
+            )
+            tool_results = traffic_learner.extract_tool_results_from_messages(learner_messages)
+            for tool_result in tool_results:
+                call_id = tool_result.get("call_id") or ""
+                # A result already seen on this connection (or baselined) is not
+                # re-learned. Results without an id fall back to learn-once-per
+                # -frame on non-baseline frames (still deduped by the learner's
+                # own pattern accumulation).
+                if call_id:
+                    if call_id in seen_call_ids:
+                        continue
+                    seen_call_ids.add(call_id)
+                if baseline:
+                    continue
+                await traffic_learner.on_tool_result(
+                    tool_name=tool_result["tool_name"],
+                    tool_input=tool_result["input"],
+                    tool_output=tool_result["output"],
+                    is_error=tool_result["is_error"],
+                )
+            if not baseline:
+                await traffic_learner.on_messages(learner_messages)
+        except Exception as exc:
+            logger.debug("[%s] Traffic learner (ws): %s", request_id, exc)
 
     @staticmethod
     def _headroom_bypass_enabled(headers: Any) -> bool:
@@ -2445,7 +2659,19 @@ class OpenAIHandlerMixin:
                 tools=working.get("tools"),
                 config=getattr(self, "config", None),
             )
-            run_request_hooks(_req_ctx)
+            # Streaming turns get fold-only hooks, same rule as the
+            # chat-completions path. A hook that defers work to `on_response`
+            # cannot run here: the response side is wired on the buffered branch
+            # only, so on a real stream the shrink would land with no reload and
+            # the model's injected tool call would be streamed straight to a
+            # client that has no such tool. `stream` is not a parameter of this
+            # method, but the payload it is compressing carries the flag.
+            #
+            # Read before CCR may force `stream:false` further down, so this is
+            # the client's request rather than the effective one — conservative
+            # in the safe direction: at worst a buffered-by-CCR turn misses a
+            # saving, never a stranded tool call.
+            run_request_hooks(_req_ctx, stream_safe_only=bool(payload.get("stream")))
             if _req_ctx.tools is not working.get("tools"):
                 working["tools"] = _req_ctx.tools
             # A hook may also fold the messages (replace or in-place). Write back a
@@ -3344,19 +3570,34 @@ class OpenAIHandlerMixin:
         # anchored on the previous turn's tool list never busts.
         tools = body.get("tools")
         _original_tools = tools  # Preserve for diagnostic / future retry
+        can_inject_ccr_tool = _should_inject_openai_chat_ccr_tool(
+            ccr_inject_tool=self.config.ccr_inject_tool,
+            stream=stream,
+        )
         if (
             self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
         ) and not _bypass:
+            if self.config.ccr_inject_tool and stream:
+                logger.info(
+                    f"[{request_id}] CCR: skipping retrieval-tool injection for "
+                    "OpenAI chat streaming; this path cannot intercept tool calls"
+                )
             injector = CCRToolInjector(
                 provider="openai",
                 inject_tool=False,  # routed through sticky helper below
-                inject_system_instructions=self.config.ccr_inject_system_instructions,
+                inject_system_instructions=(
+                    self.config.ccr_inject_system_instructions and not stream
+                ),
             )
             injector.scan_for_markers(optimized_messages)
-            if self.config.ccr_inject_system_instructions and injector.has_compressed_content:
+            if (
+                self.config.ccr_inject_system_instructions
+                and not stream
+                and injector.has_compressed_content
+            ):
                 optimized_messages = injector.inject_into_system_message(optimized_messages)
 
-            if self.config.ccr_inject_tool:
+            if can_inject_ccr_tool:
                 from headroom.proxy.helpers import (
                     apply_session_sticky_ccr_tool,
                     has_new_ccr_markers,
@@ -3655,8 +3896,11 @@ class OpenAIHandlerMixin:
         # (result.tokens_before), which mismatches optimized_tokens (provider tokenizer)
         # and yields impossible tok_after>tok_before. Recount original from the
         # pre-compression snapshot so the message delta is on one scale.
-        original_tokens = tokenizer.count_messages(original_client_messages)
-        optimized_tokens = tokenizer.count_messages(body["messages"])
+        # Off the event loop (#2810): see the matching note in the Anthropic handler.
+        original_tokens = await asyncio.to_thread(
+            tokenizer.count_messages, original_client_messages
+        )
+        optimized_tokens = await asyncio.to_thread(tokenizer.count_messages, body["messages"])
         if tool_tokens_before_compaction > 0:
             try:
                 tool_tokens_after_compaction = tokenizer.count_text(_json_debug_dumps(tools))
@@ -3972,6 +4216,14 @@ class OpenAIHandlerMixin:
                             # Turn hooks (opt-in extensions) may inspect the turn
                             # or re-drive the model before we hand back the
                             # response. Inert when no hook is registered.
+                            #
+                            # Known gap: unlike the two HTTP paths, a re-drive
+                            # here is NOT folded into this request's token
+                            # accounting — `api_call_fn` goes through the custom
+                            # backend, whose usage is recorded elsewhere. Wire a
+                            # TurnHookUsage through `send_openai_message` before
+                            # relying on cost numbers from a backend deployment
+                            # that runs re-driving hooks.
                             from headroom.proxy.turn_hooks import (
                                 TurnContext,
                                 run_response_hooks,
@@ -4004,6 +4256,19 @@ class OpenAIHandlerMixin:
                             # No silent fallback — fail loud per
                             # feedback_no_silent_fallbacks.md.
                             raise
+
+                    # Inline marker resolution runs OUTSIDE the tool-call
+                    # gate above: the callers this flag exists for (#2509,
+                    # Headroom as a LiteLLM guardrail hop) never emit a
+                    # headroom_retrieve tool call, so gating on one would
+                    # make the flag a no-op for exactly its use case.
+                    # Non-streaming responses only.
+                    if (
+                        getattr(self.config, "ccr_resolve_markers_inline", False)
+                        and backend_response.body
+                        and backend_response.status_code == 200
+                    ):
+                        backend_response.body = resolve_markers_in_response(backend_response.body)
 
                     # Extract usage from the FINAL backend body (after
                     # any CCR resolution) so the prefix tracker counts
@@ -4193,12 +4458,20 @@ class OpenAIHandlerMixin:
                     run_response_hooks,
                 )
 
+                # Tokens the hook's own re-drives cost. Stays at zero unless a
+                # hook actually calls the model again.
+                _hook_usage = TurnHookUsage()
+
                 if _registered_turn_hooks() and response.status_code == 200:
                     try:
                         _hook_resp_json = response.json()
                     except (ValueError, json.JSONDecodeError):
                         _hook_resp_json = None
                     if isinstance(_hook_resp_json, dict):
+                        # The call we already made counts too. If the hook
+                        # replaces the response, this original is the one nobody
+                        # else will read.
+                        _hook_usage.record(_hook_resp_json, **CHAT_USAGE_KEYS)
                         _hook_ctx = _TurnContext(
                             provider="openai",
                             model=str(model),
@@ -4209,12 +4482,31 @@ class OpenAIHandlerMixin:
 
                         async def _hook_call_model(_msgs):
                             body["messages"] = _msgs
+                            if _hook_ctx.tools is not None:
+                                body["tools"] = _hook_ctx.tools
                             _r = await self._retry_request("POST", url, headers, body)
-                            return _r.json()
+                            _r_json = _r.json()
+                            _hook_usage.record(_r_json, **CHAT_USAGE_KEYS)
+                            return _r_json
 
-                        _hook_final = await run_response_hooks(
-                            _hook_ctx, _hook_resp_json, _hook_call_model
-                        )
+                        # Same restore as the Responses path: the re-drive rewrote
+                        # body so the next upstream call carried the hook's turn,
+                        # but everything below is accounting for the request the
+                        # client made, not the proxy's internal detour.
+                        _hook_body_messages = body.get("messages")
+                        _hook_body_tools = body.get("tools")
+                        try:
+                            _hook_final = await run_response_hooks(
+                                _hook_ctx, _hook_resp_json, _hook_call_model
+                            )
+                        finally:
+                            if _hook_body_messages is not None:
+                                body["messages"] = _hook_body_messages
+                            if _hook_body_tools is not None:
+                                body["tools"] = _hook_body_tools
+                        # Drop whichever response the usage block below reads;
+                        # what is left is the spend nothing else records.
+                        _hook_usage.settle(_hook_final)
                         if _hook_final is not _hook_resp_json:
                             response = httpx.Response(
                                 status_code=200,
@@ -4373,6 +4665,20 @@ class OpenAIHandlerMixin:
                 except (KeyError, TypeError, AttributeError) as e:
                     logger.debug(
                         f"[{request_id}] Failed to extract cached tokens from OpenAI response: {e}"
+                    )
+
+                # Add what the hook's re-drives cost — see the matching block on
+                # the Responses path. A tool-search reload is a whole extra model
+                # call; counting only the last one lets the feature hide its own
+                # overhead behind the saving it is claiming.
+                if _hook_usage.extra_calls:
+                    total_input_tokens += _hook_usage.input_tokens
+                    output_tokens += _hook_usage.output_tokens
+                    cache_read_tokens += _hook_usage.cache_read_tokens
+                    logger.debug(
+                        f"[{request_id}] turn hook: {_hook_usage.extra_calls} unaccounted call(s): "
+                        f"+{_hook_usage.input_tokens} in / "
+                        f"+{_hook_usage.output_tokens} out"
                     )
 
                 # Update prefix cache tracker for next turn
@@ -4547,6 +4853,22 @@ class OpenAIHandlerMixin:
                     response_headers["x-headroom-cached"] = "true"
                 if _compression_failed:
                     response_headers["x-headroom-compression-failed"] = "true"
+
+                # Inline marker resolution, non-streaming only. The direct
+                # path has no CCR tool-call handling at all, which is
+                # exactly the #2509 shape: markers would otherwise reach
+                # the client as raw text.
+                if (
+                    getattr(self.config, "ccr_resolve_markers_inline", False)
+                    and resp_json
+                    and response.status_code == 200
+                ):
+                    resolved_json = resolve_markers_in_response(resp_json)
+                    return Response(
+                        content=json.dumps(resolved_json).encode(),
+                        status_code=response.status_code,
+                        headers=response_headers,
+                    )
 
                 return Response(
                     content=response.content,
@@ -5297,6 +5619,104 @@ class OpenAIHandlerMixin:
                         status_code=response.status_code,
                         metadata={"stream": stream, "auth_mode": auth_mode.value},
                     )
+                    # Turn hooks, response side. `_compress_openai_responses_payload`
+                    # already runs `run_request_hooks` for this surface, so without
+                    # this block a hook could shrink a Responses turn and then never
+                    # be asked to resolve what the model did about it — a deferral
+                    # with no reload, which strands the model's call at a client
+                    # that has no such tool. Mirrors the chat-completions wiring in
+                    # `handle_openai_chat`; buffered path only, for the same reason
+                    # CCR forces `stream:false` above: you cannot re-drive a turn
+                    # whose bytes are already flowing.
+                    from headroom.proxy.turn_hooks import (
+                        TurnContext as _RespTurnContext,
+                    )
+                    from headroom.proxy.turn_hooks import (
+                        registered_turn_hooks as _resp_registered_hooks,
+                    )
+                    from headroom.proxy.turn_hooks import (
+                        run_response_hooks as _run_resp_hooks,
+                    )
+
+                    # Tokens the hook's own re-drives cost. Stays at zero unless a
+                    # hook actually calls the model again.
+                    _resp_hook_usage = TurnHookUsage()
+
+                    if _resp_registered_hooks() and response.status_code == 200:
+                        try:
+                            _resp_hook_json = response.json()
+                        except (ValueError, json.JSONDecodeError):
+                            _resp_hook_json = None
+                        if isinstance(_resp_hook_json, dict):
+                            # The Responses API names the turn's items `input`;
+                            # fall back to `messages` so an OpenAI-compatible
+                            # upstream that accepts either still round-trips.
+                            _resp_hook_usage.record(_resp_hook_json, **RESPONSES_USAGE_KEYS)
+                            _resp_key = "input" if body.get("input") is not None else "messages"
+                            _resp_hook_ctx = _RespTurnContext(
+                                provider="openai",
+                                model=str(model),
+                                messages=body.get(_resp_key) or [],
+                                tools=body.get("tools"),
+                                config=self.config,
+                            )
+
+                            async def _resp_hook_call_model(
+                                _items: list[dict[str, Any]],
+                                _key: str = _resp_key,
+                            ) -> dict[str, Any]:
+                                # Re-drive with the hook's items. Tools may also
+                                # have grown (a reload makes resolved schemas
+                                # callable), so send those back too.
+                                body[_key] = _items
+                                if _resp_hook_ctx.tools is not None:
+                                    body["tools"] = _resp_hook_ctx.tools
+                                _rr = await self._retry_request(
+                                    "POST",
+                                    url,
+                                    headers,
+                                    body,
+                                    request_id=request_id,
+                                    forwarder_name="openai_responses_turn_hook",
+                                    path_for_log=url,
+                                )
+                                _rr_json = _rr.json()
+                                _resp_hook_usage.record(_rr_json, **RESPONSES_USAGE_KEYS)
+                                return _rr_json
+
+                            # A re-drive rewrites body[input]/body[tools] so the
+                            # next upstream call carries the hook's items. Put
+                            # the client's turn back afterwards: everything below
+                            # — CCR's `_responses_input_to_items(body["input"])`,
+                            # usage accounting, observability — is describing the
+                            # request the client actually made, not the proxy's
+                            # internal detour. Without this, a turn that both
+                            # reloaded a tool and hit CCR retrieval would hand
+                            # CCR the hook's synthetic items.
+                            _resp_body_input = body.get(_resp_key)
+                            _resp_body_tools = body.get("tools")
+                            try:
+                                _resp_hook_final = await _run_resp_hooks(
+                                    _resp_hook_ctx, _resp_hook_json, _resp_hook_call_model
+                                )
+                            finally:
+                                if _resp_body_input is not None:
+                                    body[_resp_key] = _resp_body_input
+                                if _resp_body_tools is not None:
+                                    body["tools"] = _resp_body_tools
+                            # Drop whichever response the usage block below reads.
+                            _resp_hook_usage.settle(_resp_hook_final)
+                            if _resp_hook_final is not _resp_hook_json:
+                                response = httpx.Response(
+                                    status_code=200,
+                                    headers={
+                                        k: v
+                                        for k, v in response.headers.items()
+                                        if k.lower() not in ("content-encoding", "content-length")
+                                    },
+                                    content=json.dumps(_resp_hook_final).encode(),
+                                )
+
                     total_latency = (time.time() - start_time) * 1000
 
                     total_input_tokens = original_tokens  # fallback
@@ -5323,6 +5743,21 @@ class OpenAIHandlerMixin:
                     except (KeyError, TypeError, AttributeError) as e:
                         logger.debug(
                             f"[{request_id}] Failed to extract cached tokens from OpenAI passthrough response: {e}"
+                        )
+
+                    # Add what the hook's re-drives cost. The usage read above
+                    # describes the last upstream call; a hook that re-drove the
+                    # model made earlier ones that were just as billed. Leaving
+                    # them out lets a token-saving feature hide its own overhead,
+                    # so cost and savings both read better than they are.
+                    if _resp_hook_usage.extra_calls:
+                        total_input_tokens += _resp_hook_usage.input_tokens
+                        output_tokens += _resp_hook_usage.output_tokens
+                        cache_read_tokens += _resp_hook_usage.cache_read_tokens
+                        logger.debug(
+                            f"[{request_id}] turn hook: {_resp_hook_usage.extra_calls} unaccounted call(s): "
+                            f"+{_resp_hook_usage.input_tokens} in / "
+                            f"+{_resp_hook_usage.output_tokens} out"
                         )
 
                     # CCR Response Handling: intercept headroom_retrieve tool
@@ -5452,10 +5887,10 @@ class OpenAIHandlerMixin:
                             for fc in memory_fc_items:
                                 call_id = fc.get("call_id", fc.get("id", ""))
                                 name = fc.get("name", "")
-                                args_str = fc.get("arguments", "{}")
+                                args_str = fc.get("arguments") or "{}"
                                 try:
                                     args = json.loads(args_str)
-                                except json.JSONDecodeError:
+                                except (json.JSONDecodeError, TypeError):
                                     args = {}
 
                                 await self.memory_handler._ensure_initialized()
@@ -5625,6 +6060,21 @@ class OpenAIHandlerMixin:
                             _buffered_ccr_sse(),
                             media_type="text/event-stream",
                             headers=sse_headers,
+                        )
+
+                    # Inline marker resolution, non-streaming only. Runs
+                    # outside the has_ccr_tool_calls gate above on purpose:
+                    # the #2509 case has no retrieve tool call at all.
+                    if (
+                        getattr(self.config, "ccr_resolve_markers_inline", False)
+                        and resp_json
+                        and response.status_code == 200
+                    ):
+                        resolved_json = resolve_markers_in_response(resp_json)
+                        return Response(
+                            content=json.dumps(resolved_json).encode(),
+                            status_code=response.status_code,
+                            headers=response_headers,
                         )
 
                     return Response(
@@ -6330,6 +6780,27 @@ class OpenAIHandlerMixin:
             ws_recorded_tokens_saved_total = 0
             ws_recorded_attempted_input_tokens_total = 0
             ws_response_create_frames = 1
+            # Per-connection traffic-learner dedup: tool-call ids already
+            # observed on this WS, so a replayed transcript (each turn resends
+            # the full history; reconnect replays it wholesale) is not counted
+            # as new evidence. Seeded from the first frame as a baseline.
+            ws_learner_seen_call_ids: set[str] = set()
+            # Baseline the first frame's transcript into the learner: record its
+            # tool-call ids as seen WITHOUT learning, so a reconnect that replays
+            # this history adds no spurious evidence. Later frames learn only the
+            # results appended after this point. `body` here is the original
+            # client frame (parsed before memory injection / compression).
+            if isinstance(body, dict) and body:
+                _ws_first_inner = (
+                    body["response"] if isinstance(body.get("response"), dict) else body
+                )
+                if isinstance(_ws_first_inner, dict):
+                    await self._observe_openai_ws_response_create(
+                        _ws_first_inner,
+                        seen_call_ids=ws_learner_seen_call_ids,
+                        baseline=True,
+                        request_id=request_id,
+                    )
             ws_client_frames_total = 1
             ws_upstream_frames_total = 0
             ws_cancel_frames = 0
@@ -7004,6 +7475,15 @@ class OpenAIHandlerMixin:
                                 frame_type="response.create",
                             )
                             return raw_msg, False, "invalid_inner_payload"
+                        # Learn from this turn's newly appended tool results.
+                        # Dedup against the per-connection baseline so the
+                        # replayed transcript prefix is not re-counted.
+                        await self._observe_openai_ws_response_create(
+                            inner_payload,
+                            seen_call_ids=ws_learner_seen_call_ids,
+                            baseline=False,
+                            request_id=request_id,
+                        )
                         store_forced = _ensure_chatgpt_responses_store_false(
                             inner_payload,
                             is_chatgpt_auth=is_chatgpt_auth,
@@ -7541,7 +8021,11 @@ class OpenAIHandlerMixin:
                             # as HTTP turns.
                             await self._record_request_outcome(
                                 RequestOutcome(
-                                    request_id=request_id,
+                                    # Per-emission ids keep dashboard request-log keys unique.
+                                    request_id=await self._next_request_id(),
+                                    # PERF remains grouped under the stable WS
+                                    # session id even though feed rows are unique.
+                                    perf_request_id=request_id,
                                     provider="openai",
                                     model=model_for_metrics,
                                     original_tokens=max(0, input_delta) + max(0, saved_delta),
@@ -7755,10 +8239,10 @@ class OpenAIHandlerMixin:
                                             for fc in pending_fcs:
                                                 call_id = fc.get("call_id", fc.get("id", ""))
                                                 fc_name = fc.get("name", "")
-                                                args_str = fc.get("arguments", "{}")
+                                                args_str = fc.get("arguments") or "{}"
                                                 try:
                                                     fc_args = json.loads(args_str)
-                                                except json.JSONDecodeError:
+                                                except (json.JSONDecodeError, TypeError):
                                                     fc_args = {}
 
                                                 await self.memory_handler._ensure_initialized()
@@ -8117,7 +8601,9 @@ class OpenAIHandlerMixin:
                     ws_messages_for_log.append({"role": "user", "content": ws_input_for_log})
                 await self._record_request_outcome(
                     RequestOutcome(
-                        request_id=request_id,
+                        # Per-emission ids keep dashboard request-log keys unique.
+                        request_id=await self._next_request_id(),
+                        perf_request_id=request_id,
                         provider="openai",
                         model=model_name,
                         original_tokens=residual_input_tokens + residual_tokens_saved,
@@ -8781,6 +9267,7 @@ class OpenAIHandlerMixin:
                 ),
                 timeout=COMPRESSION_TIMEOUT_SECONDS,
             )
+            ccr_hashes = _response_ccr_hashes(result.messages, result.markers_inserted)
 
             tokens_before = result.tokens_before
             tokens_after = result.tokens_after
@@ -8828,7 +9315,7 @@ class OpenAIHandlerMixin:
                     ),
                     "transforms_applied": result.transforms_applied,
                     "transforms_summary": result.transforms_summary,
-                    "ccr_hashes": result.markers_inserted,
+                    "ccr_hashes": ccr_hashes,
                 }
             )
         except TimeoutError:

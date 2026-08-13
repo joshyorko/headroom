@@ -335,6 +335,78 @@ def test_wrap_copilot_prefers_existing_oauth_session(
     assert f"COPILOT_PROVIDER_API_URL={DEFAULT_API_URL}" in captured["env_vars_display"]
 
 
+@pytest.mark.parametrize(
+    ("model", "expected_wire_api"),
+    [
+        ("gpt-5.4", "responses"),
+        ("gpt-4.1", "completions"),
+    ],
+)
+def test_wrap_copilot_oauth_defaults_wire_api_for_selected_model(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    expected_wire_api: str,
+) -> None:
+    """OAuth sessions use the same model-aware wire API default as subscriptions."""
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_client_bearer_token", return_value="gho-existing"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--no-rtk", "--", "--model", model],
+        )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_PROVIDER_WIRE_API"] == expected_wire_api
+    assert f"COPILOT_PROVIDER_WIRE_API={expected_wire_api}" in captured["env_vars_display"]
+
+
+@pytest.mark.parametrize("wire_api", ["completions", "responses"])
+def test_wrap_copilot_oauth_honors_existing_wire_api(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+    wire_api: str,
+) -> None:
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    monkeypatch.setenv("COPILOT_PROVIDER_WIRE_API", wire_api)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_client_bearer_token", return_value="gho-existing"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--no-rtk", "--", "--model", "gpt-5.4"],
+        )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_PROVIDER_WIRE_API"] == wire_api
+
+
 def test_wrap_copilot_subscription_uses_github_auth_without_provider_key(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],

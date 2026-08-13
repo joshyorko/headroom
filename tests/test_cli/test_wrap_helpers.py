@@ -16,6 +16,7 @@ import errno
 import json
 import os
 import signal
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +108,35 @@ def test_wrap_claude_allows_claude_print_short_flag_in_passthrough_args() -> Non
     )
 
     assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# _apply_1m_to_claude_args — add the [1m] suffix to an explicit pass-through
+# --model so it survives Claude Code's CLI-over-env precedence (#2915).
+# ---------------------------------------------------------------------------
+def test_apply_1m_rewrites_model_flag_value() -> None:
+    args, rewritten = wrap_mod._apply_1m_to_claude_args(("--model", "opusplan"))
+    assert args == ("--model", "opusplan[1m]")
+    assert rewritten == "opusplan[1m]"
+
+
+def test_apply_1m_rewrites_equals_model_flag() -> None:
+    args, rewritten = wrap_mod._apply_1m_to_claude_args(("--model=opusplan",))
+    assert args == ("--model=opusplan[1m]",)
+    assert rewritten == "opusplan[1m]"
+
+
+def test_apply_1m_is_idempotent_on_already_suffixed_model() -> None:
+    args, rewritten = wrap_mod._apply_1m_to_claude_args(("--model", "opusplan[1m]"))
+    assert args == ("--model", "opusplan[1m]")
+    assert rewritten == "opusplan[1m]"
+
+
+def test_apply_1m_noop_without_model_flag() -> None:
+    original = ("--permission-mode", "auto", "--resume")
+    args, rewritten = wrap_mod._apply_1m_to_claude_args(original)
+    assert args == original
+    assert rewritten is None
 
 
 # ---------------------------------------------------------------------------
@@ -788,3 +818,43 @@ class TestFindAvailablePort:
         )
         with pytest.raises(RuntimeError, match="No available port found"):
             wrap_mod._find_available_port(8787, max_attempts=3)
+
+
+def test_ensure_proxy_serializes_startup_per_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A normal wrap must enter the per-port startup critical section."""
+    events: list[object] = []
+
+    @contextmanager
+    def fake_lock(port: int):
+        events.append(("lock-enter", port))
+        try:
+            yield
+        finally:
+            events.append(("lock-exit", port))
+
+    monkeypatch.setattr(wrap_mod, "_proxy_start_lock", fake_lock)
+    monkeypatch.setattr(
+        wrap_mod,
+        "_ensure_proxy_unlocked",
+        lambda port, no_proxy, **kwargs: events.append(("ensure", port, no_proxy)) or (None, port),
+    )
+
+    assert wrap_mod._ensure_proxy(8787, False) == (None, 8787)
+    assert events == [("lock-enter", 8787), ("ensure", 8787, False), ("lock-exit", 8787)]
+
+
+def test_no_proxy_does_not_create_startup_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit --no-proxy reuses an existing service without taking the lock."""
+    entered = False
+
+    @contextmanager
+    def fail_lock(port: int):
+        nonlocal entered
+        entered = True
+        yield
+
+    monkeypatch.setattr(wrap_mod, "_proxy_start_lock", fail_lock)
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy_unlocked", lambda *args, **kwargs: (None, 8787))
+
+    assert wrap_mod._ensure_proxy(8787, True) == (None, 8787)
+    assert entered is False

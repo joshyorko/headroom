@@ -4,6 +4,7 @@ This module owns the small algebra used by Python proxy forwarders to decide
 which bytes leave Headroom:
 
 * unmutated body with original bytes -> byte-for-byte passthrough
+* signed thinking blocks with original bytes -> byte-for-byte passthrough
 * mutated body or missing original bytes -> canonical JSON bytes
 * explicit rollback mode -> legacy httpx-style JSON bytes
 """
@@ -50,6 +51,27 @@ def serialize_body_canonical(body: dict[str, Any]) -> bytes:
     return json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def has_signed_thinking_blocks(body: dict[str, Any]) -> bool:
+    """Return whether message history contains Anthropic signed thinking blocks."""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in {
+                "thinking",
+                "redacted_thinking",
+            }:
+                return True
+    return False
+
+
 class BodyMutationTracker:
     """Records whether a request body was mutated and why."""
 
@@ -85,6 +107,9 @@ def select_outbound_body(
 ) -> OutboundBody:
     """Select the exact bytes to forward upstream."""
     mode = forwarder_mode if forwarder_mode is not None else get_python_forwarder_mode()
+    if original_body_bytes is not None and has_signed_thinking_blocks(body):
+        return OutboundBody(content=original_body_bytes, source="passthrough")
+
     if mode == "legacy_json_kwarg":
         content = json.dumps(body, separators=(", ", ": "), ensure_ascii=True).encode("utf-8")
         return OutboundBody(content=content, source="legacy")

@@ -105,6 +105,16 @@ def main() -> int:
     if command == "pull":
         return 0
 
+    if command == "network" and len(args) > 1 and args[1] == "inspect":
+        # Match the default bridge gateway used by the native installer when
+        # it configures the dashboard metadata allowlist.
+        gateway = os.environ.get("FAKE_DOCKER_GATEWAY", "172.17.0.1")
+        if gateway == "FAIL":
+            return 1
+        if "--format" in args and gateway:
+            print(gateway)
+        return 0
+
     if command == "run":
         detached = "-d" in args
         if not detached:
@@ -112,17 +122,29 @@ def main() -> int:
 
         name = None
         publish = None
+        container_env = {}
         for index, arg in enumerate(args):
             if arg == "--name":
                 name = args[index + 1]
             elif arg == "-p":
                 publish = args[index + 1]
+            elif arg == "--env":
+                spec = args[index + 1]
+                if "=" in spec:
+                    env_name, value = spec.split("=", 1)
+                    container_env[env_name] = value
+                elif spec in os.environ:
+                    container_env[spec] = os.environ[spec]
 
         if name is None or publish is None:
             raise SystemExit("missing --name or -p in fake docker run")
 
         port = host_port_from_publish(publish)
-        state["containers"][name] = {"pid": start_server(port), "port": port}
+        state["containers"][name] = {
+            "pid": start_server(port),
+            "port": port,
+            "env": container_env,
+        }
         save_state(state)
         print(name)
         return 0
@@ -223,6 +245,84 @@ def _read_fake_docker_log(env: dict[str, str]) -> list[list[str]]:
     if not log_path.exists():
         return []
     return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def _persistent_run_call(env: dict[str, str], profile: str) -> list[str]:
+    container_name = f"headroom-{profile}"
+    return next(
+        call
+        for call in _read_fake_docker_log(env)
+        if call[:2] == ["run", "-d"]
+        and "--name" in call
+        and call[call.index("--name") + 1] == container_name
+    )
+
+
+def _persistent_container_env(env: dict[str, str], profile: str) -> dict[str, str]:
+    state = json.loads(Path(env["FAKE_DOCKER_STATE"]).read_text(encoding="utf-8"))
+    return state["containers"][f"headroom-{profile}"]["env"]
+
+
+def _exercise_dashboard_gateway_overrides(wrapper_command: list[str], env: dict[str, str]) -> None:
+    trusted_cidrs = "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS"
+
+    try:
+        for profile, configured_value in (("configured", "10.20.0.0/16"), ("empty", "")):
+            env[trusted_cidrs] = configured_value
+            port = _free_port()
+            _run(
+                [
+                    *wrapper_command,
+                    "install",
+                    "apply",
+                    "--profile",
+                    profile,
+                    "--port",
+                    str(port),
+                    "--image",
+                    "fake/headroom:test",
+                ],
+                env=env,
+            )
+
+            install_call = _persistent_run_call(env, profile)
+            assert install_call[install_call.index("-p") + 1] == f"127.0.0.1:{port}:{port}"
+            # Docker's name-only --env form preserves the caller's value,
+            # including an explicitly empty value, instead of installing the
+            # discovered bridge gateway default.
+            assert trusted_cidrs in install_call
+            assert not any(arg.startswith(f"{trusted_cidrs}=") for arg in install_call)
+            assert _persistent_container_env(env, profile)[trusted_cidrs] == configured_value
+            _run([*wrapper_command, "install", "remove", "--profile", profile], env=env)
+
+        env.pop(trusted_cidrs, None)
+        env["FAKE_DOCKER_GATEWAY"] = "FAIL"
+        port = _free_port()
+        result = _run(
+            [
+                *wrapper_command,
+                "install",
+                "apply",
+                "--profile",
+                "no-gateway",
+                "--port",
+                str(port),
+                "--image",
+                "fake/headroom:test",
+            ],
+            env=env,
+        )
+        install_call = _persistent_run_call(env, "no-gateway")
+        assert install_call[install_call.index("-p") + 1] == f"127.0.0.1:{port}:{port}"
+        assert not any(
+            arg == trusted_cidrs or arg.startswith(f"{trusted_cidrs}=") for arg in install_call
+        )
+        assert trusted_cidrs not in _persistent_container_env(env, "no-gateway")
+        assert "dashboard metadata remains restricted" in (result.stdout + result.stderr)
+        _run([*wrapper_command, "install", "remove", "--profile", "no-gateway"], env=env)
+    finally:
+        env.pop(trusted_cidrs, None)
+        env.pop("FAKE_DOCKER_GATEWAY", None)
 
 
 def _run(
@@ -402,11 +502,19 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
         install_call = next(
             call for call in docker_calls if call[:2] == ["run", "-d"] and "--name" in call
         )
+        assert install_call[install_call.index("-p") + 1] == f"127.0.0.1:{port}:{port}"
         assert "/tmp/headroom-home/.headroom/memory.db" in install_call
         # Canonical filesystem contract env vars (issue #175) forwarded into
         # the container so the proxy resolves state/config to the bind mount.
         assert "HEADROOM_WORKSPACE_DIR=/tmp/headroom-home/.headroom" in install_call
         assert "HEADROOM_CONFIG_DIR=/tmp/headroom-home/.headroom/config" in install_call
+        assert "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS=172.17.0.1/32" in install_call
+        assert (
+            _persistent_container_env(env, "smoke")["HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS"]
+            == "172.17.0.1/32"
+        )
+
+        _exercise_dashboard_gateway_overrides([str(wrapper)], env)
 
         status_result = _run(
             [str(wrapper), "install", "status", "--profile", "smoke"],
@@ -654,10 +762,21 @@ def test_powershell_native_installer_supports_persistent_docker_lifecycle(tmp_pa
         install_call = next(
             call for call in docker_calls if call[:2] == ["run", "-d"] and "--name" in call
         )
+        assert install_call[install_call.index("-p") + 1] == f"127.0.0.1:{port}:{port}"
         assert "/tmp/headroom-home/.headroom/memory.db" in install_call
         # Canonical filesystem contract env vars (issue #175).
         assert "HEADROOM_WORKSPACE_DIR=/tmp/headroom-home/.headroom" in install_call
         assert "HEADROOM_CONFIG_DIR=/tmp/headroom-home/.headroom/config" in install_call
+        assert "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS=172.17.0.1/32" in install_call
+        assert (
+            _persistent_container_env(env, "smoke")["HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS"]
+            == "172.17.0.1/32"
+        )
+
+        _exercise_dashboard_gateway_overrides(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper)],
+            env,
+        )
 
         status_result = _run(
             [

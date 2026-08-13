@@ -7,6 +7,7 @@ needing API key access.
 
 import json
 import os
+import shutil
 import subprocess
 import urllib.error
 import urllib.request
@@ -156,12 +157,11 @@ def mcp() -> None:
 )
 def mcp_report_rtk(proxy_url: str | None, scope: str, timeout: float) -> None:
     """Report local RTK aggregate counters to a remote Headroom proxy."""
-    from headroom.rtk import get_rtk_path
-
-    rtk_path = get_rtk_path()
-    if rtk_path is None:
+    resolved_rtk = shutil.which("rtk")
+    if resolved_rtk is None:
         click.echo("Error: rtk is not installed or not on PATH.", err=True)
         raise SystemExit(1)
+    rtk_path = Path(resolved_rtk)
 
     try:
         result = run(

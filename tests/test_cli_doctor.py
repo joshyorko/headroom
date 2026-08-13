@@ -390,6 +390,17 @@ class TestShellEnv:
         env = {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
         assert check_shell_env(env, 8787).status == WARN
 
+    def test_ollama_launch_url_names_the_collision(self):
+        # `ollama launch claude` points Claude Code at Ollama's :11434, which
+        # outranks the persistent Headroom route (issue #2199). The diagnostic
+        # must name Ollama, not tell the user to re-probe port 11434.
+        env = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11434"}
+        result = check_shell_env(env, 8787)
+        assert result.status == WARN
+        assert "Ollama" in result.summary
+        assert "#2199" in (result.hint or "")
+        assert "--port 11434" not in (result.hint or "")
+
 
 class TestSavings:
     def test_from_stats_passes_with_totals(self, tmp_path):

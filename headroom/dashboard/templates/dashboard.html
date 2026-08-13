@@ -2203,7 +2203,9 @@
 
                 truncateModel(model) {
                     if (!model) return '-';
-                    return model.replace(/^(anthropic\.|openai\.|bedrock\/)/, '')
+                    return model.replace(/^(bedrock\/)/, '')
+                               .replace(/^(au\.|us\.|eu\.|apac\.|global\.)/, '')
+                               .replace(/^(anthropic\.|openai\.)/, '')
                                .replace(/-\d{8}$/, '')
                                .substring(0, 20);
                 },

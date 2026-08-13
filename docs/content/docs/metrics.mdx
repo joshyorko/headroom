@@ -110,7 +110,11 @@ HEADROOM_OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod
 | `HEADROOM_OTEL_SERVICE_NAME` | `headroom-proxy` | OTEL `service.name` |
 | `HEADROOM_OTEL_RESOURCE_ATTRIBUTES` | unset | Comma-separated resource attributes |
 
-Exported counters include `headroom.proxy.requests`, `headroom.proxy.tokens.input`, `headroom.proxy.tokens.output`, `headroom.proxy.tokens.saved`, and `headroom.proxy.cache.read_tokens` / `write_tokens`.
+Exported counters include `headroom.proxy.requests`, `headroom.proxy.tokens.input`, and
+`headroom.proxy.tokens.output`. `headroom.proxy.tokens.saved` is the all-layer total:
+message/compression savings plus tool-schema deferral savings. The component counter
+`headroom.proxy.tokens.tool_schema_saved` exposes the deferral portion separately;
+`headroom.compression.tokens.saved` remains the compression-pipeline component.
 
 Confirm the exporter is live with `curl -s http://localhost:8787/stats | jq .otel`.
 

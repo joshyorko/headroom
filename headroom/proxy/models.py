@@ -186,6 +186,13 @@ class ProxyConfig:
     # markers can be toggled from the CLI (--no-ccr, which also drops the retrieve
     # tool). Threaded into the router in server.py; default preserves current behavior.
     ccr_inject_marker: bool = True
+    # Explicit opt-in fallback for callers with no path to redeem a marker via
+    # the headroom_retrieve tool (e.g. a LiteLLM guardrail/proxy hop with no
+    # tool-call turn — issue #2509). Off by default: guessing "this caller
+    # can't use tools" is fragile, so operators must opt in with
+    # --ccr-inline-resolve / HEADROOM_CCR_INLINE_RESOLVE. Applies to
+    # non-streaming responses only; buffered-CCR streaming is untouched.
+    ccr_resolve_markers_inline: bool = False
 
     # CCR Response Handling
     ccr_handle_responses: bool = True

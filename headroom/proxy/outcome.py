@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from headroom.proxy.tool_schema_savings_policy import (
@@ -87,6 +87,12 @@ class RequestOutcome:
     output_tokens: int
     tokens_saved: int
     attempted_input_tokens: int
+    # Optional correlation id for the human-readable PERF line. Most requests
+    # use ``request_id`` for both storage identity and log correlation. A
+    # long-lived WebSocket session is different: each emitted feed row needs a
+    # unique request id, while operators still need every line from the socket
+    # under one greppable session prefix.
+    perf_request_id: str | None = None
     # Optional so the 18 existing emit sites need no change: a handler that has
     # no provider count (or whose optimized_tokens is already provider-scaled)
     # leaves it 0 and billing falls back to optimized_tokens, exactly as before.
@@ -526,7 +532,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         request_logger.log(
             RequestLog(
                 request_id=outcome.request_id,
-                timestamp=datetime.now().isoformat(),
+                # Request logs are consumed by browsers in arbitrary time zones.
+                # Include the UTC offset so relative-age calculations represent
+                # the same instant regardless of where the proxy runs.
+                timestamp=datetime.now(timezone.utc).isoformat(),
                 provider=outcome.provider,
                 model=outcome.model,
                 input_tokens_original=outcome.original_tokens,
@@ -562,7 +571,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     tool_saved = tool_schema_saved_from_tags(outcome.tags or {})
     total_saved = headline_tokens_saved(outcome.tokens_saved, outcome.tags or {})
     logger.info(
-        f"[{outcome.request_id}] PERF "
+        f"[{outcome.perf_request_id or outcome.request_id}] PERF "
         f"model={outcome.model} msgs={outcome.num_messages} "
         f"tok_before={outcome.original_tokens} tok_after={outcome.optimized_tokens} "
         f"tok_saved={outcome.tokens_saved} "

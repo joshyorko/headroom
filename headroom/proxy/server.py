@@ -1163,6 +1163,19 @@ class HeadroomProxy(
         self._compression_timed_out_in_flight_max: int = 0
         self._compression_quarantine_activations: int = 0
         self._compression_quarantine_skips: int = 0
+        # Time cap on the timeout-debt quarantine. Python cannot preempt a
+        # worker, so one that never returns (a hung/pathological compression)
+        # would keep ``_compression_timed_out_in_flight > 0`` forever and pin the
+        # quarantine open — zeroing out ALL further compression (#2360). The
+        # deadline is (re)set on every fresh timeout; once it lapses with no new
+        # timeouts the leaked worker is presumed abandoned and compression
+        # resumes. The bounded executor still caps thread growth, and any new
+        # timeout re-arms the quarantine.
+        self._compression_quarantine_deadline: float = 0.0
+        self._compression_quarantine_max_seconds: float = _get_env_float(
+            "HEADROOM_COMPRESSION_QUARANTINE_MAX_SECONDS", 60.0
+        )
+        self._compression_quarantine_releases: int = 0
         self._compression_metrics_lock = threading.Lock()
 
         # Backend for Anthropic API (direct, LiteLLM, or any-llm)
@@ -1420,12 +1433,36 @@ class HeadroomProxy(
             ``asyncio.TimeoutError`` subclass) if a prior timed-out worker is
             still running.
         """
+        now = time.monotonic()
         with self._compression_metrics_lock:
             timed_out_in_flight = self._compression_timed_out_in_flight
-            if timed_out_in_flight > 0:
+            quarantined = timed_out_in_flight > 0 and now < self._compression_quarantine_deadline
+            # Debt outlived the cap: presume the worker leaked/hung and stop
+            # blocking on it. Count the release once per lapse (while debt stands
+            # and the deadline has passed) so operators can see it happened.
+            released = (
+                timed_out_in_flight > 0
+                and not quarantined
+                and self._compression_quarantine_deadline > 0.0
+            )
+            if quarantined:
                 self._compression_quarantine_skips += 1
+            if released:
+                self._compression_quarantine_releases += 1
+                # Clear the deadline so the release is recorded once, not on
+                # every subsequent request until the worker (maybe never) exits.
+                self._compression_quarantine_deadline = 0.0
 
-        if timed_out_in_flight > 0:
+        if released:
+            self.metrics.record_compression_quarantine("released")
+            logger.warning(
+                "Compression quarantine released after %.0fs cap; %d timed-out "
+                "worker(s) presumed leaked. Compression resumes.",
+                self._compression_quarantine_max_seconds,
+                timed_out_in_flight,
+            )
+
+        if quarantined:
             self.metrics.record_compression_quarantine("skipped")
             raise CompressionQuarantinedError(
                 f"compression quarantined: {timed_out_in_flight} timed-out worker(s) still running"
@@ -1463,6 +1500,12 @@ class HeadroomProxy(
             self._compression_timed_out_in_flight_max = max(
                 self._compression_timed_out_in_flight_max,
                 self._compression_timed_out_in_flight,
+            )
+            # (Re)arm the quarantine time cap on every fresh timeout, so ongoing
+            # slowness keeps quarantining while a single leaked worker cannot
+            # hold it past the cap (#2360).
+            self._compression_quarantine_deadline = (
+                time.monotonic() + self._compression_quarantine_max_seconds
             )
             state["timeout_debt_recorded"] = True
             if was_clear:
@@ -2569,6 +2612,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.ready = False
         app.state.startup_error = None
         await initialize_context_tool_session_baseline()
+        app.state.periodic_toin_stats_task = None
 
         try:
             try:
@@ -2576,7 +2620,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 # Startup
                 await proxy.startup()
                 if config.periodic_toin_stats_enabled:
-                    asyncio.create_task(_log_toin_stats_periodically())
+                    app.state.periodic_toin_stats_task = asyncio.create_task(
+                        _log_toin_stats_periodically()
+                    )
                 if proxy.usage_reporter:
                     await proxy.usage_reporter.start(proxy)
                 if proxy.traffic_learner:
@@ -2628,6 +2674,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         timeout,
                         exc,
                     )
+
+            periodic_toin_stats_task = app.state.periodic_toin_stats_task
+            if periodic_toin_stats_task is not None:
+                periodic_toin_stats_task.cancel()
+                await _timed(
+                    asyncio.gather(periodic_toin_stats_task, return_exceptions=True),
+                    label="periodic_toin_stats.stop",
+                    timeout=3.0,
+                )
+                app.state.periodic_toin_stats_task = None
 
             if _cc_reconciler is not None:
                 await _timed(_cc_reconciler.stop(), label="cc_reconciler.stop", timeout=3.0)
@@ -2692,15 +2748,29 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         *,
         enabled: bool,
         ready: bool,
+        optional: bool = False,
         **details: Any,
     ) -> dict[str, Any]:
-        status = "disabled" if not enabled else ("healthy" if ready else "unhealthy")
-        return {
+        if not enabled:
+            status = "disabled"
+        elif ready:
+            status = "healthy"
+        elif optional:
+            # Optional/non-gating components report "degraded" rather than
+            # "unhealthy" so the top-level status: "healthy" / ready: true
+            # payload is not contradicted by a component-level failure label.
+            status = "degraded"
+        else:
+            status = "unhealthy"
+        result: dict[str, Any] = {
             "enabled": enabled,
             "ready": (ready if enabled else True),
             "status": status,
-            **details,
         }
+        if optional:
+            result["optional"] = True
+        result.update(details)
+        return result
 
     def _kompress_health_routers() -> list[ContentRouter]:
         routers: list[ContentRouter] = []
@@ -2810,6 +2880,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "kompress": _component_health(
                 enabled=kompress_enabled,
                 ready=proxy.warmup.kompress.status == "loaded",
+                optional=True,
                 backend=proxy.warmup.kompress.info.get("backend", None),
             ),
         }
@@ -3353,6 +3424,40 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     from headroom.proxy.loopback_guard import require_loopback as _require_loopback
     from headroom.proxy.loopback_guard import require_same_origin as _require_same_origin
 
+    def _require_loopback_or_trusted_dashboard_client(request: Request) -> None:
+        """Allow loopback callers, or gateway-forwarded dashboard clients.
+
+        Mirrors the trust chain already used by /stats and /stats-lifetime
+        (see _request_can_view_dashboard_metadata) so the settings UI works
+        the same way behind a reverse-proxy/gateway (issue #2466).
+        """
+        if not _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs):
+            raise HTTPException(status_code=404)
+
+    def _require_same_origin_or_trusted_dashboard_client(request: Request) -> None:
+        """Same-origin CSRF guard for settings writes, trusted-dashboard aware.
+
+        ``require_same_origin`` only accepts an ``Origin`` that itself names a
+        loopback host, so a browser POST from a trusted-gateway dashboard
+        client was rejected even though the paired GET routes allow that same
+        caller (issue #2466). For non-loopback callers, accept an ``Origin``
+        that matches this request's own Host header, provided the caller is
+        already an IP-literal-Host, CIDR-trusted dashboard client. Loopback
+        callers keep the stricter loopback-only origin check unchanged.
+        """
+        if not _request_is_loopback(request):
+            origin = request.headers.get("origin")
+            host_header = request.headers.get("host")
+            if (
+                origin
+                and origin != "null"
+                and host_header
+                and _request_has_same_origin_or_no_provenance(request, host_header)
+                and _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs)
+            ):
+                return
+        _require_same_origin(request)
+
     @app.get("/admin/upstream", dependencies=[Depends(_require_loopback)])
     async def get_upstream():
         """Current Anthropic upstream + cc-switch reconciler state (loopback-only).
@@ -3473,21 +3578,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # (Phase 3's /settings/apply drives that).
     from headroom import settings_store
 
-    def _require_settings_access(request: Request) -> None:
-        """Allow settings only to loopback or explicitly trusted dashboard clients."""
-        if not _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs):
-            raise HTTPException(status_code=404)
-
-    def _require_settings_same_origin(request: Request) -> None:
-        """Preserve loopback CSRF checks and require exact origin for remote dashboards."""
-        if _request_is_loopback(request):
-            _require_same_origin(request)
-            return
-        host_header = request.headers.get("host")
-        if not host_header or not _request_has_same_origin_or_no_provenance(request, host_header):
-            raise HTTPException(status_code=403, detail="cross-origin request rejected")
-
-    @app.get("/settings/schema", dependencies=[Depends(_require_settings_access)])
+    @app.get(
+        "/settings/schema", dependencies=[Depends(_require_loopback_or_trusted_dashboard_client)]
+    )
     async def settings_schema(_request: Request):
         """Registry + grouped fields + effective values for the settings form."""
         schema = settings_store.to_schema()
@@ -3504,14 +3597,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             schema["supervised"] = False
         return JSONResponse(status_code=200, content=schema)
 
-    @app.get("/settings", dependencies=[Depends(_require_settings_access)])
+    @app.get("/settings", dependencies=[Depends(_require_loopback_or_trusted_dashboard_client)])
     async def settings_get(_request: Request):
         """Return stored (file) values only; secret fields masked."""
         return JSONResponse(status_code=200, content=settings_store.stored_values())
 
     @app.post(
         "/settings",
-        dependencies=[Depends(_require_settings_same_origin), Depends(_require_settings_access)],
+        dependencies=[
+            Depends(_require_loopback_or_trusted_dashboard_client),
+            Depends(_require_same_origin_or_trusted_dashboard_client),
+        ],
     )
     async def settings_post(request: Request):
         """Persist settings. Unknown key -> 400; bad type/enum/range -> 422.
@@ -3558,7 +3654,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.post(
         "/settings/apply",
-        dependencies=[Depends(_require_settings_same_origin), Depends(_require_settings_access)],
+        dependencies=[
+            Depends(_require_loopback_or_trusted_dashboard_client),
+            Depends(_require_same_origin_or_trusted_dashboard_client),
+        ],
     )
     async def settings_apply(request: Request):
         """Persist settings (optional body) then restart the proxy to apply them.
@@ -3621,7 +3720,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.get(
         "/dashboard/settings",
         response_class=HTMLResponse,
-        dependencies=[Depends(_require_settings_access)],
+        dependencies=[Depends(_require_loopback_or_trusted_dashboard_client)],
     )
     async def dashboard_settings():
         """Serve the Headroom settings GUI."""
@@ -4893,7 +4992,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         }
 
     # Telemetry endpoints (Data Flywheel)
-    @app.get("/v1/telemetry")
+    @app.get("/v1/telemetry", dependencies=[Depends(_require_loopback)])
     async def telemetry_stats():
         """Get telemetry statistics for the data flywheel.
 
@@ -4916,7 +5015,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         telemetry = get_telemetry_collector()
         return telemetry.get_stats()
 
-    @app.get("/v1/telemetry/export")
+    @app.get("/v1/telemetry/export", dependencies=[Depends(_require_loopback)])
     async def telemetry_export():
         """Export full telemetry data for aggregation.
 
@@ -4932,7 +5031,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         telemetry = get_telemetry_collector()
         return telemetry.export_stats()
 
-    @app.post("/v1/telemetry/import")
+    @app.post("/v1/telemetry/import", dependencies=[Depends(_require_loopback)])
     async def telemetry_import(request: Request):
         """Import telemetry data from another source.
 
@@ -4946,7 +5045,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         telemetry.import_stats(data)
         return {"status": "imported", "current_stats": telemetry.get_stats()}
 
-    @app.get("/v1/telemetry/tools")
+    @app.get("/v1/telemetry/tools", dependencies=[Depends(_require_loopback)])
     async def telemetry_tools():
         """Get telemetry statistics for all tracked tool signatures.
 
@@ -4962,7 +5061,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "tools": {sig_hash: stats.to_dict() for sig_hash, stats in all_stats.items()},
         }
 
-    @app.get("/v1/telemetry/tools/{signature_hash}")
+    @app.get("/v1/telemetry/tools/{signature_hash}", dependencies=[Depends(_require_loopback)])
     async def telemetry_tool_detail(signature_hash: str):
         """Get detailed telemetry for a specific tool signature.
 
@@ -4984,7 +5083,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         }
 
     # TOIN (Tool Output Intelligence Network) endpoints
-    @app.get("/v1/toin/stats")
+    @app.get("/v1/toin/stats", dependencies=[Depends(_require_loopback)])
     async def toin_stats():
         """Get overall TOIN statistics.
 
@@ -5002,7 +5101,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         toin = get_toin()
         return toin.get_stats()
 
-    @app.get("/v1/toin/patterns")
+    @app.get("/v1/toin/patterns", dependencies=[Depends(_require_loopback)])
     async def toin_patterns(limit: int = 20):
         """List TOIN patterns with most samples.
 
@@ -5057,7 +5156,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return patterns_list[:limit]
 
-    @app.get("/v1/toin/pattern/{hash_prefix}")
+    @app.get("/v1/toin/pattern/{hash_prefix}", dependencies=[Depends(_require_loopback)])
     async def toin_pattern_detail(hash_prefix: str):
         """Get detailed TOIN pattern info by hash prefix.
 
@@ -5076,7 +5175,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Search for pattern with matching hash prefix
         for sig_hash, pattern_dict in patterns_data.items():
             if sig_hash.startswith(hash_prefix):
-                return pattern_dict
+                # Keep this response aligned with /v1/toin/patterns while
+                # excluding query text, field semantics, and other internal
+                # learning state from the detail endpoint.
+                return {
+                    "compressions": pattern_dict.get("total_compressions", 0),
+                    "retrievals": pattern_dict.get("total_retrievals", 0),
+                    "retrieval_rate": pattern_dict.get("retrieval_rate", 0.0),
+                    "confidence": pattern_dict.get("confidence", 0.0),
+                    "skip_recommended": pattern_dict.get("skip_compression_recommended", False),
+                    "optimal_max_items": pattern_dict.get("optimal_max_items", 20),
+                }
 
         raise HTTPException(
             status_code=404, detail=f"No TOIN pattern found with hash starting with: {hash_prefix}"

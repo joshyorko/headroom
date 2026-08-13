@@ -165,7 +165,14 @@ class HeadroomOtelMetrics:
         )
         self._proxy_saved_tokens = self._meter.create_counter(
             "headroom.proxy.tokens.saved",
-            description="Input tokens saved by Headroom compression.",
+            description=(
+                "Input tokens saved across Headroom compression and tool-schema deferral."
+            ),
+            unit="1",
+        )
+        self._proxy_tool_schema_saved_tokens = self._meter.create_counter(
+            "headroom.proxy.tokens.tool_schema_saved",
+            description="Input tokens saved by deferring tool schemas.",
             unit="1",
         )
         self._proxy_cache_read_tokens = self._meter.create_counter(
@@ -346,6 +353,7 @@ class HeadroomOtelMetrics:
         output_tokens: int,
         tokens_saved: int,
         latency_ms: float,
+        tool_search_saved: int = 0,
         cached: bool = False,
         overhead_ms: float = 0.0,
         ttfb_ms: float = 0.0,
@@ -363,7 +371,11 @@ class HeadroomOtelMetrics:
 
         self._proxy_input_tokens.add(max(input_tokens, 0), attrs)
         self._proxy_output_tokens.add(max(output_tokens, 0), attrs)
-        self._proxy_saved_tokens.add(max(tokens_saved, 0), attrs)
+        compression_saved = max(tokens_saved, 0)
+        tool_schema_saved = max(tool_search_saved, 0)
+        self._proxy_saved_tokens.add(compression_saved + tool_schema_saved, attrs)
+        if tool_schema_saved > 0:
+            self._proxy_tool_schema_saved_tokens.add(tool_schema_saved, attrs)
         self._proxy_latency.record(max(latency_ms, 0.0) / _MILLISECONDS_TO_SECONDS, attrs)
 
         if overhead_ms > 0:

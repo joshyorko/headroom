@@ -114,6 +114,20 @@ class TestFalsePositiveFiltering:
         )
         assert is_error_content("bash: unknown_cmd: command not found")
 
+    def test_exit_code_zero_is_not_an_error(self):
+        """Agent harnesses append 'exit code 0' to every successful command;
+        that must not be classified as an error."""
+        from headroom.learn.scanner import is_error_content
+
+        assert not is_error_content("Ran the tests.\nProcess finished with exit code 0")
+
+    def test_nonzero_exit_code_is_an_error(self):
+        """A nonzero exit code (any casing / with a colon) is still an error."""
+        from headroom.learn.scanner import is_error_content
+
+        assert is_error_content("build failed\ncommand exited with exit code 1")
+        assert is_error_content("npm run build\nExit code: 127")
+
 
 # =============================================================================
 # Real-World Integration Tests (skipped if data not present)

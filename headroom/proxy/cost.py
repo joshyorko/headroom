@@ -213,7 +213,7 @@ def build_prefix_cache_stats(
                 # Match model to provider
                 _openai_prefixes = ("gpt", "o1", "o3", "o4")
                 is_match = (
-                    (provider == "anthropic" and "claude" in model_name)
+                    (provider in ("anthropic", "vertex:anthropic") and "claude" in model_name)
                     or (provider == "openai" and any(p in model_name for p in _openai_prefixes))
                     or (provider == "gemini" and "gemini" in model_name)
                     or (provider == "bedrock" and "claude" in model_name)

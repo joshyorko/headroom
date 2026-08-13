@@ -160,6 +160,46 @@ def test_wrap_claude_sibling_note_accurate_under_1m_and_tool_search_optouts(
     assert "kept on" not in output
 
 
+def test_wrap_claude_1m_adds_suffix_to_passthrough_model_flag(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #2915: Claude Code's --model CLI flag outranks ANTHROPIC_MODEL, so with
+    # both --1m and an explicit --model the env-var [1m] suffix is shadowed and
+    # the window silently caps at 200k. The wrapper must add the suffix to the
+    # pass-through flag so the 1M window actually activates.
+    captured, output = _invoke_wrap_claude(
+        runner,
+        monkeypatch,
+        env={},
+        extra_args=("--1m", "--model", "opusplan"),
+    )
+    assert captured["child_cmd"] == ["/usr/bin/claude", "--model", "opusplan[1m]"]
+    # The banner reports what actually takes effect, not the shadowed env value.
+    assert "--model opusplan[1m]" in output
+
+
+def test_wrap_claude_1m_adds_suffix_to_equals_model_flag(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, _output = _invoke_wrap_claude(
+        runner,
+        monkeypatch,
+        env={},
+        extra_args=("--1m", "--model=opusplan"),
+    )
+    assert captured["child_cmd"] == ["/usr/bin/claude", "--model=opusplan[1m]"]
+
+
+def test_wrap_claude_1m_without_model_flag_still_uses_env(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No pass-through --model: ANTHROPIC_MODEL carries the suffix as before, and
+    # the launched command is untouched.
+    captured, _output = _invoke_wrap_claude(runner, monkeypatch, env={}, extra_args=("--1m",))
+    assert captured["child_cmd"] == ["/usr/bin/claude"]
+    assert captured["child_env"]["ANTHROPIC_MODEL"].endswith("[1m]")
+
+
 def test_wrap_claude_tool_search_banner_line_still_accurate_when_active(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

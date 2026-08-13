@@ -48,6 +48,13 @@ SKIP = "skip"
 _LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
 _CODEX_BASE_URL_RE = re.compile(r'base_url\s*=\s*"https?://(?:127\.0\.0\.1|localhost):(\d+)')
 
+# Ollama's fixed default port. `ollama launch claude` writes
+# ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
+# child, which outranks the persistent-install env block and silently bypasses
+# the Headroom proxy (issue #2199). Recognized so the routing diagnostic names
+# the collision instead of telling the user to re-probe port 11434.
+_OLLAMA_DEFAULT_PORT = 11434
+
 
 @dataclass
 class CheckResult:
@@ -344,6 +351,22 @@ def _classify_routing_url(name: str, url: str, port: int, *, source: str) -> Che
         )
     found_port = int(match.group(1))
     if found_port != port:
+        if found_port == _OLLAMA_DEFAULT_PORT:
+            # Not a mis-probed Headroom port — this is Ollama's endpoint, so
+            # `headroom doctor --port 11434` would only chase a red herring.
+            return CheckResult(
+                name=name,
+                status=WARN,
+                summary=(
+                    f"points at Ollama ({url}), not the Headroom proxy ({source}) — "
+                    "`ollama launch claude` bypasses the persistent Headroom route"
+                ),
+                hint=(
+                    "both claim ANTHROPIC_BASE_URL; run Ollama-backed sessions "
+                    "through Headroom by chaining the proxy at its Ollama upstream "
+                    "(see issue #2199)"
+                ),
+            )
         return CheckResult(
             name=name,
             status=WARN,

@@ -172,6 +172,89 @@ def test_prepare_outbound_mutated_uses_canonical() -> None:
     assert source == "canonical"
 
 
+@pytest.mark.parametrize("block_type", ["thinking", "redacted_thinking"])
+def test_signed_thinking_history_with_original_bytes_uses_passthrough(
+    block_type: str,
+) -> None:
+    body = {
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": "Solve this"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": block_type,
+                        "thinking": "private reasoning",
+                        "signature": "sig123",
+                    },
+                    {"type": "text", "text": "The answer is 42."},
+                ],
+            },
+            {"role": "user", "content": "Continue"},
+        ],
+    }
+    original = json.dumps(body, indent=2).encode("utf-8")
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=original,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+    )
+
+    assert outbound.source == "passthrough"
+    assert outbound.content == original
+
+
+def test_signed_thinking_history_without_original_bytes_uses_canonical() -> None:
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "private reasoning",
+                        "signature": "sig123",
+                    }
+                ],
+            }
+        ]
+    }
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=None,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+    )
+
+    assert outbound.source == "canonical"
+    assert outbound.content == serialize_body_canonical(body)
+
+
+def test_signed_thinking_history_overrides_legacy_encoder() -> None:
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "signature": "sig123"}],
+            }
+        ]
+    }
+    original = json.dumps(body, indent=2).encode("utf-8")
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=original,
+        body_mutated=True,
+        forwarder_mode="legacy_json_kwarg",
+    )
+
+    assert outbound == OutboundBody(content=original, source="passthrough")
+
+
 def test_prepare_outbound_no_original_bytes_uses_canonical() -> None:
     out, source = prepare_outbound_body_bytes(
         body={"a": 1},

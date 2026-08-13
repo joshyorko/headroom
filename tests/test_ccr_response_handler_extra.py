@@ -155,6 +155,27 @@ def test_create_tool_result_message_google_and_generic_formats() -> None:
     assert invalid_google["parts"][0]["functionResponse"]["response"] == {"content": "not-json"}
 
 
+def test_create_tool_result_message_google_preserves_call_id() -> None:
+    handler = CCRResponseHandler()
+    message = handler._create_tool_result_message(
+        [
+            CCRToolResult(
+                tool_call_id="call-1",
+                tool_name="headroom_retrieve",
+                content='{"count": 1}',
+                success=True,
+            )
+        ],
+        "google",
+    )
+
+    assert message["parts"][0]["functionResponse"] == {
+        "name": "headroom_retrieve",
+        "id": "call-1",
+        "response": {"count": 1},
+    }
+
+
 def test_extract_assistant_message_google_and_generic() -> None:
     handler = CCRResponseHandler()
     google_message = handler._extract_assistant_message(
@@ -315,6 +336,60 @@ def test_streaming_buffer_and_parse_sse_helpers() -> None:
     assert message["tool_calls"][0]["function"]["arguments"] == (
         '{"hash":"aaaaaaaaaaaaaaaaaaaaaaaa"}'
     )
+
+
+def test_reconstruct_openai_response_tolerates_null_tool_calls_and_function() -> None:
+    # Some OpenAI-compatible providers put ``"tool_calls": null`` (and
+    # ``"function": null``) in a streaming delta instead of omitting the key.
+    # Only checking key presence made the reconstruction iterate ``None`` and
+    # raise ``TypeError``, aborting the whole CCR round.
+    handler = StreamingCCRHandler(CCRResponseHandler(), provider="openai")
+
+    parsed = handler._reconstruct_openai_response(
+        [
+            {"choices": [{"delta": {"content": "Hi", "tool_calls": None}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": None}]}}]},
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "function": {"name": "f", "arguments": "{}"},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
+    message = parsed["choices"][0]["message"]
+    # The null frames did not crash, and the real tool call still reconstructs.
+    assert message["content"] == "Hi"
+    assert message["tool_calls"][0]["id"] == "call_1"
+    assert message["tool_calls"][0]["function"] == {"name": "f", "arguments": "{}"}
+
+
+def test_extract_assistant_message_responses_output_null_coerces_to_list() -> None:
+    # A Responses turn with a present-but-null `output` (some gateways send this
+    # on an empty/filtered turn) must not become None: handle_response later
+    # does `current_messages.extend(...)` on it, which would raise TypeError.
+    handler = CCRResponseHandler()
+
+    assert handler._extract_assistant_message({"output": None}, "openai_responses") == {
+        "_openai_responses_output_items": []
+    }
+    # An absent output is also an empty list, and a real output passes through.
+    assert handler._extract_assistant_message({}, "openai_responses") == {
+        "_openai_responses_output_items": []
+    }
+    assert handler._extract_assistant_message(
+        {"output": [{"type": "message"}]}, "openai_responses"
+    ) == {"_openai_responses_output_items": [{"type": "message"}]}
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from headroom.proxy.auth_mode import classify_client
+from headroom.proxy.auth_mode import classify_client, supports_mid_turn_coalescing
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
     jitter_delay_ms,
@@ -1044,7 +1044,6 @@ class StreamingMixin:
         4. Streams the final response to the client
         """
         session_key = session_key or self._get_session_key(body)
-        self._active_streams.add(session_key)
 
         # Guard everything up to the generator's own try/finally (which owns
         # cleanup once streaming starts): any exception here — including
@@ -1109,6 +1108,7 @@ class StreamingMixin:
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
+        from starlette.background import BackgroundTask
 
         from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
 
@@ -1116,6 +1116,15 @@ class StreamingMixin:
         # ...) from the *client's* User-Agent before copilot-auth
         # potentially rewrites headers for upstream.
         client = classify_client(headers)
+        # Mid-turn message coalescing (queueing a concurrent same-session
+        # request and later replaying it via a `headroom_pending_messages`
+        # SSE event) is a Claude Code-only protocol. Only register the stream
+        # as active for coalescing when the client can consume that protocol,
+        # so concurrent requests from other harnesses (e.g. OpenCode subagents
+        # that share a body-derived session key) are streamed normally instead
+        # of being swallowed. (#1608)
+        if supports_mid_turn_coalescing(client):
+            self._active_streams.add(session_key)
         headers = await apply_copilot_api_auth(headers, url=url)
         start_time = time.time()
 
@@ -1661,16 +1670,35 @@ class StreamingMixin:
                     client=client,
                     waste_signals=waste_signals,
                 )
-                if pending_messages:
+                if supports_mid_turn_coalescing(client) and pending_messages:
                     pending_event = json.dumps(
                         {"type": "headroom_pending_messages", "messages": pending_messages}
                     )
                     yield f"event: headroom_pending_messages\ndata: {pending_event}\n\n".encode()
 
+        async def _release_upstream_stream() -> None:
+            # Guarantee the upstream HTTP/2 stream is released even when the
+            # body generator above is never iterated — the client disconnected
+            # before Starlette started sending the response body (routine when a
+            # harness like Claude Code cancels or supersedes an in-flight turn),
+            # so ``generate()`` never entered its own ``aclosing`` and nothing
+            # else closes ``upstream_response``. Each such request otherwise
+            # leaks one open h2 stream; they accumulate on the pooled upstream
+            # connection until it reaches SETTINGS_MAX_CONCURRENT_STREAMS (100)
+            # and no new stream can open ("Max outbound streams is 100, 100
+            # open"), and the proxy goes unhealthy until restart (#2797).
+            # Starlette runs a response's ``background`` task after the body
+            # finishes *and* after an early client disconnect, so this fires in
+            # both cases. ``aclose()`` is idempotent, so on the normal path —
+            # where the generator already closed the stream — this is a no-op.
+            with contextlib.suppress(Exception):
+                await upstream_response.aclose()
+
         return StreamingResponse(
             generate(),
             media_type="text/event-stream",
             headers=forwarded_headers,
+            background=BackgroundTask(_release_upstream_stream),
         )
 
     async def _stream_response_bedrock(

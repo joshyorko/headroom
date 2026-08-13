@@ -95,7 +95,7 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
 
     # server.json — the MCP registry descriptor. Asserted byte-for-byte against
     # render_server_json(), which reads the version from pyproject.toml, so it has
-    # to move with every bump or the release PR's test job fails.
+    # to move with every bump or release validation fails.
     server_json = root / "server.json"
     server_json.write_text(
         json.dumps(
@@ -371,7 +371,7 @@ def test_openclaw_headroom_dependency_is_preserved_for_registry_installability(
 
 
 def test_server_json_version_is_synchronized(temp_project: dict[str, Path]) -> None:
-    """server.json must track the bump or the release PR's test job fails.
+    """server.json must track the bump or release validation fails.
 
     ``tests/test_mcp_registry/test_server_json.py::test_root_server_json_matches_builder``
     asserts the tracked file equals ``render_server_json()``, which reads the version

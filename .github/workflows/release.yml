@@ -26,13 +26,8 @@ env:
   GH_PACKAGES_SKIP: "false"
 
 on:
-  # Triggered when release-please's release PR is merged: the bot
-  # tags the merge commit `vX.Y.Z` and creates a GitHub Release on
-  # that tag, which fires the `release: published` event. Ordinary
-  # pushes to main no longer trigger publishes — that was the old
-  # behavior that burned PyPI's per-project storage quota by
-  # uploading a fresh wheel matrix (~200 MB) per merged fix/feat PR.
-  # See .github/workflows/release-please.yml for the PR-aggregator.
+  # Publishing is explicit: publish a GitHub Release or manually dispatch this
+  # workflow. Ordinary branch pushes never publish packages.
   release:
     types: [published]
   # X2: PR-time release dry-run. Trigger on PRs that touch release-
@@ -91,8 +86,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      # When fired by release-please's release event, the tag the
-      # bot just published IS the canonical version for this run —
+      # When fired by a release event, the published tag is the canonical
+      # version for this run —
       # release_version.py's git-log derivation would re-bump it.
       # workflow_dispatch still honors `inputs.version`; PR dry-runs
       # leave MANUAL_VER empty and the script computes normally.
@@ -1051,9 +1046,7 @@ jobs:
           TAG="v${{ needs.detect-version.outputs.version }}"
           TITLE="Release v${{ needs.detect-version.outputs.version }}"
           if gh release view "$TAG" > /dev/null 2>&1; then
-            # Release already exists — typically created by
-            # release-please on release-PR merge with an auto-
-            # generated changelog body. Don't overwrite its notes
+            # Release already exists. Don't overwrite its notes
             # (--notes-file would clobber them); only sync the
             # title in case detect-version's canonical form differs
             # from what the bot set.

@@ -170,7 +170,7 @@ class RequestOutcome:
     # (``original_messages``); otherwise ``request_messages`` carries the sent
     # body for backward compatibility and this stays ``None``.
     compressed_messages: list[dict[str, Any]] | None = None
-    tags: dict[str, str] = field(default_factory=dict)
+    tags: dict[str, Any] = field(default_factory=dict)
     client: str | None = None
     project: str | None = None
 
@@ -399,6 +399,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
+    from headroom.proxy.savings_attribution import encode, from_tags, public_tags
     from headroom.telemetry.session import record_outcome
 
     # GitHub Copilot: requests routed to the Copilot API travel on the OpenAI or
@@ -464,6 +465,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # tags and never move tok_before/after; aggregate them into Metrics so the
     # session summary / cost summary / all-layers total can surface the layer.
     tool_search_saved = tool_schema_saved_from_tags(outcome.tags or {})
+    savings_breakdown = from_tags(outcome.tags)
 
     # Billed input volume. Prefer the provider's own count where it reported one
     # — that is what the invoice charges for, and it is the number cache math is
@@ -499,6 +501,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         client=outcome.client,
         tool_search_saved=tool_search_saved,
         local_input_tokens=outcome.optimized_tokens,
+        savings_attribution=savings_breakdown,
     )
 
     # 2. Cost tracker (optional).
@@ -524,7 +527,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    dict is not mutated (frozen dataclass + defensive copy).
     request_logger = getattr(handler, "logger", None)
     if request_logger is not None:
-        log_tags = dict(outcome.tags)
+        log_tags = public_tags(outcome.tags)
         if outcome.client:
             log_tags["client"] = outcome.client
         if project:
@@ -551,6 +554,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 cache_write_tokens=outcome.cache_write_tokens,
                 uncached_input_tokens=outcome.uncached_input_tokens,
                 transforms_applied=list(outcome.transforms_applied),
+                savings_breakdown=savings_breakdown,
                 waste_signals=outcome.waste_signals,
                 request_messages=outcome.request_messages,
                 compressed_messages=outcome.compressed_messages,
@@ -579,6 +583,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # compaction is already inside tok_saved and must not be added twice.
     tool_saved = tool_schema_saved_from_tags(outcome.tags or {})
     total_saved = headline_tokens_saved(outcome.tokens_saved, outcome.tags or {})
+    encoded_savings = encode(savings_breakdown)
     logger.info(
         f"[{outcome.perf_request_id or outcome.request_id}] PERF "
         f"model={outcome.model} msgs={outcome.num_messages} "
@@ -593,6 +598,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"total_ms={outcome.total_latency_ms:.0f} "
         f"tok_out={outcome.output_tokens} "
         f"ttfb_ms={outcome.ttfb_ms:.0f} "
+        f"savings={encoded_savings} "
         f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
         f"{client_part}"
         f"{cached_part}"

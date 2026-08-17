@@ -3805,6 +3805,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "has_exact_tokens": token_accounting_status == "complete",
                     "token_accounting_status": token_accounting_status,
                     "transforms_applied": log.get("transforms_applied", []),
+                    "savings_breakdown": log.get("savings_breakdown", []),
                     "waste_signals": log.get("waste_signals"),
                     "tool_schema_saved_tokens": _tool_schema_saved_from_tags(log.get("tags")),
                 }
@@ -4192,6 +4193,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     persistent_savings.get("projects", {}),
                     cli_filtering_stats,
                     cli_filtering_project_stats,
+                ),
+                # Attribution only: these rows explain the canonical headline
+                # and are not added to it again.
+                "by_source": sorted(
+                    (dict(row) for row in m.savings_by_source.values()),
+                    key=lambda row: (-int(row.get("tokens", 0)), str(row["source"])),
                 ),
                 "by_layer": {
                     "cli_filtering": {

@@ -2506,6 +2506,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         timing: dict[str, float] | None = None,
         client: str | None = None,
+        savings_tags: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -2652,6 +2653,23 @@ class OpenAIHandlerMixin:
             working["tools"] = _deferred_tools
             modified = True
             transforms.append("openai:responses:tool_search_deferral")
+            try:
+                from headroom.proxy.savings_attribution import record_savings
+
+                deferred = [
+                    tool
+                    for tool in _deferred_tools
+                    if isinstance(tool, dict) and tool.get("defer_loading")
+                ]
+                record_savings(
+                    savings_tags if savings_tags is not None else {},
+                    "tool_search",
+                    tokens=self.openai_provider.get_token_counter(model).count_text(
+                        _json_debug_dumps(deferred)
+                    ),
+                )
+            except Exception:
+                logger.debug("tool-search savings attribution skipped", exc_info=True)
 
         # Turn hooks (opt-in extensions): a registered hook may inspect or rewrite
         # the outbound tools before we send — the extensible counterpart to the
@@ -2690,6 +2708,17 @@ class OpenAIHandlerMixin:
                 messages=_msgs_before,
                 tools=working.get("tools"),
                 config=getattr(self, "config", None),
+                tags=savings_tags if savings_tags is not None else {},
+                count_messages=lambda value: self.openai_provider.get_token_counter(
+                    model
+                ).count_text(_json_debug_dumps(value)),
+                count_tools=lambda value: (
+                    self.openai_provider.get_token_counter(model).count_text(
+                        _json_debug_dumps(value)
+                    )
+                    if value
+                    else 0
+                ),
             )
             # Streaming turns get fold-only hooks, same rule as the
             # chat-completions path. A hook that defers work to `on_response`
@@ -2860,6 +2889,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
         client: str | None = None,
+        savings_tags: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
@@ -2880,6 +2910,8 @@ class OpenAIHandlerMixin:
                 "timing": timing,
                 "client": client,
             }
+            if savings_tags is not None:
+                compression_kwargs["savings_tags"] = savings_tags
             while True:
                 try:
                     result = self._compress_openai_responses_payload(
@@ -2891,7 +2923,7 @@ class OpenAIHandlerMixin:
                     unsupported_kwarg = next(
                         (
                             name
-                            for name in ("client", "timing")
+                            for name in ("savings_tags", "client", "timing")
                             if f"unexpected keyword argument '{name}'" in str(exc)
                             and name in compression_kwargs
                         ),
@@ -3095,6 +3127,9 @@ class OpenAIHandlerMixin:
         # if httpx lacks brotli support the response body is undecipherable → 502.
         headers.pop("accept-encoding", None)
         tags = extract_tags(headers)
+        from headroom.proxy.savings_attribution import bind_scope
+
+        bind_scope(tags, request.scope)
         client = classify_client(headers)
         # Surface the image-compression decision (computed earlier) into
         # tags now that the tags dict exists. Same observability pattern
@@ -3986,6 +4021,7 @@ class OpenAIHandlerMixin:
             run_request_hooks,
         )
 
+        _th_ctx: TurnContext | None = None
         if registered_turn_hooks():
             _th_tools_before = body.get("tools")
             _th_tok_before = (
@@ -3999,6 +4035,11 @@ class OpenAIHandlerMixin:
                 messages=body["messages"],
                 tools=_th_tools_before,
                 config=self.config,
+                tags=tags,
+                count_messages=tokenizer.count_messages,
+                count_tools=lambda value: (
+                    tokenizer.count_text(json.dumps(value, default=str)) if value else 0
+                ),
             )
             # Snapshot messages BEFORE the hook (same tokenizer) so we can tell whether
             # the hook itself folded — comparing against optimized_tokens instead
@@ -4534,12 +4575,13 @@ class OpenAIHandlerMixin:
                         # replaces the response, this original is the one nobody
                         # else will read.
                         _hook_usage.record(_hook_resp_json, **CHAT_USAGE_KEYS)
-                        _hook_ctx = _TurnContext(
+                        _hook_ctx = _th_ctx or _TurnContext(
                             provider="openai",
                             model=str(model),
                             messages=body["messages"],
                             tools=body.get("tools"),
                             config=self.config,
+                            tags=tags,
                         )
 
                         async def _hook_call_model(_msgs):
@@ -5086,6 +5128,9 @@ class OpenAIHandlerMixin:
         # to decompress already-decoded JSON and reject it with HTTP 400 (#1542).
         headers.pop("content-encoding", None)
         tags = extract_tags(headers)
+        from headroom.proxy.savings_attribution import bind_scope
+
+        bind_scope(tags, request.scope)
         client = classify_client(headers)
 
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
@@ -5454,6 +5499,7 @@ class OpenAIHandlerMixin:
                     model=model,
                     request_id=request_id,
                     client=client,
+                    savings_tags=tags,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _transforms:
@@ -5720,6 +5766,7 @@ class OpenAIHandlerMixin:
                                 messages=body.get(_resp_key) or [],
                                 tools=body.get("tools"),
                                 config=self.config,
+                                tags=tags,
                             )
 
                             async def _resp_hook_call_model(

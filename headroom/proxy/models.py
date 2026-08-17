@@ -65,9 +65,13 @@ class RequestLog:
     total_latency_ms: float | None
 
     # Metadata
-    tags: dict[str, str]
+    tags: dict[str, Any]
     cache_hit: bool
     transforms_applied: list[str]
+
+    # Per-request attribution. Headline totals remain authoritative, so these
+    # explanatory rows are never added a second time.
+    savings_breakdown: list[dict[str, Any]] = field(default_factory=list)
 
     # Provider-side cache economics (Anthropic prompt caching, #2438).
     # ``cache_hit`` alone is ambiguous: a call billed cache-*creation* (write)

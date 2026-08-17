@@ -134,6 +134,16 @@ def _parse_kv(kv_str: str) -> dict[str, str]:
     return result
 
 
+def _decode_perf_savings(value: str) -> list[dict[str, object]]:
+    # Local import keeps the analyzer usable against old logs/install layouts.
+    try:
+        from headroom.proxy.savings_attribution import decode
+
+        return decode(value)
+    except Exception:
+        return []
+
+
 @dataclass
 class PerfRecord:
     """A single parsed PERF log entry."""
@@ -345,6 +355,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 tokens_after=int(kv.get("tok_after", 0)),
                                 tokens_saved=int(kv.get("tok_saved", 0)),
                                 tool_saved=int(kv.get("tool_saved", 0)),
+                                savings_breakdown=_decode_perf_savings(kv.get("savings", "none")),
                                 cache_read=int(kv.get("cache_read", 0)),
                                 cache_write=int(kv.get("cache_write", 0)),
                                 cache_hit_pct=int(kv.get("cache_hit_pct", 0)),
@@ -997,7 +1008,9 @@ def build_perf_summary(report: PerfReport) -> dict:
     for model, recs in sorted(by_model_groups.items()):
         m_before = sum(r.tokens_before for r in recs)
         m_after = sum(r.tokens_after for r in recs)
-        m_saved = sum(r.tokens_saved for r in recs)
+        m_message_saved = sum(r.tokens_saved for r in recs)
+        m_tool_saved = sum(r.tool_saved for r in recs)
+        m_saved = m_message_saved + m_tool_saved
         by_model.append(
             {
                 "model": model,
@@ -1005,7 +1018,9 @@ def build_perf_summary(report: PerfReport) -> dict:
                 "tokens_before": m_before,
                 "tokens_after": m_after,
                 "tokens_saved": m_saved,
-                "savings_pct": _pct(m_saved, m_before),
+                "message_tokens_saved": m_message_saved,
+                "tool_tokens_saved": m_tool_saved,
+                "savings_pct": _pct(m_saved, m_before + m_tool_saved),
                 "list_price_per_mtok": _get_list_price(model),
             }
         )
@@ -1028,6 +1043,37 @@ def build_perf_summary(report: PerfReport) -> dict:
                 "savings_pct": _pct(t_saved, t_before),
             }
         )
+
+    by_source_groups: dict[tuple[str, bool], dict[str, int | float | str | bool]] = {}
+    for record in records:
+        for item in record.savings_breakdown:
+            source = str(item.get("source") or "other")
+            realized = bool(item.get("realized", True))
+            key = (source, realized)
+            row = by_source_groups.setdefault(
+                key,
+                {
+                    "source": source,
+                    "realized": realized,
+                    "events": 0,
+                    "tokens": 0,
+                    "usd": 0.0,
+                },
+            )
+            row["events"] = int(row["events"]) + 1
+            raw_tokens = item.get("tokens", 0)
+            raw_usd = item.get("usd", 0.0)
+            tokens = int(raw_tokens) if isinstance(raw_tokens, (str, int, float)) else 0
+            usd = float(raw_usd) if isinstance(raw_usd, (str, int, float)) else 0.0
+            row["tokens"] = int(row["tokens"]) + max(0, tokens)
+            row["usd"] = round(
+                float(row["usd"]) + usd,
+                12,
+            )
+    by_source = sorted(
+        by_source_groups.values(),
+        key=lambda row: (-int(row["tokens"]), str(row["source"])),
+    )
 
     return {
         "window_hours": report.requested_hours,
@@ -1052,6 +1098,7 @@ def build_perf_summary(report: PerfReport) -> dict:
         "cache_hit_pct": cache_hit_pct,
         "by_model": by_model,
         "by_transform": by_transform,
+        "by_source": by_source,
         "overhead": build_overhead_summary(report),
         "throughput": calculate_throughput(report),
         "log_files_read": report.log_files_read,

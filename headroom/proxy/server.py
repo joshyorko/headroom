@@ -2443,6 +2443,35 @@ def _normalized_http_origin(value: str) -> tuple[str, str, int] | None:
     return scheme, parsed.hostname.lower(), port
 
 
+#: Feedback-pattern keys built verbatim from agent query text. They are useful
+#: in-process for compression decisions but must never reach an HTTP response —
+#: same privacy contract the TOIN endpoints were brought under in #2926/#2927.
+_FEEDBACK_QUERY_TEXT_KEYS = ("common_queries", "queried_fields")
+
+
+def _feedback_stats_without_query_text(stats: dict[str, Any]) -> dict[str, Any]:
+    """Return ``stats`` with per-tool query text stripped from ``tool_patterns``.
+
+    Copies only the levels it edits; the aggregate counters are shared with the
+    caller's dict, which is fine because they are scalars.
+    """
+
+    patterns = stats.get("tool_patterns")
+    if not isinstance(patterns, dict):
+        return stats
+
+    scrubbed: dict[str, Any] = {}
+    for name, pattern in patterns.items():
+        if isinstance(pattern, dict):
+            scrubbed[name] = {
+                key: value for key, value in pattern.items() if key not in _FEEDBACK_QUERY_TEXT_KEYS
+            }
+        else:
+            scrubbed[name] = pattern
+
+    return {**stats, "tool_patterns": scrubbed}
+
+
 _is_known_websocket_callback_failure = is_known_websocket_callback_failure
 
 
@@ -3511,7 +3540,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         payload["runtime"] = _runtime_payload()
         return JSONResponse(status_code=200, content=payload)
 
-    @app.post("/admin/runtime-env", dependencies=[Depends(_require_loopback)])
+    @app.post(
+        "/admin/runtime-env",
+        dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
+    )
     async def admin_runtime_env(request: Request):
         """Hot-reload live env knobs (the output-shaper family, the ast-grep
         read threshold) without restarting the proxy.
@@ -4682,7 +4714,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return {"ok": True, "context_tool": stats_payload}
 
-    @app.post("/stats/reset", dependencies=[Depends(_require_loopback)])
+    @app.post(
+        "/stats/reset",
+        dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
+    )
     async def stats_reset():
         """Reset in-memory proxy stats for local test/debug isolation."""
         await proxy.metrics.reset_runtime()
@@ -4838,7 +4873,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         report = tracker.get_report()
         return report.to_dict()
 
-    @app.post("/cache/clear", dependencies=[Depends(_require_loopback)])
+    @app.post(
+        "/cache/clear",
+        dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
+    )
     async def clear_cache():
         """Clear the response cache.
 
@@ -4854,7 +4892,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return {"status": "cache disabled"}
 
     # CCR (Compress-Cache-Retrieve) endpoints
-    @app.post("/v1/retrieve", dependencies=[Depends(_require_loopback)])
+    @app.post(
+        "/v1/retrieve",
+        dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
+    )
     async def ccr_retrieve(request: Request):
         """Retrieve original content from CCR compression cache.
 
@@ -4933,21 +4974,25 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             ],
         }
 
-    @app.get("/v1/feedback")
+    @app.get("/v1/feedback", dependencies=[Depends(_require_loopback)])
     async def ccr_feedback():
         """Get CCR feedback loop statistics and learned patterns.
 
         This endpoint exposes the feedback loop's learned patterns for monitoring
         and debugging. It shows:
         - Per-tool retrieval rates (high = compress less aggressively)
-        - Common search queries per tool
-        - Queried fields (suggest what to preserve)
+        - Aggregate compression/retrieval counters per tool
 
         Use this to understand how well compression is working and whether
         the feedback loop is adjusting appropriately.
+
+        Loopback-guarded and query-text free for the same reason as the
+        telemetry and TOIN endpoints (#2926/#2927): ``common_queries`` and
+        ``queried_fields`` are built verbatim from agent search queries, so
+        they stay out of the response even on the guarded path.
         """
         feedback = get_compression_feedback()
-        stats = feedback.get_stats()
+        stats = _feedback_stats_without_query_text(feedback.get_stats())
         return {
             "feedback": stats,
             "hints_example": {
@@ -4966,12 +5011,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
         }
 
-    @app.get("/v1/feedback/{tool_name}")
+    @app.get("/v1/feedback/{tool_name}", dependencies=[Depends(_require_loopback)])
     async def ccr_feedback_for_tool(tool_name: str):
         """Get compression hints for a specific tool.
 
         Returns feedback-based hints that would be used for compressing
         this tool's output.
+
+        Loopback-guarded, and the pattern block excludes ``common_queries``
+        and ``queried_fields`` — both are raw agent query text (#2926/#2927).
         """
         feedback = get_compression_feedback()
         hints = feedback.get_compression_hints(tool_name)
@@ -4994,8 +5042,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "retrieval_rate": patterns.retrieval_rate if patterns else 0.0,
                 "full_retrieval_rate": patterns.full_retrieval_rate if patterns else 0.0,
                 "search_rate": patterns.search_rate if patterns else 0.0,
-                "common_queries": list(patterns.common_queries.keys())[:10] if patterns else [],
-                "queried_fields": list(patterns.queried_fields.keys())[:10] if patterns else [],
             }
             if patterns
             else None,
@@ -5041,7 +5087,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         telemetry = get_telemetry_collector()
         return telemetry.export_stats()
 
-    @app.post("/v1/telemetry/import", dependencies=[Depends(_require_loopback)])
+    @app.post(
+        "/v1/telemetry/import",
+        dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
+    )
     async def telemetry_import(request: Request):
         """Import telemetry data from another source.
 

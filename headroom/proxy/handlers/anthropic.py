@@ -2006,6 +2006,10 @@ class AnthropicHandlerMixin:
                     inject_system_instructions=inject_system_instructions,
                 )
                 injector.scan_for_markers(optimized_messages)
+                # Shape-only scanning also matches markers from other context
+                # tools; drop hashes this proxy never actually stored before
+                # they can drive tool injection (issue #2836).
+                injector.verify_ownership()
                 if inject_system_instructions and injector.has_compressed_content:
                     optimized_messages = injector.inject_into_system_message(optimized_messages)
 

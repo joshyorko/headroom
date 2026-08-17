@@ -3590,6 +3590,10 @@ class OpenAIHandlerMixin:
                 ),
             )
             injector.scan_for_markers(optimized_messages)
+            # Shape-only scanning also matches markers from other context
+            # tools; drop hashes this proxy never actually stored before
+            # they can drive tool injection (issue #2836).
+            injector.verify_ownership()
             if (
                 self.config.ccr_inject_system_instructions
                 and not stream

@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -38,7 +39,7 @@ from fastapi.testclient import TestClient
 
 from headroom.cli.proxy import proxy as proxy_cli
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
-from headroom.proxy.models import ProxyConfig
+from headroom.proxy.models import CacheEntry, ProxyConfig
 from headroom.proxy.server import HeadroomProxy, create_app
 
 # --------------------------------------------------------------------------- #
@@ -870,12 +871,20 @@ class _SecurityBlock:
 
 
 class _CacheHit:
-    class _Entry:
-        response_headers: dict = {}
-        response_body: bytes = b'{"id":"cached","type":"message","role":"assistant","content":[{"type":"text","text":"hit"}]}'
-
     def __init__(self) -> None:
-        self._entry = self._Entry()
+        # A real ``CacheEntry`` rather than a hand-rolled stand-in: the
+        # cache-hit path reads more of the entry than just the body (it logs
+        # the entry's age and hit count), and a partial fake drifts out of
+        # sync with it silently.
+        self._entry = CacheEntry(
+            response_body=(
+                b'{"id":"cached","type":"message","role":"assistant",'
+                b'"content":[{"type":"text","text":"hit"}]}'
+            ),
+            response_headers={},
+            created_at=datetime.now(),
+            ttl_seconds=3600,
+        )
 
     async def get(self, _messages, _model, **_kwargs):
         return self._entry

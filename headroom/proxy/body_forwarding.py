@@ -32,6 +32,15 @@ class OutboundBody:
 
     content: bytes
     source: OutboundBodySource
+    #: True when byte-faithful passthrough won over a mutated body, so every
+    #: edit the handler made to ``body`` was discarded before the wire. Callers
+    #: that gated a downstream decision on their own mutation (for example
+    #: flipping ``stream`` to False to buffer a reply) MUST consult this — the
+    #: request upstream actually sees is the client's original one.
+    dropped_mutations: bool = False
+    #: The ``BodyMutationTracker`` reasons discarded alongside it, when the
+    #: caller supplied them. Empty when the caller passed no reason list.
+    dropped_mutation_reasons: tuple[str, ...] = ()
 
 
 def get_python_forwarder_mode() -> PythonForwarderMode:
@@ -104,11 +113,23 @@ def select_outbound_body(
     original_body_bytes: bytes | None,
     body_mutated: bool,
     forwarder_mode: PythonForwarderMode | None = None,
+    mutation_reasons: list[str] | None = None,
 ) -> OutboundBody:
-    """Select the exact bytes to forward upstream."""
+    """Select the exact bytes to forward upstream.
+
+    ``mutation_reasons`` is optional and only used for reporting: when the
+    signed-thinking passthrough overrides a mutated body, the discarded reasons
+    are echoed back on the result so the call site can log what never made it
+    upstream instead of silently claiming the edit landed.
+    """
     mode = forwarder_mode if forwarder_mode is not None else get_python_forwarder_mode()
     if original_body_bytes is not None and has_signed_thinking_blocks(body):
-        return OutboundBody(content=original_body_bytes, source="passthrough")
+        return OutboundBody(
+            content=original_body_bytes,
+            source="passthrough",
+            dropped_mutations=body_mutated,
+            dropped_mutation_reasons=tuple(mutation_reasons or ()) if body_mutated else (),
+        )
 
     if mode == "legacy_json_kwarg":
         content = json.dumps(body, separators=(", ", ": "), ensure_ascii=True).encode("utf-8")
@@ -125,12 +146,38 @@ def prepare_outbound_body_bytes(
     original_body_bytes: bytes | None,
     body_mutated: bool,
     forwarder_mode: PythonForwarderMode | None = None,
+    mutation_reasons: list[str] | None = None,
 ) -> tuple[bytes, OutboundBodySource]:
-    """Compatibility tuple wrapper around :func:`select_outbound_body`."""
+    """Compatibility tuple wrapper around :func:`select_outbound_body`.
+
+    Keeps the two-value shape its existing callers unpack. Call
+    :func:`select_outbound_body` directly when you need the dropped-mutation
+    reporting.
+    """
     outbound = select_outbound_body(
         body=body,
         original_body_bytes=original_body_bytes,
         body_mutated=body_mutated,
         forwarder_mode=forwarder_mode,
+        mutation_reasons=mutation_reasons,
     )
     return outbound.content, outbound.source
+
+
+def outbound_body_is_client_bytes(
+    *,
+    body: dict[str, Any],
+    original_body_bytes: bytes | None,
+) -> bool:
+    """Return whether the wire body will be the client's original bytes.
+
+    A handler that changes ``body`` to steer its own upstream call — the
+    ``stream`` flip that buys a buffered reply is the load-bearing case — has to
+    know that the signed-thinking passthrough will throw that change away and
+    send the client's bytes verbatim. Asking before acting is cheaper than
+    discovering it from a reply in the wrong wire format.
+
+    Mirrors the first branch of :func:`select_outbound_body`; the forwarder mode
+    is deliberately not consulted because that branch overrides it too.
+    """
+    return original_body_bytes is not None and has_signed_thinking_blocks(body)

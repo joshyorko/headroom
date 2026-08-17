@@ -563,6 +563,15 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    line unchanged, and gives ``headroom perf --client X``
     #    parsers a clean key to filter on.
     client_part = f" client={outcome.client}" if outcome.client else ""
+    # ``cached=1`` marks a turn answered from Headroom's own response cache.
+    # Such a turn never contacts the upstream, so it has no outbound_request
+    # line, no upstream stage timings, and all-zero token counters — which
+    # made it indistinguishable in the logs from a turn that died silently
+    # (#3019). Appended only on a hit, so every other PERF line is unchanged
+    # and existing parsers keep working (``_parse_kv`` reads trailing
+    # key=value pairs after ``transforms=`` the same way it reads
+    # ``client=``).
+    cached_part = " cached=1" if outcome.from_response_cache else ""
     # Tool-schema DEFERRAL savings can't move tok_before/after (those count messages
     # only), so a tool-heavy turn shows tok_saved=0 while genuinely saving thousands of
     # tool-definition tokens. `tool_saved` carries that component and `total_saved` is
@@ -586,4 +595,5 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"ttfb_ms={outcome.ttfb_ms:.0f} "
         f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
         f"{client_part}"
+        f"{cached_part}"
     )

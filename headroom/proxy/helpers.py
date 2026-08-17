@@ -319,6 +319,40 @@ def _headroom_bypass_enabled(headers: Any) -> bool:
     return bypass or passthrough
 
 
+# Response headers that describe how the *upstream* framed its body on the
+# wire, not what the payload means. Every one of them is invalid to replay:
+# Starlette recomputes content-length, and uvicorn owns the connection
+# framing. Forwarding a stale ``transfer-encoding: chunked`` onto a
+# fixed-length body is the worst of them — RFC 9112 §6.1 makes
+# Transfer-Encoding override Content-Length, so the client tries to parse a
+# plain JSON body as chunked frames, finds no valid chunk-size line, and
+# reads an empty body out of an HTTP 200 (#3019).
+FRAMING_RESPONSE_HEADERS: tuple[str, ...] = (
+    "content-encoding",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "server",
+)
+
+
+def sanitize_forwarded_response_headers(
+    headers: Any,
+    *extra_names: str,
+) -> dict[str, str]:
+    """Drop wire-framing headers before replaying an upstream response.
+
+    Pass any additional header names to strip as ``extra_names`` (for
+    example ``"content-type"`` when the caller sets its own media type).
+
+    Matching is case-insensitive, but the casing of the headers that
+    survive is left untouched.
+    """
+    drop = {name.lower() for name in (*FRAMING_RESPONSE_HEADERS, *extra_names)}
+    return {key: value for key, value in dict(headers).items() if key.lower() not in drop}
+
+
 def log_outbound_request(
     *,
     forwarder: str,
@@ -329,12 +363,18 @@ def log_outbound_request(
     mutation_reasons: list[str],
     request_id: str | None,
     source: str,
+    dropped_mutation_reasons: tuple[str, ...] | list[str] | None = None,
 ) -> None:
     """Structured log line for every outbound forwarder call.
 
     Per realignment build constraints: every cache-affecting decision is
     logged. Never includes ``Authorization``/``x-api-key`` content or full
     body bytes.
+
+    ``dropped_mutation_reasons`` records edits that byte-faithful passthrough
+    discarded before the wire. That is a WARNING, not a detail: the line above
+    reports the transforms Headroom *decided* on, and without this the operator
+    reads savings and injections that the upstream never saw.
     """
     logger.info(
         "event=outbound_request forwarder=%s method=%s path=%s body_bytes=%d "
@@ -348,6 +388,16 @@ def log_outbound_request(
         source,
         request_id or "",
     )
+    if dropped_mutation_reasons:
+        logger.warning(
+            "event=outbound_body_mutations_dropped forwarder=%s source=%s "
+            "dropped_mutation_reasons=%s request_id=%s (signed thinking blocks force "
+            "byte-faithful passthrough, so these body edits did NOT reach upstream)",
+            forwarder,
+            source,
+            ",".join(dropped_mutation_reasons),
+            request_id or "",
+        )
 
 
 def count_cache_breakpoints(
@@ -3469,8 +3519,9 @@ def inject_tool_search_deferral(
     if not isinstance(tools, list) or len(tools) < _TOOL_SEARCH_MIN_TOOLS:
         return tools
     for tool in tools:
-        if isinstance(tool, dict) and str(tool.get("type", "")).startswith(
-            _TOOL_SEARCH_TOOL_TYPE_PREFIX
+        if isinstance(tool, dict) and (
+            str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+            or str(tool.get("name") or "").lower().startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
         ):
             return tools  # client already uses tool search — leave it alone
 
@@ -3585,7 +3636,19 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
         return messages, 0
 
     tool_list = tools if isinstance(tools, list) else []
-    available = {str(t["name"]) for t in tool_list if isinstance(t, dict) and t.get("name")}
+    # Typed search tools (type starts with "tool_search_tool_") are the search
+    # mechanism itself — they are never the target of a tool_reference lookup.
+    # Excluding them from `available` ensures that a stale history entry that
+    # references "tool_search_tool_regex" (from a turn where inject deferred a
+    # typeless client tool with that name) is correctly dropped rather than
+    # falsely kept because the injected typed search tool shares the same name.
+    available = {
+        str(t["name"])
+        for t in tool_list
+        if isinstance(t, dict)
+        and t.get("name")
+        and not str(t.get("type") or "").startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+    }
     has_search_tool = any(
         isinstance(t, dict) and str(t.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
         for t in tool_list

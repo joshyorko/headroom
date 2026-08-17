@@ -36,7 +36,11 @@ from headroom.proxy.auth_mode import (
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
-from headroom.proxy.helpers import extract_tags
+from headroom.proxy.helpers import (
+    extract_tags,
+    relocate_system_messages_to_top_level,
+    sanitize_forwarded_response_headers,
+)
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
@@ -71,6 +75,20 @@ def _strip_index_from_content_blocks(content: Any) -> None:
             block.pop("index", None)
             # tool_result blocks nest their own content list of blocks.
             _strip_index_from_content_blocks(block.get("content"))
+
+
+def _looks_like_sse_response(response: httpx.Response) -> bool:
+    """Return whether an upstream reply is a Server-Sent Events stream.
+
+    Trusts the declared content-type first and falls back to sniffing the
+    leading bytes for an SSE field, because a gateway in front of Anthropic may
+    relay the stream under a vaguer type.
+    """
+    content_type = (response.headers.get("content-type") or "").lower()
+    if "text/event-stream" in content_type:
+        return True
+    head = response.content[:64].lstrip()
+    return head.startswith(b"event:") or head.startswith(b"data:")
 
 
 class AnthropicHandlerMixin:
@@ -1050,10 +1068,32 @@ class AnthropicHandlerMixin:
                         )
                     )
 
-                    # Remove compression headers from cached response
-                    response_headers = dict(cached.response_headers)
-                    response_headers.pop("content-encoding", None)
-                    response_headers.pop("content-length", None)
+                    # Strip the stored response's wire-framing headers. The
+                    # entry carries whatever the *producing* upstream sent,
+                    # and replaying that framing over a different connection
+                    # breaks the body: a stale ``transfer-encoding: chunked``
+                    # makes the client parse plain JSON as chunked frames and
+                    # read nothing out of an HTTP 200 (#3019). ``content-type``
+                    # goes too, because Starlette lets an explicit header win
+                    # over ``media_type`` and the producing request's type
+                    # would hand this caller a wire format it never asked
+                    # for (#2952).
+                    response_headers = sanitize_forwarded_response_headers(
+                        cached.response_headers,
+                        "content-type",
+                    )
+
+                    # A cache hit answers the client without touching the
+                    # upstream, so it emits no outbound_request line and no
+                    # upstream stage timings. Without this log a served-from-
+                    # cache turn is indistinguishable from a turn that died
+                    # silently, which is exactly how #3019 stayed invisible.
+                    logger.info(
+                        f"[{request_id}] RESPONSE-CACHE-HIT: model={model} "
+                        f"bytes={len(cached.response_body)} "
+                        f"age_s={(datetime.now() - cached.created_at).total_seconds():.0f} "
+                        f"hits={cached.hit_count}"
+                    )
 
                     # Unit 4: release the pre-upstream semaphore on cache
                     # hit — no upstream call will happen.
@@ -3127,13 +3167,37 @@ class AnthropicHandlerMixin:
                 ccr_response_handler_enabled = bool(
                     self.ccr_response_handler and getattr(ccr_handler_config, "enabled", True)
                 )
-                buffered_stream_ccr = bool(
+                # A body carrying signed thinking blocks leaves as the client's
+                # original bytes (see ``select_outbound_body``), which throws
+                # away every edit made here — including the ``stream`` flip
+                # below. Taking the buffered path anyway asks upstream for a
+                # stream:true reply and then tries to read it as buffered JSON:
+                # the parse fails, SSE resynthesis is skipped, and the client
+                # gets a 200 with no usable body (#2952). The retrieve tool is
+                # itself an injected (and equally discarded) mutation on these
+                # turns, so the plain streaming path is the coherent choice.
+                from headroom.proxy.body_forwarding import outbound_body_is_client_bytes
+
+                outbound_locked_to_client_bytes = outbound_body_is_client_bytes(
+                    body=body,
+                    original_body_bytes=original_body_bytes,
+                )
+                wants_buffered_stream_ccr = bool(
                     stream
                     and ccr_response_handler_enabled
                     and self._has_headroom_retrieve_tool(
                         tools if tools is not None else body.get("tools")
                     )
                 )
+                buffered_stream_ccr = (
+                    wants_buffered_stream_ccr and not outbound_locked_to_client_bytes
+                )
+                if wants_buffered_stream_ccr and outbound_locked_to_client_bytes:
+                    logger.info(
+                        f"[{request_id}] CCR: signed thinking blocks force byte-faithful "
+                        "passthrough, so a stream:false flip could not reach upstream; "
+                        "using the plain streaming path instead of buffered retrieval"
+                    )
                 if buffered_stream_ccr:
                     if body.get("stream") is not False:
                         body["stream"] = False
@@ -3416,9 +3480,23 @@ class AnthropicHandlerMixin:
                         try:
                             resp_json = response.json()
                         except (json.JSONDecodeError, ValueError) as e:
-                            logger.debug(
-                                f"[{request_id}] Failed to parse response JSON for CCR handling: {e}"
-                            )
+                            # DEBUG is right for the buffered non-stream path, where
+                            # an unparseable body is just "no CCR handling". On the
+                            # buffered-stream path it means the reply came back in a
+                            # wire format we did not ask for, and every downstream
+                            # step (retrieval, SSE resynthesis, usage accounting)
+                            # silently no-ops — that has to be visible (#2952).
+                            if buffered_stream_ccr:
+                                logger.warning(
+                                    f"[{request_id}] CCR: buffered stream:false request got a "
+                                    f"non-JSON {response.status_code} reply "
+                                    f"(content-type={response.headers.get('content-type')!r}): {e}"
+                                )
+                            else:
+                                logger.debug(
+                                    f"[{request_id}] Failed to parse response JSON for CCR "
+                                    f"handling: {e}"
+                                )
 
                         # CCR Response Handling: Handle headroom_retrieve tool calls automatically
                         if (
@@ -3746,7 +3824,30 @@ class AnthropicHandlerMixin:
                         # Cache response under the SAME key it was looked up by:
                         # cache_lookup_messages is the raw pre-mutation snapshot, not
                         # the live (compressed/hooked) `messages` (#327).
-                        if self.cache and response.status_code == 200:
+                        # ``resp_json`` is None when the reply did not parse as
+                        # JSON — an SSE stream, most often. Caching those bytes
+                        # poisons the entry for every later caller that shares
+                        # the key: the cache key has no ``stream`` component, so
+                        # a buffered request would be answered with a stream it
+                        # cannot read (#2952).
+                        #
+                        # ``not stream`` mirrors the read gate at the cache
+                        # lookup above. ``stream`` still holds the *client's*
+                        # original flag here — the buffered-CCR conversion
+                        # flips ``body["stream"]``, never this variable — so a
+                        # turn the client asked to stream is the one case that
+                        # can reach this store site with a buffered body. That
+                        # body was shaped by a forced ``stream: false`` flip
+                        # plus CCR tool injection, and the key cannot tell it
+                        # apart from an ordinary non-streaming reply, so
+                        # storing it lets a later caller be answered with a
+                        # response built for a request it never made (#3019).
+                        if (
+                            self.cache
+                            and not stream
+                            and response.status_code == 200
+                            and resp_json is not None
+                        ):
                             await self.cache.set(
                                 cache_lookup_messages,
                                 model,
@@ -3909,6 +4010,63 @@ class AnthropicHandlerMixin:
                                     f"[{request_id}] Security response scan error: {sec_err}"
                                 )
 
+                        if (
+                            buffered_stream_ccr
+                            and response.status_code == 200
+                            and not resp_json
+                            and _looks_like_sse_response(response)
+                        ):
+                            # Upstream streamed instead of buffering, so there is
+                            # nothing to resynthesize — but the client asked for a
+                            # stream and this already is one. Relay it verbatim
+                            # rather than falling through to a plain Response the
+                            # _BufferedCCRResponse wrapper can only turn into a bare
+                            # error event (#2952).
+                            logger.warning(
+                                f"[{request_id}] CCR: relaying the upstream SSE reply verbatim; "
+                                "server-side retrieval was skipped for this turn"
+                            )
+                            relay_headers = {
+                                k: v
+                                for k, v in response_headers.items()
+                                if k.lower()
+                                not in (
+                                    "content-encoding",
+                                    "content-length",
+                                    "transfer-encoding",
+                                    "content-type",
+                                )
+                            }
+                            relayed_sse = response.content
+
+                            async def _upstream_sse_relay():
+                                yield relayed_sse
+
+                            return StreamingResponse(
+                                _upstream_sse_relay(),
+                                media_type="text/event-stream",
+                                headers=relay_headers,
+                            )
+
+                        if buffered_stream_ccr and response.status_code == 200 and not resp_json:
+                            logger.warning(
+                                f"[{request_id}] CCR: rejecting malformed buffered 200 reply "
+                                f"(content-type={response.headers.get('content-type')!r}, "
+                                f"body_bytes={len(response.content)})"
+                            )
+                            return Response(
+                                content=json.dumps(
+                                    {
+                                        "error": {
+                                            "type": "upstream_protocol_error",
+                                            "message": "Upstream returned an invalid buffered response.",
+                                        }
+                                    }
+                                ),
+                                status_code=502,
+                                media_type="application/json",
+                            )
+
                         if buffered_stream_ccr and response.status_code == 200 and resp_json:
                             sse_headers = {
                                 k: v
@@ -4007,122 +4165,50 @@ class AnthropicHandlerMixin:
 
                     class _BufferedCCRResponse(Response):
                         async def __call__(self, scope, receive, send):  # noqa: ANN001
-                            await asyncio.sleep(0)
-                            loop = asyncio.get_running_loop()
-                            keepalive_deadline = loop.time() + 1.0
-                            started = False
+                            # Send nothing until the buffered operation resolves.
+                            # The previous keepalive preamble committed
+                            # `200 text/event-stream` after 1s, i.e. before the
+                            # outcome was known: any upstream reply that then
+                            # failed to become SSE (non-200, unparseable body)
+                            # reached the client as a 200 whose body carried no
+                            # `message_start`, which Claude Code reports as "API
+                            # returned an empty or malformed response (HTTP 200) —
+                            # check for a proxy or gateway intercepting the
+                            # request". The real status was lost with it, so
+                            # client-side 429/5xx backoff never fired. Clients
+                            # budget minutes for a turn (Claude Code sends
+                            # `x-stainless-timeout: 600`), so waiting is free.
                             try:
-                                while True:
-                                    timeout = (
-                                        0.25
-                                        if started
-                                        else max(0.0, keepalive_deadline - loop.time())
-                                    )
-                                    done, _ = await asyncio.wait({operation}, timeout=timeout)
-                                    if done:
-                                        try:
-                                            result = operation.result()
-                                        except Exception as e:
-                                            await record_failed(provider=provider_name)
-                                            logger.error(
-                                                f"[{request_id}] Request failed: {type(e).__name__}: {e}"
-                                            )
-                                            if not started:
-                                                await send(
-                                                    {
-                                                        "type": "http.response.start",
-                                                        "status": 502,
-                                                        "headers": [
-                                                            (b"content-type", b"application/json")
-                                                        ],
-                                                    }
-                                                )
-                                                await send(
-                                                    {
-                                                        "type": "http.response.body",
-                                                        "body": json.dumps(
-                                                            {
-                                                                "type": "error",
-                                                                "error": {
-                                                                    "type": "api_error",
-                                                                    "message": "An error occurred while processing your request. Please try again.",
-                                                                },
-                                                            }
-                                                        ).encode(),
-                                                        "more_body": False,
-                                                    }
-                                                )
-                                                return
-                                            await send(
-                                                {
-                                                    "type": "http.response.body",
-                                                    "body": b'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"An error occurred while processing the request."}}\n\n',
-                                                    "more_body": False,
-                                                }
-                                            )
-                                            return
-
-                                        if not started:
-                                            await result(scope, receive, send)
-                                            return
-
-                                        body_iterator = getattr(result, "body_iterator", None)
-                                        if body_iterator is not None:
-                                            async for chunk in body_iterator:
-                                                await send(
-                                                    {
-                                                        "type": "http.response.body",
-                                                        "body": chunk,
-                                                        "more_body": True,
-                                                    }
-                                                )
-                                            await send(
-                                                {
-                                                    "type": "http.response.body",
-                                                    "body": b"",
-                                                    "more_body": False,
-                                                }
-                                            )
-                                            return
-
-                                        await send(
+                                result = await operation
+                            except Exception as e:
+                                await record_failed(provider=provider_name)
+                                logger.error(
+                                    f"[{request_id}] Request failed: {type(e).__name__}: {e}"
+                                )
+                                await send(
+                                    {
+                                        "type": "http.response.start",
+                                        "status": 502,
+                                        "headers": [(b"content-type", b"application/json")],
+                                    }
+                                )
+                                await send(
+                                    {
+                                        "type": "http.response.body",
+                                        "body": json.dumps(
                                             {
-                                                "type": "http.response.body",
-                                                "body": b'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"An error occurred while processing the request."}}\n\n',
-                                                "more_body": False,
+                                                "type": "error",
+                                                "error": {
+                                                    "type": "api_error",
+                                                    "message": "An error occurred while processing your request. Please try again.",
+                                                },
                                             }
-                                        )
-                                        return
-
-                                    if not started:
-                                        await send(
-                                            {
-                                                "type": "http.response.start",
-                                                "status": 200,
-                                                "headers": [
-                                                    (b"content-type", b"text/event-stream")
-                                                ],
-                                            }
-                                        )
-                                        started = True
-                                    await send(
-                                        {
-                                            "type": "http.response.body",
-                                            "body": b'event: ping\ndata: {"type":"ping"}\n\n',
-                                            "more_body": True,
-                                        }
-                                    )
-                            except asyncio.CancelledError:
-                                raise
-                            finally:
-                                if not operation.done():
-                                    operation.cancel()
-                                try:
-                                    await operation
-                                except asyncio.CancelledError:
-                                    pass
-                                except Exception:
-                                    pass
+                                        ).encode(),
+                                        "more_body": False,
+                                    }
+                                )
+                                return
+                            await result(scope, receive, send)
 
                     return _BufferedCCRResponse(media_type="text/event-stream")
                 return await _buffered_ccr_operation()

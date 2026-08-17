@@ -156,6 +156,12 @@ class PerfRecord:
     tokens_out: int = 0
     ttfb_ms: float = 0.0
     stages: dict[str, float] = field(default_factory=dict)
+    savings_breakdown: list[dict[str, object]] = field(default_factory=list)
+    # True when the proxy answered from its own response cache and never
+    # contacted the upstream. Such a turn has all-zero token counters and no
+    # upstream stage timings, so without this flag it reads as a turn that
+    # did nothing (#3019). Absent from pre-#3019 logs, hence the default.
+    from_response_cache: bool = False
 
 
 @dataclass
@@ -347,6 +353,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 total_ms=float(kv.get("total_ms", 0)),
                                 tokens_out=int(kv.get("tok_out", 0)),
                                 ttfb_ms=float(kv.get("ttfb_ms", 0)),
+                                from_response_cache=kv.get("cached", "0") == "1",
                                 stages=stages_by_rid.get(m.group("rid"), {}),
                             )
                         )
@@ -737,6 +744,10 @@ PERF_RECORD_FIELDS = [
     "tokens_out",
     "ttfb_ms",
     "stages",
+    "savings_breakdown",
+    # Appended last so every existing CSV column keeps its position; a reader
+    # that indexes by name is unaffected either way.
+    "from_response_cache",
 ]
 
 

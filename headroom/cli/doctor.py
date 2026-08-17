@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -30,6 +31,8 @@ from headroom.paths import savings_path
 from headroom.providers.claude import (
     REMOTE_CONTROL_BASE_URL_ENV,
     REMOTE_CONTROL_SIBLING_GATE_NOTE,
+    claude_auth_conflict_message,
+    claude_auth_conflict_sources,
     detect_claude_code_version,
     is_custom_anthropic_base_url,
     remote_control_applies_to_auth,
@@ -187,6 +190,84 @@ def check_claude_routing(settings_path: Path, port: int) -> CheckResult:
             hint="wrap it: headroom wrap claude",
         )
     return _classify_routing_url(name, base_url, port, source=str(settings_path))
+
+
+def check_claude_auth_conflict(
+    settings_path: Path,
+    project_settings_path: Path,
+    project_local_settings_path: Path,
+    environ: Mapping[str, str],
+) -> CheckResult | None:
+    """Report contradictory effective Claude credentials without their values."""
+
+    def settings_env(path: Path) -> dict[str, object]:
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        env = payload.get("env") if isinstance(payload, dict) else None
+        return dict(env) if isinstance(env, dict) else {}
+
+    conflict = claude_auth_conflict_sources(
+        (str(settings_path), settings_env(settings_path)),
+        (str(project_settings_path), settings_env(project_settings_path)),
+        (str(project_local_settings_path), settings_env(project_local_settings_path)),
+        ("shell environment", environ),
+    )
+    if conflict is None:
+        return None
+    return CheckResult(
+        name="claude auth",
+        status=FAIL,
+        summary=claude_auth_conflict_message(conflict),
+    )
+
+
+def claude_desktop_config_dir() -> Path:
+    """Return Claude Desktop's per-user config directory for this platform.
+
+    Claude Desktop (``com.anthropic.claudefordesktop``) stores its config here,
+    distinct from Claude Code CLI's ``~/.claude``. Directory existence is used as
+    a proxy for "Desktop is installed / has been run" (#2925).
+    """
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "Claude"
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else home / "AppData" / "Roaming"
+        return base / "Claude"
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else home / ".config"
+    return base / "Claude"
+
+
+def check_claude_desktop(config_dir: Path) -> CheckResult | None:
+    """Surface that Claude Desktop agent sessions bypass the proxy (#2925 / #869).
+
+    Claude Desktop unconditionally overwrites ``ANTHROPIC_BASE_URL`` when it
+    spawns agent sessions, so a correctly-wrapped ``~/.claude/settings.json``
+    (which the ``claude`` check verifies for the terminal CLI) does not route
+    Desktop traffic. Without this, ``doctor`` passes on the settings value alone
+    and never hints that Desktop sessions are unrouted.
+
+    Reported as its own per-surface row -- like ``wrap_marker`` and ``shell env``
+    -- and only when Desktop is detected, so it never contradicts a genuinely
+    routed CLI. Returns ``None`` when Desktop is absent (no row).
+    """
+    if not config_dir.exists():
+        return None
+    return CheckResult(
+        name="claude desktop",
+        status=WARN,
+        summary="agent sessions bypass the proxy (Desktop overwrites ANTHROPIC_BASE_URL)",
+        hint=(
+            "Desktop routing is not supported yet (see #869); use the terminal "
+            "Claude Code CLI for proxy-routed sessions."
+        ),
+    )
 
 
 def check_claude_remote_control_gate(
@@ -567,16 +648,26 @@ def doctor(port: int, emit_json: bool) -> None:
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
     installed = get_version()
 
+    project_claude_settings = Path.cwd() / ".claude" / "settings.json"
+    project_local_claude_settings = Path.cwd() / ".claude" / "settings.local.json"
     checks = [
         check_proxy_liveness(livez, base_url),
         check_version_drift(livez, installed),
         check_claude_routing(claude_settings_path(), port),
-        check_wrap_marker_staleness(Path.cwd() / ".claude" / "settings.local.json"),
+        check_wrap_marker_staleness(project_local_claude_settings),
         check_codex_routing(codex_config_path(), port),
         check_shell_env(os.environ, port),
         check_savings(stats, savings_path()),
         check_budget(stats),
     ]
+    auth_conflict_check = check_claude_auth_conflict(
+        claude_settings_path(),
+        project_claude_settings,
+        project_local_claude_settings,
+        os.environ,
+    )
+    if auth_conflict_check is not None:
+        checks.append(auth_conflict_check)
     # Lazy resolver: `claude --version` is a Node CLI subprocess (seconds of
     # cold start, 10s worst-case timeout) — only pay for it when the RC gate
     # is actually plausible (custom base URL + subscription auth).
@@ -585,6 +676,9 @@ def doctor(port: int, emit_json: bool) -> None:
     )
     if remote_control_gate_check is not None:
         checks.append(remote_control_gate_check)
+    desktop_check = check_claude_desktop(claude_desktop_config_dir())
+    if desktop_check is not None:
+        checks.append(desktop_check)
     deployments = check_deployments(list_manifests())
     if deployments is not None:
         checks.append(deployments)

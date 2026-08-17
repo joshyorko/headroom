@@ -199,6 +199,24 @@ response = client.chat.completions.create(
 
 The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes were removed in 0.9.x. Context management now happens automatically inside the pipeline.
 
+### Claude 1M context window (`headroom wrap claude --1m`)
+
+`headroom wrap claude --1m` opts a Claude Code session into Anthropic's 1M-token context window by selecting a `[1m]`-suffixed model id, which makes Claude Code send the `context-1m` beta header. The model that `--1m` targets is resolved in this order:
+
+1. an explicit `--model` / `ANTHROPIC_MODEL` value (used as-is, with a `[1m]` suffix appended when missing),
+2. otherwise `HEADROOM_1M_MODEL`, when set,
+3. otherwise the built-in default (currently `claude-opus-5`).
+
+Set `HEADROOM_1M_MODEL` to point `--1m` at a specific model without pinning `ANTHROPIC_MODEL` globally, so the default can follow a new Opus generation without a code change:
+
+```bash
+# Route --1m at a specific model for this shell / session
+export HEADROOM_1M_MODEL=claude-opus-5
+headroom wrap claude --1m
+```
+
+`HEADROOM_1M_MODEL` is a fallback only: an explicit `--model` or `ANTHROPIC_MODEL` always wins. The value may be given with or without the `[1m]` suffix; both `claude-opus-5` and `claude-opus-5[1m]` are accepted, and the suffix is added when absent.
+
 ## Pipeline Extensions
 
 Use a `headroom.pipeline_extension` entry point when you need to normalize or annotate requests before they leave Headroom. The `PRE_SEND` stage is the right place for provider-specific request cleanup, such as turning `content: null` into `content: ""` for upstreams that reject OpenAI-spec tool-call messages.
@@ -306,6 +324,7 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_DEDUPE` | Whole-conversation verbatim cross-turn dedup in the router (cache-safe, information-preserving via retrieval markers). Superseded-read drop + lossless folds run without it; this adds verbatim dedup. | `off` |
 | `HEADROOM_CACHE_TTL_LEARN` | Append per-turn cache-outcome observations (provider, model, idle, hit/miss) to `cache_ttl_observations.jsonl` for the offline `headroom-cache-ttl` learner. Observation-only (no request-behavior change); respects `HEADROOM_STATELESS`; the log is size-bounded. | `off` |
 | `HEADROOM_KOMPRESS_ENDPOINT` / `HEADROOM_KOMPRESS_ENDPOINT_TOKEN` | Offload ML compression (Kompress) to a remote endpoint instead of the local ONNX model — used by reasoning compaction and the router when set. | -- |
+| `HEADROOM_1M_MODEL` | Fallback model that `headroom wrap claude --1m` targets when neither `--model` nor `ANTHROPIC_MODEL` is set. Accepts the id with or without the `[1m]` suffix (added when absent); an explicit `--model` / `ANTHROPIC_MODEL` always wins. See [Claude 1M context window](#claude-1m-context-window-headroom-wrap-claude---1m). | `claude-opus-5` |
 
 For provider-only proxying, prefer `HEADROOM_HTTP_PROXY` over process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or `NO_PROXY`. HTTPX reads those global variables, but Headroom also passes them through to tool executions.
 

@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import warnings
+from importlib import import_module
 from typing import Any, Literal, cast
 
 import click
@@ -17,6 +18,38 @@ from headroom.providers.registry import (
 from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 
 from .main import main
+
+
+def ensure_proxy_dependencies() -> None:
+    """Verify optional proxy extras are installed before starting or wrapping."""
+    required_modules: list[str] = [
+        "fastapi",
+        "uvicorn",
+        "httpx",
+        "openai",
+        "mcp",
+        "magika",
+        "zstandard",
+        "websockets",
+        "onnxruntime",
+        "transformers",
+        "watchdog",
+    ]
+    if sys.implementation.name != "pypy":
+        required_modules.append("orjson")
+
+    try:
+        for module in required_modules:
+            import_module(module)
+    except ImportError as e:
+        click.secho(
+            "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
+            fg="red",
+            err=True,
+        )
+        click.secho(f"Details: {e}", fg="red", err=True)
+        raise SystemExit(1) from None
+
 
 # ---------------------------------------------------------------------------
 # Startup log suppression.
@@ -1066,23 +1099,16 @@ def proxy(
     Usage with OpenAI-compatible clients:
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
+    ensure_proxy_dependencies()
+
     # Import here to avoid slow startup
-    try:
-        from headroom.proxy.server import (
-            ProxyConfig,
-            _parse_csv_tools,
-            _parse_exclude_tools,
-            _parse_tool_profiles,
-            run_server,
-        )
-    except ImportError as e:
-        click.secho(
-            "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
-            fg="red",
-            err=True,
-        )
-        click.secho(f"Details: {e}", fg="red", err=True)
-        raise SystemExit(1) from None
+    from headroom.proxy.server import (
+        ProxyConfig,
+        _parse_csv_tools,
+        _parse_exclude_tools,
+        _parse_tool_profiles,
+        run_server,
+    )
 
     # Warn if --learn and --no-learn are both set (--no-learn wins, per docstring)
     if learn and no_learn:

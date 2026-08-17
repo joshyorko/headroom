@@ -66,6 +66,7 @@ def test_wrap_vscode_no_configure_prints_transparent_settings(tmp_path: Path) ->
     assert result.exit_code == 0, result.output
     assert not path.exists()
     assert "overrideProxyUrl" in result.output
+    assert "overrideCapiUrl" in result.output
     assert "overrideAuthType" in result.output
 
 

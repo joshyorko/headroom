@@ -62,6 +62,22 @@ _REPO_DOTENV_HEADROOM_KEYS = {
 # config instead of the test's. Scrub them so local runs match CI; tests
 # that need a value set it explicitly via monkeypatch or CliRunner env.
 @pytest.fixture(autouse=True)
+def _skip_proxy_dependency_gate_unless_exercised(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Most CLI tests run without headroom-ai[proxy] extras installed."""
+    if request.node.get_closest_marker("proxy_dependency_gate") is not None:
+        return
+    try:
+        from headroom.cli import proxy
+    except ModuleNotFoundError:
+        # Native-wrapper jobs intentionally install only pytest and exercise the
+        # installer scripts without importing Headroom's runtime dependencies.
+        return
+    monkeypatch.setattr(proxy, "ensure_proxy_dependencies", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _scrub_developer_headroom_env(monkeypatch):
     for key in list(os.environ):
         if key.startswith("HEADROOM_"):

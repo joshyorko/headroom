@@ -524,7 +524,9 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
             "handle_anthropic_batch_passthrough"
         )
         assert client.post("/v1/chat/completions").json()["handler"] == "handle_openai_chat"
+        assert client.post("/chat/completions").json()["handler"] == "handle_openai_chat"
         assert client.post("/v1/responses").json()["handler"] == "handle_openai_responses"
+        assert client.post("/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/v1/codex/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/backend-api/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/backend-api/codex/responses").json()["handler"] == (

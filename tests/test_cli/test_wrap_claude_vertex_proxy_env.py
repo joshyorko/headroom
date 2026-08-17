@@ -78,6 +78,13 @@ def _invoke_wrap_claude(
 
     monkeypatch.setattr(wrap_mod, "_write_claude_wrap_base_url", fake_write_base_url)
     monkeypatch.setattr(wrap_mod, "_restore_claude_wrap_base_url", lambda *_args, **_kwargs: None)
+
+    def fake_write_tool_search(value: str, **kwargs: object) -> None:
+        captured["write_tool_search_value"] = value
+        captured["write_tool_search_kwargs"] = kwargs
+
+    monkeypatch.setattr(wrap_mod, "_write_claude_wrap_tool_search", fake_write_tool_search)
+    monkeypatch.setattr(wrap_mod, "_restore_claude_wrap_tool_search", lambda *_a, **_k: None)
     monkeypatch.setattr(wrap_mod, "_print_telemetry_notice", lambda: None)
 
     def fake_ensure_proxy(*args: object, **kwargs: object) -> tuple[None, int]:
@@ -139,6 +146,57 @@ def test_wrap_claude_plain_mode_api_key_auth_skips_remote_control_warning(
         runner, monkeypatch, env={"ANTHROPIC_API_KEY": "sk-ant-api-xxx"}
     )
     assert "Remote Control" not in output
+
+
+def test_wrap_claude_rejects_conflicting_auth_before_proxy_mutation(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    user_settings = tmp_path / "user-settings.json"
+    user_settings.write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"token-value"}}', encoding="utf-8")
+    monkeypatch.setattr(wrap_mod, "claude_user_settings_path", lambda: user_settings)
+    monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/claude")
+    proxy_calls: list[int] = []
+    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda port: proxy_calls.append(port))
+
+    result = runner.invoke(
+        main,
+        ["wrap", "claude", "--no-mcp", "--no-tokensave", "--no-serena"],
+        env={"ANTHROPIC_API_KEY": "api-value"},
+    )
+
+    assert result.exit_code != 0
+    assert "both ANTHROPIC_API_KEY" in result.output
+    assert "shell environment" in result.output
+    assert str(user_settings) in result.output
+    assert "api-value" not in result.output
+    assert "token-value" not in result.output
+    assert proxy_calls == []
+
+
+def test_wrap_claude_includes_shared_project_settings_in_auth_precedence(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    user_settings = tmp_path / "user-settings.json"
+    user_settings.write_text("{}", encoding="utf-8")
+    project_dir = tmp_path / ".claude"
+    project_dir.mkdir()
+    shared_settings = project_dir / "settings.json"
+    shared_settings.write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"token-value"}}', encoding="utf-8")
+    monkeypatch.setattr(wrap_mod, "claude_user_settings_path", lambda: user_settings)
+    monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/claude")
+
+    result = runner.invoke(
+        main,
+        ["wrap", "claude", "--no-mcp", "--no-tokensave", "--no-serena"],
+        env={"ANTHROPIC_API_KEY": "api-value"},
+    )
+
+    assert result.exit_code != 0
+    assert str(shared_settings) in result.output
+    assert "api-value" not in result.output
+    assert "token-value" not in result.output
 
 
 def test_wrap_claude_sibling_note_accurate_under_1m_and_tool_search_optouts(
@@ -209,6 +267,24 @@ def test_wrap_claude_tool_search_banner_line_still_accurate_when_active(
     assert "on-demand tool loading kept on" in output
     assert "keeps it on for this session" in output
     assert "DISABLED per your setting" not in output
+    assert _captured["write_tool_search_value"] == "true"
+
+
+def test_wrap_claude_foundry_persists_disabled_tool_search_for_workers(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, output = _invoke_wrap_claude(
+        runner,
+        monkeypatch,
+        env={
+            "CLAUDE_CODE_USE_FOUNDRY": "1",
+            "ANTHROPIC_FOUNDRY_BASE_URL": "https://tenant.services.ai.azure.com/anthropic",
+        },
+    )
+
+    assert captured["child_env"]["ENABLE_TOOL_SEARCH"] == "false"
+    assert captured["write_tool_search_value"] == "false"
+    assert "on-demand tool loading DISABLED" in output
 
 
 def test_wrap_claude_vertex_passes_custom_base_url_to_proxy_before_child_redirect(

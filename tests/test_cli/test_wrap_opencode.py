@@ -20,6 +20,16 @@ def _no_retired_context_tool_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _mock_ensure_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wrap-opencode tests should not spawn a real proxy subprocess in CI."""
+
+    def fake_ensure_proxy(port: int, no_proxy: bool, **kwargs):  # noqa: ANN002, ANN003
+        return None, port
+
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", fake_ensure_proxy)
+
+
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()

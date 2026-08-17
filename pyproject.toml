@@ -78,6 +78,8 @@ proxy = [
     "orjson>=3.9.14; platform_python_implementation != 'PyPy'",
     "httpx[http2]>=0.24.0",
     "openai>=2.14.0",             # OpenAI API format support
+    # The server still uses the v1 low-level Server decorator API. Keep this
+    # cap until the SDK 2.x port lands (GH #2658 / regression GH #2977).
     "mcp>=1.28.1,<2.0.0",         # MCP server (headroom_compress, retrieve, stats)
     "magika>=0.6.0",              # ML content detection for ContentRouter
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)

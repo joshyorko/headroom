@@ -2798,6 +2798,43 @@ def has_new_ccr_markers(
     )
 
 
+def history_references_ccr_tool(messages: Any) -> bool:
+    """True when the request history already contains a ``headroom_retrieve`` call.
+
+    Anthropic emits it as an assistant ``tool_use`` content block; OpenAI as an
+    assistant ``tool_calls[].function.name``. When such a reference is present in
+    history but the tool is not re-declared in ``tools``, the provider rejects
+    the whole request (``400 Tool reference 'headroom_retrieve' not found``,
+    #2440). Used to force sticky re-injection on the sessionless path.
+    """
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") == CCR_TOOL_NAME
+                ):
+                    return True
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function")
+                name = fn.get("name") if isinstance(fn, dict) else tc.get("name")
+                if name == CCR_TOOL_NAME:
+                    return True
+    return False
+
+
 def apply_session_sticky_ccr_tool(
     *,
     provider: Literal["anthropic", "openai", "google"],
@@ -2805,6 +2842,7 @@ def apply_session_sticky_ccr_tool(
     request_id: str | None,
     existing_tools: list[dict[str, Any]] | None,
     has_compressed_content_this_turn: bool,
+    history_has_ccr_reference: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on CCR retrieval-tool injection per :class:`SessionCcrTracker`.
 
@@ -2853,9 +2891,14 @@ def apply_session_sticky_ccr_tool(
         )
         return tools_out, False
 
-    # No session_id (e.g. WS path): per-turn decision drives directly.
+    # No session_id (e.g. WS path): the per-turn flag drives the decision, but
+    # a headroom_retrieve tool_use already sitting in history must ALSO force
+    # re-injection. Without a session the tracker can't remember a prior turn's
+    # CCR, so a later turn with no fresh compression would drop the tool
+    # definition and the provider rejects the request because history still
+    # references it (#2440).
     if not session_id:
-        if not has_compressed_content_this_turn:
+        if not (has_compressed_content_this_turn or history_has_ccr_reference):
             log_tool_injection_decision(
                 provider=provider,
                 session_id=None,
@@ -2869,7 +2912,9 @@ def apply_session_sticky_ccr_tool(
         log_tool_injection_decision(
             provider=provider,
             session_id=None,
-            decision="inject_first_time",
+            decision="inject_first_time"
+            if has_compressed_content_this_turn
+            else "inject_history_reference",
             tool_definition_bytes_count=len(replay.canonical_bytes),
             request_id=request_id,
         )
@@ -3370,6 +3415,13 @@ _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 _TOOL_SEARCH_MIN_TOOLS = 12
 
 
+def _tool_search_resident_key(name: Any) -> str:
+    """Normalize a client tool name for resident-tool membership checks."""
+    # Oh My Pi prefixes every built-in with ``_``. Strip only leading namespace
+    # markers so internal separators such as ``mcp__server__read`` stay intact.
+    return str(name or "").lower().lstrip("_")
+
+
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
     """Return whether Anthropic server-side tool search is valid for this upstream."""
     from headroom.providers.claude.runtime import is_custom_anthropic_base_url
@@ -3430,17 +3482,17 @@ def inject_tool_search_deferral(
     last_resident_real: dict[str, Any] | None = None
     resident_has_cache_control = False
 
-    # Clients disagree on casing for the same tool: Claude Code sends ``Bash`` /
-    # ``ToolSearch`` where opencode sends ``bash``. Compare case-insensitively so
-    # the exemption applies to both — an exact match silently deferred *every*
-    # tool for PascalCase clients, including their own tool-search tool.
-    core_lower = {name.lower() for name in core_tools}
+    # Clients disagree on casing and leading namespace markers for the same tool:
+    # Claude Code sends ``Bash``, opencode sends ``bash``, and Oh My Pi sends
+    # ``_bash``. Normalize both the configured names and each candidate so the
+    # exemption applies consistently across clients.
+    core_keys = {_tool_search_resident_key(name) for name in core_tools}
 
     for tool in tools:
         if (
             not isinstance(tool, dict)
             or tool.get("type")
-            or str(tool.get("name") or "").lower() in core_lower
+            or _tool_search_resident_key(tool.get("name")) in core_keys
         ):
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
@@ -3586,6 +3638,126 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
     return (out, removed) if changed else (messages, 0)
 
 
+def _ccr_result_as_text(block: dict[str, Any]) -> str:
+    """Flatten a ``tool_result`` block's content to plain text, preserving what
+    the model already saw. Falls back to a short placeholder when there is no
+    textual content to keep."""
+    content = block.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        parts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+        ]
+        joined = "\n".join(part for part in parts if part)
+        if joined.strip():
+            return joined
+    return "[headroom_retrieve result omitted]"
+
+
+def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
+    """Neutralize ``headroom_retrieve`` history references the outbound ``tools``
+    array cannot support.
+
+    Claude Code replays one transcript across requests that carry different
+    ``tools`` arrays, and Anthropic validates every history ``tool_use`` against
+    the array of the request at hand. A passthrough side-request (the prompt-type
+    Stop hook evaluator, ``/compact``) that the proxy forwards without declaring
+    ``headroom_retrieve`` then 400s on a historical ``tool_use`` that names it --
+    the CCR sibling of the tool-search history repair (#2814 / #2807). This is
+    belt-and-braces with the injection-side fixes: they keep the tool available
+    where it belongs; this makes the 400 structurally impossible where it cannot.
+
+    When the request does NOT declare ``headroom_retrieve``, replace each
+    ``headroom_retrieve`` ``tool_use`` block and its paired ``tool_result`` with a
+    text block, so no dangling reference survives. Neutralize rather than drop:
+    CCR's ``tool_use`` (an assistant turn) and its ``tool_result`` (the next user
+    turn) live in DIFFERENT messages, so removing a message could leave two
+    same-role messages adjacent and break Anthropic's user/assistant alternation.
+    Replacing blocks in place keeps every message and role intact, and preserves
+    the retrieved text the model already saw.
+
+    Returns ``(messages, blocks_neutralized)``, and the ORIGINAL ``messages``
+    object when nothing changed -- callers rely on identity to skip the write-back.
+    """
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME
+
+    if not isinstance(messages, list):
+        return messages, 0
+
+    tool_list = tools if isinstance(tools, list) else []
+    available = {str(t["name"]) for t in tool_list if isinstance(t, dict) and t.get("name")}
+    # The tool is declared this turn (e.g. the main loop, or sticky re-injection),
+    # so its history references resolve. Nothing to repair.
+    if CCR_TOOL_NAME in available:
+        return messages, 0
+
+    # First pass: collect the ids of headroom_retrieve tool_use blocks so their
+    # paired tool_result blocks (in a later user turn) can be matched.
+    retrieve_ids: set[str] = set()
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == CCR_TOOL_NAME
+            ):
+                use_id = block.get("id")
+                if use_id:
+                    retrieve_ids.add(str(use_id))
+
+    if not retrieve_ids:
+        return messages, 0
+
+    out: list[Any] = []
+    neutralized = 0
+    changed = False
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+
+        new_content: list[Any] = []
+        touched = False
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "tool_use" and block.get("name") == CCR_TOOL_NAME:
+                    new_content.append(
+                        {
+                            "type": "text",
+                            "text": "[headroom_retrieve call omitted: tool not available this turn]",
+                        }
+                    )
+                    neutralized += 1
+                    touched = True
+                    continue
+                if (
+                    block.get("type") == "tool_result"
+                    and str(block.get("tool_use_id", "")) in retrieve_ids
+                ):
+                    new_content.append({"type": "text", "text": _ccr_result_as_text(block)})
+                    neutralized += 1
+                    touched = True
+                    continue
+            new_content.append(block)
+
+        if touched:
+            changed = True
+            repaired = dict(message)
+            repaired["content"] = new_content
+            out.append(repaired)
+        else:
+            out.append(message)
+
+    return (out, neutralized) if changed else (messages, 0)
+
+
 # ---------------------------------------------------------------------------
 # Server-side Tool Search injection — OpenAI Responses API (gpt-5.4+).
 #
@@ -3685,10 +3857,10 @@ def inject_tool_search_deferral_openai(
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0
-    # Case-insensitive for the same reason as the Anthropic path above: the
-    # resident-name sets are lowercase, clients are not required to be.
-    resident_lower = {name.lower() for name in core_tools} | {
-        name.lower() for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+    # Normalize for the same reason as the Anthropic path above: clients may use
+    # different casing or a leading namespace marker for the same resident tool.
+    resident_keys = {_tool_search_resident_key(name) for name in core_tools} | {
+        _tool_search_resident_key(name) for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
     }
     for tool in tools:
         if not isinstance(tool, dict):
@@ -3699,7 +3871,7 @@ def inject_tool_search_deferral_openai(
         # trained to search namespaces / MCP servers). Everything else — core
         # coding tools and other hosted tools — stays resident.
         deferrable = (
-            ttype == "function" and str(tool.get("name") or "").lower() not in resident_lower
+            ttype == "function" and _tool_search_resident_key(tool.get("name")) not in resident_keys
         ) or ttype == "mcp"
         if deferrable and not tool.get("defer_loading"):
             new_tool = dict(tool)

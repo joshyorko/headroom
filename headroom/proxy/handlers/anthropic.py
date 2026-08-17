@@ -2030,7 +2030,10 @@ class AnthropicHandlerMixin:
                 # dropping the gate cannot start injecting into non-CCR
                 # conversations.
                 if configured_inject_tool:
-                    from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+                    from headroom.proxy.helpers import (
+                        apply_session_sticky_ccr_tool,
+                        history_references_ccr_tool,
+                    )
 
                     # Inject whenever the request carries ANY CCR marker, new or
                     # replayed from the frozen prefix. #1850 narrowed the
@@ -2055,6 +2058,7 @@ class AnthropicHandlerMixin:
                         request_id=request_id,
                         existing_tools=tools,
                         has_compressed_content_this_turn=injector.has_compressed_content,
+                        history_has_ccr_reference=history_references_ccr_tool(optimized_messages),
                     )
                     if ccr_tool_injected:
                         logger.debug(
@@ -2712,6 +2716,28 @@ class AnthropicHandlerMixin:
                     "(tools array cannot resolve their tool_reference entries)",
                     request_id,
                     _ts_stripped,
+                )
+
+            # CCR retrieve history repair (#2814). Run beside the tool-search
+            # repair and after both normal CCR injection and turn hooks, so it
+            # validates against the final outbound tools array. A side-request
+            # that does not declare headroom_retrieve cannot retain historical
+            # tool_use/tool_result references that Anthropic would reject.
+            from headroom.proxy.helpers import strip_unsupported_ccr_retrieve_blocks
+
+            _ccr_repaired, _ccr_neutralized = strip_unsupported_ccr_retrieve_blocks(
+                body.get("messages"), body.get("tools")
+            )
+            if _ccr_neutralized:
+                body["messages"] = _ccr_repaired
+                optimized_messages = _ccr_repaired
+                body_mutation_tracker.mark_mutated("ccr_retrieve_history_repair")
+                transforms_applied.append(f"router:ccr_retrieve_repair:{_ccr_neutralized}blocks")
+                logger.info(
+                    "[%s] CCR: neutralized %d headroom_retrieve history block(s) "
+                    "(tools array does not declare the tool this turn)",
+                    request_id,
+                    _ccr_neutralized,
                 )
 
             # Consistency: report tok_before/tok_after with ONE tokenizer. The pipeline

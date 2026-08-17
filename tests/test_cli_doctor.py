@@ -546,7 +546,16 @@ class TestDoctorCommand:
         monkeypatch.setattr(doctor_mod, "codex_config_path", lambda: tmp_path / "config.toml")
         monkeypatch.setattr(doctor_mod, "savings_path", lambda: tmp_path / "savings.json")
         monkeypatch.setattr(doctor_mod, "list_manifests", lambda: [])
-        for var in ("ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "HEADROOM_PORT"):
+        for var in (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_VERTEX",
+            "OPENAI_BASE_URL",
+            "HEADROOM_PORT",
+        ):
             monkeypatch.delenv(var, raising=False)
         return tmp_path
 
@@ -576,6 +585,7 @@ class TestDoctorCommand:
     def test_all_pass_exits_0(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
         monkeypatch.setattr(doctor_mod, "get_version", lambda: "0.26.0")
+        monkeypatch.setattr(doctor_mod, "detect_claude_code_version", lambda: None)
         (isolated / "settings.json").write_text(
             json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}),
             encoding="utf-8",

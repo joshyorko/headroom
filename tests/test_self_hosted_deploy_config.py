@@ -23,8 +23,10 @@ def _render_compose() -> str:
 def test_self_hosted_compose_selects_external_memory_backend() -> None:
     rendered = _render_compose()
 
-    assert "- --memory-backend" in rendered
-    assert "- ${HEADROOM_MEMORY_BACKEND:-qdrant-neo4j}" in rendered
+    assert "--memory-backend" not in rendered
+    assert "--memory-neo4j-uri" not in rendered
+    assert "--memory-neo4j-user" not in rendered
+    assert "HEADROOM_MEMORY_BACKEND=${HEADROOM_MEMORY_BACKEND:-qdrant-neo4j}" in rendered
     assert "HEADROOM_QDRANT_HOST=${HEADROOM_QDRANT_HOST:-qdrant}" in rendered
     assert "HEADROOM_QDRANT_PORT=${HEADROOM_QDRANT_PORT:-6333}" in rendered
     assert "HEADROOM_NEO4J_URI=${HEADROOM_NEO4J_URI:-neo4j://neo4j:7687}" in rendered

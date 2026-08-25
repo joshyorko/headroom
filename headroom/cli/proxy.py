@@ -1425,12 +1425,22 @@ def proxy(
         # --learn implies --memory (need backend for storing patterns)
         # Stateless mode disables memory (requires SQLite on disk)
         memory_enabled=False if is_stateless else (memory or (learn and not no_learn)),
+        memory_backend=cast(
+            Literal["local", "qdrant-neo4j"],
+            os.environ.get("HEADROOM_MEMORY_BACKEND", "local").strip().lower(),
+        ),
         memory_db_path=memory_db_path,
         memory_storage_mode=cast(Literal["project", "user", "global"], memory_storage.lower()),
         memory_project_root_override=memory_project_root,
         memory_inject_tools=not no_memory_tools,
         memory_inject_context=not no_memory_context,
         memory_top_k=memory_top_k,
+        memory_neo4j_uri=os.environ.get("HEADROOM_NEO4J_URI", "neo4j://localhost:7687"),
+        memory_neo4j_user=os.environ.get("HEADROOM_NEO4J_USER", "neo4j"),
+        memory_neo4j_password=(
+            os.environ.get("HEADROOM_NEO4J_PASSWORD")
+            or os.environ.get("NEO4J_PASSWORD", "")
+        ),
         **qdrant_overrides,
         # Traffic Learning: only with --learn, never with --no-learn
         # Stateless mode disables learning (requires filesystem)

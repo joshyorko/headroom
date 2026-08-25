@@ -492,6 +492,28 @@ class TestNewEnvVarWiring:
         assert result.exit_code == 0, result.output
         assert mock_run_server["config"].memory_top_k == 20
 
+    def test_external_memory_backend_from_env(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy", "--memory"],
+            env={
+                "HEADROOM_MEMORY_BACKEND": "qdrant-neo4j",
+                "HEADROOM_NEO4J_URI": "neo4j://neo4j:7687",
+                "HEADROOM_NEO4J_USER": "neo4j",
+                "HEADROOM_NEO4J_PASSWORD": "test-secret",
+            },
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0, result.output
+        config = mock_run_server["config"]
+        assert config.memory_backend == "qdrant-neo4j"
+        assert config.memory_neo4j_uri == "neo4j://neo4j:7687"
+        assert config.memory_neo4j_user == "neo4j"
+        assert config.memory_neo4j_password == "test-secret"
+
 
 class TestHelpTextCompleteness:
     """Verify key flags appear in --help output with non-trivial descriptions."""

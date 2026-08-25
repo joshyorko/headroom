@@ -227,9 +227,7 @@ class HeadroomOtelMetrics:
         )
         self._proxy_attempted_input_tokens = self._meter.create_counter(
             "headroom.proxy.tokens.attempted_input",
-            description=(
-                "Input tokens Headroom attempted to optimize before compression."
-            ),
+            description=("Input tokens Headroom attempted to optimize before compression."),
             unit="1",
         )
         self._proxy_output_saved_tokens = self._meter.create_counter(
@@ -239,9 +237,7 @@ class HeadroomOtelMetrics:
         )
         self._proxy_savings_usd = self._meter.create_counter(
             "headroom.proxy.savings.usd",
-            description=(
-                "Estimated savings in USD by distinct Headroom or provider-cache layer."
-            ),
+            description=("Estimated savings in USD by distinct Headroom or provider-cache layer."),
             unit="USD",
         )
         self._proxy_saved_tokens = self._meter.create_counter(

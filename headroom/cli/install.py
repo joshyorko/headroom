@@ -139,6 +139,12 @@ def _require_manifest(profile: str) -> DeploymentManifest:
     raise _missing_profile_error(profile, installed)
 
 
+def _is_windows() -> bool:
+    """Return whether this command is running on Windows."""
+
+    return sys.platform.startswith("win")
+
+
 def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool = False) -> None:
     if not assume_start_lock:
         with acquire_runtime_start_lock(manifest.profile) as acquired:
@@ -499,9 +505,10 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     "--port",
     "-p",
     default=8787,
+    envvar="HEADROOM_PORT",
     type=click.IntRange(1, 65535),
     show_default=True,
-    help="Persistent proxy port.",
+    help="Persistent proxy port (env: HEADROOM_PORT).",
 )
 @click.option(
     "--backend",
@@ -559,7 +566,8 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     is_flag=True,
     help=(
         "Opt in to tool_result interceptors (ast-grep Read outliner, etc.) in the "
-        "persistent runtime. Off by default while this feature ships."
+        "persistent runtime. This also selects the required canary rollout channel "
+        "unless --env HEADROOM_ROLLOUT_CHANNEL=... is supplied."
     ),
 )
 @click.option(
@@ -657,6 +665,16 @@ def install_apply(
         bedrock_profile=bedrock_profile,
         extra_env=combined_env,
     )
+    if (
+        preset == InstallPreset.PERSISTENT_SERVICE.value
+        and manifest.preset == InstallPreset.PERSISTENT_TASK.value
+        and _is_windows()
+    ):
+        click.echo(
+            "Warning: persistent-service is not supported on Windows because the "
+            "Python runner cannot act as a Windows service. Falling back to "
+            "persistent-task with Task Scheduler."
+        )
 
     _apply_manifest(manifest)
     _echo_installed(manifest)
@@ -665,7 +683,13 @@ def install_apply(
 @main.command("deploy")
 @click.option("--profile", default="default", show_default=True, help="Deployment profile name.")
 @click.option(
-    "--port", "-p", default=8787, type=int, show_default=True, help="Persistent proxy port."
+    "--port",
+    "-p",
+    default=8787,
+    envvar="HEADROOM_PORT",
+    type=int,
+    show_default=True,
+    help="Persistent proxy port (env: HEADROOM_PORT).",
 )
 @click.option(
     "--backend",

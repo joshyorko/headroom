@@ -490,3 +490,59 @@ def test_learn_target_ignored_for_unsupported_agent(
 
     assert result.exit_code == 0, result.output
     assert "Note: --target is not supported for codex" in result.output
+
+
+@pytest.mark.parametrize(("enabled", "expected"), [(True, "live"), (False, "blocked")])
+def test_activate_output_shaper_reports_effective_rollout_decision(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, expected: str
+) -> None:
+    import urllib.request
+
+    from headroom.cli.learn import _activate_output_shaper
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "rollout": {
+                        "features": [
+                            {"name": "proxy_output_shaper", "enabled": enabled},
+                        ]
+                    }
+                }
+            ).encode()
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: Response())
+
+    status, port = _activate_output_shaper(9876)
+
+    assert status == expected
+    assert port == 9876
+
+
+def test_activate_output_shaper_handles_malformed_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.request
+
+    from headroom.cli.learn import _activate_output_shaper
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self) -> bytes:
+            return b"not-json"
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: Response())
+
+    assert _activate_output_shaper(9876) == ("error", 9876)

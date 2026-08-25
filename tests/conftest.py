@@ -194,6 +194,38 @@ def pytest_runtest_call(item):
 
 
 @pytest.fixture(autouse=True)
+def _null_binary_pins():
+    """Null the tools.json SHA-256 pins during tests.
+
+    Installer tests fetch small mock archives, whose digests can't match the
+    real published pins. Nulling the pins lets those download/extract mechanics
+    tests run (verification then falls back to HTTPS trust); the tests that
+    specifically exercise verification set their own pin explicitly. Production
+    keeps the real pins (this fixture is test-only) and the tools-hash-refresh
+    CI gate guarantees they stay correct.
+    """
+    try:
+        from headroom import binaries
+    except Exception:
+        # Lean CI environments (e.g. the native-installer jobs) omit heavy deps
+        # such as opentelemetry that importing `binaries` pulls in. There are no
+        # tool pins to null there, so skip cleanly rather than erroring at setup.
+        yield
+        return
+
+    saved = [
+        (asset, asset.get("sha256"))
+        for tool in binaries._registry().get("tools", {}).values()
+        for asset in tool.get("assets", {}).values()
+    ]
+    for asset, _original in saved:
+        asset["sha256"] = None
+    yield
+    for asset, original in saved:
+        asset["sha256"] = original
+
+
+@pytest.fixture(autouse=True)
 def _reset_headroom_logger_propagation():
     """Keep `headroom.*` log records flowing to pytest's caplog handler.
 
@@ -253,12 +285,12 @@ def _reset_headroom_logger_propagation():
 def _isolate_codex_home_and_guard_real_config(monkeypatch, tmp_path):
     """Keep Codex config-writing tests out of the user's real config."""
 
-    def _snapshot(path: Path) -> tuple[bool, int | None, int | None]:
+    def _snapshot(path: Path) -> tuple[bool, bytes | None]:
         try:
-            stat = path.stat()
+            content = path.read_bytes()
         except FileNotFoundError:
-            return (False, None, None)
-        return (True, stat.st_mtime_ns, stat.st_size)
+            return (False, None)
+        return (True, content)
 
     before = {path: _snapshot(path) for path in _REAL_CODEX_CONFIG_PATHS}
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex-test-home"))

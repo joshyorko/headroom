@@ -45,8 +45,8 @@ The command:
 1. validates Copilot subscription access and resolves the account API endpoint;
 2. starts Headroom on `127.0.0.1:8787` with the short-lived upstream token;
 3. adds a marker-owned block to VS Code user settings containing
-   `github.copilot.advanced.debug.overrideProxyUrl` and
-   `github.copilot.advanced.debug.overrideAuthType`;
+   `github.copilot.advanced.debug.overrideProxyUrl` (inline completions) and
+   `github.copilot.advanced.debug.overrideCapiUrl` (chat);
 4. keeps running until `Ctrl+C` so the local proxy is available to VS Code.
 
 Continue using Copilot's normal model picker. The request body—and therefore the

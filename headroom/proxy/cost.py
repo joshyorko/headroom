@@ -425,7 +425,6 @@ def build_prefix_cache_stats(
 def merge_cost_stats(
     cost_stats: dict | None,
     cache_stats: dict,
-    cli_tokens_avoided: int = 0,
 ) -> dict | None:
     """Merge compression and cache savings into cost stats.
 
@@ -450,10 +449,6 @@ def merge_cost_stats(
         "savings_usd": round(compression_savings, 4),
         "compression_savings_usd": round(compression_savings, 4),
         "cache_savings_usd": round(cache_net, 4),
-        "cli_tokens_avoided": cli_tokens_avoided,
-        "cli_filtering_tokens_avoided": cli_tokens_avoided,
-        "cli_tokens_included_in_compression": True,
-        "cli_filtering_tokens_included_in_compression": True,
     }
 
 
@@ -513,7 +508,6 @@ def build_session_summary(
     metrics: Any,
     prefix_cache_stats: dict,
     total_tokens_before: int,
-    cli_tokens_avoided: int = 0,
 ) -> dict[str, Any]:
     """Build a human-readable session summary from metrics and request logs.
 
@@ -622,14 +616,6 @@ def build_session_summary(
             "best_compression_pct": best_compression,
             "best_detail": best_detail,
             "total_tokens_removed": metrics.tokens_saved_total,
-            "cli_filtering_tokens_avoided": cli_tokens_avoided,
-            "total_tokens_saved_with_cli_filtering": (
-                metrics.tokens_saved_total + cli_tokens_avoided
-            ),
-            "total_tokens_before_with_cli_filtering": total_tokens_before,
-            "rtk_tokens_avoided": cli_tokens_avoided,
-            "total_tokens_saved_with_rtk": metrics.tokens_saved_total + cli_tokens_avoided,
-            "total_tokens_before_with_rtk": total_tokens_before,
             "total_tokens_before": total_tokens_before,
             # Tool-schema deferral / turn-hook tool shrink, tracked apart from
             # message compression, so consumers can see the full picture.
@@ -647,23 +633,9 @@ def build_session_summary(
             "breakdown": {
                 "cache_savings_usd": round(cache_net, 2),
                 "compression_savings_usd": round(compression_savings, 2),
-                "cli_filtering_savings_usd": None,
-                "cli_filtering_savings_note": (
-                    "CLI filtering tokens are included in token savings only; "
-                    "dollar savings use proxy compression tokens at model list price."
-                ),
-                "rtk_savings_usd": None,
             },
         },
     }
-
-    ws_units = getattr(metrics, "codex_ws_units_total", 0)
-    if ws_units:
-        summary["codex_ws"] = {
-            "units_total": ws_units,
-            "units_modified": getattr(metrics, "codex_ws_units_modified_total", 0),
-            "tokens_saved": getattr(metrics, "codex_ws_unit_tokens_saved_sum", 0),
-        }
 
     # MCP-side compression: events written by `headroom mcp serve`
     # instances (one or more) to the shared stats log. Surfaces direct
@@ -672,6 +644,21 @@ def build_session_summary(
     # (if it grows linearly with turn count, our lossy compressors are
     # dropping info the model actually needs).
     summary["mcp"] = _aggregate_mcp_events()
+
+    # Codex WS sessions compress per-unit on the long-lived /responses socket,
+    # but turn-level records (which feed tokens_saved_total above) only land
+    # when a response.completed frame carries usage. Surface the live per-unit
+    # counters so a WS-only session doesn't read as "no activity" mid-turn.
+    # Kept as a separate block rather than summed into the compression totals:
+    # turns that DID record already contributed the same savings there, so
+    # adding the unit sums on top would double-count.
+    ws_units = getattr(metrics, "codex_ws_units_total", 0)
+    if ws_units:
+        summary["codex_ws"] = {
+            "units_total": ws_units,
+            "units_modified": getattr(metrics, "codex_ws_units_modified_total", 0),
+            "tokens_saved": getattr(metrics, "codex_ws_unit_tokens_saved_sum", 0),
+        }
 
     # Add tip if token mode would help
     if proxy.config.mode == PROXY_MODE_CACHE and uncompressed_reasons["prefix_frozen"] > 10:
@@ -719,6 +706,11 @@ class CostTracker:
 
         # Token savings per model (exact, no dollar estimation)
         self._tokens_saved_by_model: dict[str, int] = {}
+        # Tool-schema deferral per model, DISJOINT from _tokens_saved_by_model
+        # (deferred schemas are never in the message counts). Tracked separately
+        # so the compression-only figure stays available; `stats()` reports both
+        # the split and the sum.
+        self._tool_saved_by_model: dict[str, int] = {}
         self._tokens_sent_by_model: dict[str, int] = {}
         self._requests_by_model: dict[str, int] = {}
 
@@ -734,6 +726,7 @@ class CostTracker:
         self._costs.clear()
         self._last_prune_time = datetime.now()
         self._tokens_saved_by_model.clear()
+        self._tool_saved_by_model.clear()
         self._tokens_sent_by_model.clear()
         self._requests_by_model.clear()
         self._api_cache_read_by_model.clear()
@@ -823,6 +816,7 @@ class CostTracker:
         uncached_tokens: int = 0,
         output_tokens: int = 0,
         cache_inferred: bool = False,
+        tool_schema_saved: int = 0,
     ):
         """Record token counts per model and accumulate request cost for budget enforcement.
 
@@ -840,6 +834,13 @@ class CostTracker:
                 ``uncached_tokens``, so it is excluded from the billed prompt
                 total and from the write premium. Defaults False, which preserves
                 behaviour for providers that report disjoint buckets.
+            tool_schema_saved: Tokens withheld by tool-schema deferral for this
+                request. Disjoint from ``tokens_saved`` — deferred schemas never
+                enter the message token counts, so they moved neither
+                ``tokens_saved`` nor ``tokens_sent`` and had nowhere to be
+                attributed. The dashboard's per-model "Tokens Saved" column
+                therefore showed compression only, while the headline above it
+                counted both.
         """
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original (handlers revert any inflation before sending),
@@ -856,6 +857,9 @@ class CostTracker:
             tokens_saved = 0
         self._tokens_saved_by_model[model] = (
             self._tokens_saved_by_model.get(model, 0) + tokens_saved
+        )
+        self._tool_saved_by_model[model] = self._tool_saved_by_model.get(model, 0) + max(
+            0, tool_schema_saved
         )
         self._tokens_sent_by_model[model] = self._tokens_sent_by_model.get(model, 0) + tokens_sent
         self._requests_by_model[model] = self._requests_by_model.get(model, 0) + 1
@@ -1107,17 +1111,34 @@ class CostTracker:
         """Get token statistics per model."""
         per_model = {}
         total_saved = 0
-        for model in sorted(self._tokens_saved_by_model.keys()):
-            saved = self._tokens_saved_by_model[model]
+        total_compression_saved = 0
+        total_tool_saved = 0
+        # A model may have tool savings and no compression savings at all (every
+        # turn deferral-only), so iterate the union — keying off
+        # ``_tokens_saved_by_model`` alone would drop such a model from the table
+        # entirely rather than merely under-report it.
+        for model in sorted(set(self._tokens_saved_by_model) | set(self._tool_saved_by_model)):
+            compression_saved = self._tokens_saved_by_model.get(model, 0)
+            tool_saved = self._tool_saved_by_model.get(model, 0)
+            # What the "Tokens Saved" column means: everything Headroom kept off
+            # the wire for this model. The two components stay addressable beside
+            # it so a caller can show the split.
+            saved = compression_saved + tool_saved
             sent = self._tokens_sent_by_model.get(model, 0)
             reqs = self._requests_by_model.get(model, 0)
             total_saved += saved
+            total_compression_saved += compression_saved
+            total_tool_saved += tool_saved
             per_model[model] = {
                 "requests": reqs,
                 "tokens_saved": saved,
+                "compression_tokens_saved": compression_saved,
+                "tool_tokens_saved": tool_saved,
                 "tokens_sent": sent,
                 "cache_write_5m_tokens": self._api_cache_write_5m_by_model.get(model, 0),
                 "cache_write_1h_tokens": self._api_cache_write_1h_by_model.get(model, 0),
+                # Deferred schemas were never in ``sent``, so ``saved + sent`` is
+                # still the pre-Headroom volume with the wider numerator.
                 "reduction_pct": round(saved / (saved + sent) * 100, 1)
                 if (saved + sent) > 0
                 else 0,
@@ -1166,7 +1187,14 @@ class CostTracker:
                 savings_usd += saved * uncached_price
 
         return {
+            # Sum of the per-model rows above, so the payload reconciles with
+            # itself. ``savings_usd`` below is deliberately NOT widened: tool
+            # deferral is already priced by SavingsTracker, and this tracker's
+            # dollars feed budget enforcement — counting it in both places would
+            # double-book the saving against a budget.
             "total_tokens_saved": total_saved,
+            "total_compression_tokens_saved": total_compression_saved,
+            "total_tool_tokens_saved": total_tool_saved,
             "total_input_tokens": total_input_tokens,
             "total_input_cost_usd": round(cost_with_headroom, 4),
             "cache_write_5m_tokens": sum(self._api_cache_write_5m_by_model.values()),

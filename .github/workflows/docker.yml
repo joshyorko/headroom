@@ -182,8 +182,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           # Keep the variant + arch naming even though the self-hosted lane
-          # currently builds one root amd64 image; the manifest job already
-          # consumes this artifact shape.
+          # currently builds one root amd64 image.
           name: digests-${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
@@ -234,12 +233,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download per-arch digests for this variant
+      - name: Download amd64 digest for this variant
         uses: actions/download-artifact@v8
         with:
-          pattern: digests-${{ matrix.variant.name || 'root' }}-*
+          name: digests-${{ matrix.variant.name || 'root' }}-amd64
           path: ${{ runner.temp }}/digests
-          merge-multiple: true
 
       # Pushes to self-hosted publish the tags Kamal and local operators use:
       # branch, dev, latest, and a short sha tag. Manual runs may also stamp
@@ -249,6 +247,18 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
+          # `latest=false` is load-bearing (#3150). The action defaults to
+          # `latest=auto`, which appends a bare `latest` for any semver
+          # release — and it logs `suffixLatest=false`, so the per-tag
+          # `suffix=` below never reaches it. Every one of the 8 variant
+          # cells therefore pushed `ghcr.io/.../headroom:latest`, and the
+          # last cell to finish won. At 0.36.0 that was `code-slim`, so
+          # `:latest` resolved to the distroless build, whose
+          # `import onnxruntime` segfaults on arm64 — `headroom deploy`
+          # crash-looped on Apple Silicon. `:latest` has exactly one
+          # writer: the root-cell promotion step at the end of this job.
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=branch,enable=${{ inputs.enable_ref_tags != 'false' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
             type=raw,value=dev,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name == 'push' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
@@ -264,6 +274,9 @@ jobs:
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
           DIGEST_DIR: ${{ runner.temp }}/digests
+          # Read by the bare-`latest` guard below. Via `env:` rather than
+          # inline `${{ }}` so the value is never spliced into the script.
+          VARIANT_NAME: ${{ matrix.variant.name }}
         run: |
           # Reconstruct full image references from the digest marker
           # filenames (each file is named after the bare hex digest
@@ -273,8 +286,8 @@ jobs:
             exit 1
           fi
           digest_count="$(find "${DIGEST_DIR}" -maxdepth 1 -type f | wc -l)"
-          if [ "${digest_count}" -ne 2 ]; then
-            echo "ERROR: expected both architecture digests for variant '${{ matrix.variant.name || 'root' }}', found ${digest_count}" >&2
+          if [ "${digest_count}" -ne 1 ]; then
+            echo "ERROR: expected one amd64 digest for variant '${{ matrix.variant.name || 'root' }}', found ${digest_count}" >&2
             exit 1
           fi
           digest_refs=()
@@ -282,6 +295,16 @@ jobs:
             digest="$(basename "$f")"
             digest_refs+=("${IMAGE}@sha256:${digest}")
           done
+
+          # Belt-and-braces for #3150: only the root cell may ever carry a
+          # bare `latest`. A suffixed variant reaching this point with one
+          # means the tag rules regressed, and shipping it would repoint
+          # `:latest` at a non-default image. Fail instead of publishing.
+          if [ -n "${VARIANT_NAME}" ] && jq -e '.tags[]? | select(endswith(":latest"))' \
+               <<< "${DOCKER_METADATA_OUTPUT_JSON}" >/dev/null 2>&1; then
+            echo "::error::variant '${VARIANT_NAME}' would publish a bare :latest tag" >&2
+            exit 1
+          fi
 
           # Build `--tag` args from the metadata-action JSON output.
           # Empty tags array is valid (PR builds without ref-tags

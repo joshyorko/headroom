@@ -15,7 +15,6 @@ import logging
 import os
 import random
 import re
-import shutil
 import threading
 import time
 from collections import OrderedDict
@@ -25,7 +24,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
-from headroom._subprocess import run as subprocess_run
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -907,16 +905,15 @@ def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
 def relocate_system_messages_to_top_level(
     messages: list[dict[str, Any]],
     system: Any,
+    model: str | None = None,
 ) -> tuple[list[dict[str, Any]], Any, bool]:
-    """Move any ``role="system"`` entries out of ``messages`` into ``system``.
+    """Relocate only system messages invalid for the selected Anthropic model.
 
-    Anthropic's Messages API rejects a ``system`` role inside ``messages`` with
-    HTTP 400 ("messages.0: use the top-level 'system' parameter for the initial
-    system prompt"). Internal transforms / pipeline extensions can leave a stray
-    system message in the list (e.g. a relocated harness system block during
-    compression). This is the Anthropic forwarder's last line of defense: it
-    guarantees the forwarded body never violates the wire contract, regardless
-    of which transform introduced the entry.
+    Supported models accept mid-conversation system sections after a user turn
+    (or an assistant server-tool result) when followed by an assistant turn or
+    placed at the end. Hoisting those changes semantics and invalidates the
+    cached prefix. The initial/invalid forms are still moved to the top-level
+    field as the issue-765 last-line wire-contract guard.
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved and no content
@@ -926,9 +923,58 @@ def relocate_system_messages_to_top_level(
     message is present the inputs pass through unchanged (``changed=False``) so
     the common path is untouched.
     """
-    system_indices = {
-        i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == _ROLE_SYSTEM
-    }
+    model_id = str(model or "").lower()
+    supports_mid_conversation = any(
+        family in model_id
+        for family in (
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+        )
+    )
+
+    def _assistant_ends_in_server_tool_result(message: object) -> bool:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return False
+        content = message.get("content")
+        if not isinstance(content, list) or not content:
+            return False
+        final = content[-1]
+        if not isinstance(final, dict):
+            return False
+        block_type = str(final.get("type") or "")
+        return block_type == "server_tool_use" or block_type.endswith("_tool_result")
+
+    system_indices: set[int] = set()
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != _ROLE_SYSTEM:
+            index += 1
+            continue
+
+        section_start = index
+        while (
+            index + 1 < len(messages)
+            and isinstance(messages[index + 1], dict)
+            and messages[index + 1].get("role") == _ROLE_SYSTEM
+        ):
+            index += 1
+        section_end = index
+
+        previous = messages[section_start - 1] if section_start > 0 else None
+        following = messages[section_end + 1] if section_end + 1 < len(messages) else None
+        valid_previous = (
+            isinstance(previous, dict) and previous.get("role") == "user"
+        ) or _assistant_ends_in_server_tool_result(previous)
+        valid_following = following is None or (
+            isinstance(following, dict) and following.get("role") == "assistant"
+        )
+        if not (supports_mid_conversation and valid_previous and valid_following):
+            system_indices.update(range(section_start, section_end + 1))
+        index += 1
     if not system_indices:
         return messages, system, False
 
@@ -1012,47 +1058,6 @@ def append_text_to_latest_user_input_item(
 
     return body_input, 0
 
-
-_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
-_CONTEXT_TOOL_RTK = "rtk"
-_CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
-_VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
-_RTK_GAIN_SCOPE_ENV = "HEADROOM_RTK_GAIN_SCOPE"
-_RTK_GAIN_SCOPE_GLOBAL = "global"
-_RTK_GAIN_SCOPE_PROJECT = "project"
-_RTK_GAIN_SCOPES = {_RTK_GAIN_SCOPE_GLOBAL, _RTK_GAIN_SCOPE_PROJECT}
-
-RTK_STATS_CACHE_TTL_SECONDS = float(os.environ.get("HEADROOM_CONTEXT_TOOL_STATS_TTL_SECONDS", "60"))
-CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS = RTK_STATS_CACHE_TTL_SECONDS
-_context_tool_stats_cache_lock = threading.Lock()
-_context_tool_stats_cache: dict[str, Any] = {
-    "expires_at": 0.0,
-    "has_value": False,
-    "tool": None,
-    "value": None,
-}
-_context_tool_reported_snapshot: dict[str, Any] = {
-    "tool": None,
-    "value": None,
-    "reported_at": 0.0,
-    "source": None,
-}
-_context_tool_reported_project_snapshots: dict[str, dict[str, dict[str, Any]]] = {}
-_context_tool_session_baseline: dict[str, Any] = {
-    "initialized": False,
-    "tool": None,
-    "source": None,
-    "scope": None,
-    "total_commands": 0,
-    "input_tokens": 0,
-    "output_tokens": 0,
-    "tokens_saved": 0,
-    "total_time_ms": 0,
-    "captured_at": 0.0,
-}
-_rtk_stats_cache_lock = _context_tool_stats_cache_lock
-_rtk_stats_cache = _context_tool_stats_cache
-_rtk_session_baseline = _context_tool_session_baseline
 
 # Maximum request body size (100MB - increased to support image-heavy requests)
 MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
@@ -1534,659 +1539,6 @@ def _setup_file_logging() -> None:
         pass
 
 
-def _selected_context_tool() -> str:
-    raw = os.environ.get(_CONTEXT_TOOL_ENV, _CONTEXT_TOOL_RTK).strip().lower()
-    normalized = raw.replace("_", "-")
-    if normalized in ("leanctx", _CONTEXT_TOOL_LEAN_CTX):
-        return _CONTEXT_TOOL_LEAN_CTX
-    return _CONTEXT_TOOL_RTK
-
-
-def _context_tool_label(tool: str) -> str:
-    if tool == _CONTEXT_TOOL_LEAN_CTX:
-        return "lean-ctx"
-    return "RTK"
-
-
-def _context_tool_default_scope(tool: str) -> str:
-    if tool == _CONTEXT_TOOL_LEAN_CTX:
-        return "local"
-    return _RTK_GAIN_SCOPE_GLOBAL
-
-
-def _rtk_gain_scope() -> str:
-    raw = os.environ.get(_RTK_GAIN_SCOPE_ENV, "").strip().lower()
-    if not raw:
-        return _RTK_GAIN_SCOPE_GLOBAL
-    if raw in _RTK_GAIN_SCOPES:
-        return raw
-
-    logger.warning(
-        "event=rtk_gain_scope_invalid env=%s value=%r default=%s",
-        _RTK_GAIN_SCOPE_ENV,
-        raw,
-        _RTK_GAIN_SCOPE_GLOBAL,
-    )
-    return _RTK_GAIN_SCOPE_GLOBAL
-
-
-def _rtk_gain_command(rtk_path: Any, scope: str) -> list[str]:
-    command = [str(rtk_path), "gain"]
-    if scope == _RTK_GAIN_SCOPE_PROJECT:
-        command.append("--project")
-    command.extend(["--format", "json"])
-    return command
-
-
-def _coerce_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return default
-
-
-def _coerce_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value or 0.0)
-    except (TypeError, ValueError):
-        return default
-
-
-def _first_value(mapping: dict[str, Any], keys: tuple[str, ...], default: Any = 0) -> Any:
-    for key in keys:
-        if key in mapping and mapping[key] is not None:
-            return mapping[key]
-    return default
-
-
-def _context_tool_summary_payload(
-    *,
-    tool: str,
-    installed: bool,
-    scope: str | None = None,
-    summary: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Normalize RTK/lean-ctx lifetime gain output into one schema.
-
-    Both tools expose cumulative counters, but field names vary slightly.
-    Headroom computes session values by subtracting a startup baseline, so
-    keeping raw input/output counters is necessary for a truthful session
-    savings percentage.
-    """
-
-    summary = summary or {}
-    input_tokens = _coerce_int(
-        _first_value(
-            summary,
-            (
-                "total_input",
-                "total_input_tokens",
-                "input_tokens",
-                "tokens_input",
-                "totalBefore",
-            ),
-        )
-    )
-    output_tokens = _coerce_int(
-        _first_value(
-            summary,
-            (
-                "total_output",
-                "total_output_tokens",
-                "output_tokens",
-                "tokens_output",
-                "totalAfter",
-            ),
-        )
-    )
-    tokens_saved = _coerce_int(
-        _first_value(
-            summary,
-            (
-                "total_saved",
-                "tokens_saved",
-                "total_tokens_saved",
-                "saved_tokens",
-                "totalSaved",
-            ),
-        )
-    )
-    if tokens_saved <= 0 and input_tokens > 0 and output_tokens >= 0:
-        tokens_saved = max(input_tokens - output_tokens, 0)
-    if input_tokens <= 0 and tokens_saved > 0 and output_tokens >= 0:
-        input_tokens = tokens_saved + output_tokens
-
-    lifetime_savings_pct = _coerce_float(
-        _first_value(
-            summary,
-            (
-                "avg_savings_pct",
-                "average_savings_pct",
-                "savings_pct",
-                "savings_percent",
-                "avgSavingsPct",
-            ),
-            0.0,
-        )
-    )
-    if lifetime_savings_pct <= 0 and input_tokens > 0:
-        lifetime_savings_pct = (tokens_saved / input_tokens) * 100.0
-
-    return {
-        "tool": tool,
-        "label": _context_tool_label(tool),
-        "installed": installed,
-        "scope": scope or _context_tool_default_scope(tool),
-        "total_commands": _coerce_int(
-            _first_value(
-                summary,
-                (
-                    "total_commands",
-                    "commands",
-                    "command_count",
-                    "totalCommandCount",
-                ),
-            )
-        ),
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "tokens_saved": tokens_saved,
-        # Backward-compatible name. See `lifetime_avg_savings_pct` and
-        # `session_savings_pct` below for explicit scopes.
-        "avg_savings_pct": lifetime_savings_pct,
-        "lifetime_avg_savings_pct": lifetime_savings_pct,
-        "total_time_ms": _coerce_int(
-            _first_value(summary, ("total_time_ms", "time_ms", "totalTimeMs"))
-        ),
-    }
-
-
-def _context_tool_zero_payload(
-    *,
-    tool: str,
-    installed: bool,
-    scope: str | None = None,
-) -> dict[str, Any]:
-    return _context_tool_summary_payload(
-        tool=tool,
-        installed=installed,
-        scope=scope,
-        summary={},
-    )
-
-
-def _context_tool_project_name_from_cwd(cwd: Any) -> str | None:
-    if not isinstance(cwd, str) or not cwd.strip():
-        return None
-    clean = cwd.rstrip("/\\")
-    if not clean:
-        return None
-    project = clean.replace("\\", "/").rsplit("/", 1)[-1].strip()
-    return project or None
-
-
-def ingest_context_tool_stats(
-    payload: dict[str, Any],
-    *,
-    source: str = "reported",
-) -> dict[str, Any]:
-    """Store a client-reported context-tool stats snapshot for remote dashboards.
-
-    Remote self-hosted dashboards cannot read RTK counters from the workstation
-    running Codex, so ``headroom mcp report-rtk`` reports aggregate counters.
-    This stores counts only, never command output.
-    """
-
-    if not isinstance(payload, dict):
-        raise ValueError("context-tool stats payload must be an object")
-
-    tool = str(payload.get("tool") or _selected_context_tool()).strip().lower()
-    if tool not in _VALID_CONTEXT_TOOLS:
-        raise ValueError(f"unsupported context tool: {tool}")
-
-    raw_scope = str(payload.get("scope") or _context_tool_default_scope(tool)).strip().lower()
-    if tool == _CONTEXT_TOOL_RTK and raw_scope not in _RTK_GAIN_SCOPES:
-        raise ValueError(f"unsupported RTK stats scope: {raw_scope}")
-
-    summary = payload.get("summary")
-    if not isinstance(summary, dict):
-        summary = payload
-
-    normalized = _context_tool_summary_payload(
-        tool=tool,
-        installed=bool(payload.get("installed", True)),
-        scope=raw_scope,
-        summary=summary,
-    )
-    normalized["reported"] = True
-    normalized["reported_at"] = time.time()
-    normalized["reported_source"] = source
-    cwd = payload.get("cwd")
-    if isinstance(cwd, str) and cwd.strip():
-        normalized["cwd"] = cwd
-    project = _context_tool_project_name_from_cwd(cwd)
-    if raw_scope == "project" and project:
-        normalized["project"] = project
-
-    with _context_tool_stats_cache_lock:
-        _context_tool_reported_snapshot.update(
-            {
-                "tool": tool,
-                "value": normalized,
-                "reported_at": normalized["reported_at"],
-                "source": source,
-            }
-        )
-        if raw_scope == "project" and project:
-            tool_projects = _context_tool_reported_project_snapshots.setdefault(tool, {})
-            tool_projects[project] = dict(normalized)
-        _context_tool_stats_cache.update(
-            {
-                "expires_at": 0.0,
-                "has_value": False,
-                "tool": None,
-                "value": None,
-            }
-        )
-
-    return normalized
-
-
-def _get_context_tool_reported_project_stats(tool: str | None = None) -> dict[str, dict[str, Any]]:
-    """Return client-reported project snapshots keyed by project name."""
-
-    selected_tool = (tool or _selected_context_tool()).strip().lower()
-    with _context_tool_stats_cache_lock:
-        snapshots = _context_tool_reported_project_snapshots.get(selected_tool, {})
-        return {project: dict(value) for project, value in snapshots.items()}
-
-
-def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
-    """Read rtk's lifetime stats using the configured gain scope."""
-
-    scope = _rtk_gain_scope()
-    rtk_path = shutil.which("rtk")
-    if not rtk_path:
-        return _context_tool_zero_payload(
-            tool=_CONTEXT_TOOL_RTK,
-            installed=False,
-            scope=scope,
-        )
-
-    try:
-        result = subprocess_run(
-            _rtk_gain_command(rtk_path, scope),
-            capture_output=True,
-            text=True,
-            # rtk output is UTF-8 (emoji etc.); without this, Windows decodes
-            # with cp1252 and the reader thread dies with UnicodeDecodeError.
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            data = json.loads(result.stdout)
-            summary = data.get("summary", {})
-            payload = _context_tool_summary_payload(
-                tool=_CONTEXT_TOOL_RTK,
-                installed=True,
-                scope=scope,
-                summary=summary if isinstance(summary, dict) else {},
-            )
-        else:
-            # A failed read is "no data", never a zero counter — a synthetic
-            # zero here re-pins the session baseline and inflates session
-            # savings by the tool's whole lifetime on recovery.
-            stderr_excerpt = (result.stderr or "")[:200]
-            logger.warning(
-                "event=rtk_stats_subprocess_failed reason=non_zero_exit rc=%s stderr=%r",
-                result.returncode,
-                stderr_excerpt,
-            )
-            return None
-    except Exception as exc:
-        # Reason is the exception class name (without payload — RTK
-        # exceptions can carry filesystem paths).
-        logger.warning(
-            "event=rtk_stats_subprocess_failed reason=%s error=%s",
-            type(exc).__name__,
-            exc,
-        )
-        return None
-
-    return payload
-
-
-def _read_lean_ctx_lifetime_stats() -> dict[str, Any] | None:
-    """Read lean-ctx's current project-level lifetime stats."""
-
-    lean_ctx_path = shutil.which("lean-ctx")
-    if not lean_ctx_path:
-        return _context_tool_zero_payload(tool=_CONTEXT_TOOL_LEAN_CTX, installed=False)
-
-    try:
-        result = subprocess_run(
-            [str(lean_ctx_path), "gain", "--json"],
-            capture_output=True,
-            text=True,
-            # UTF-8 regardless of the Windows console code page (cp1252).
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-        # Failed reads return None ("no data") — mirrors the rtk reader so
-        # the baseline logic never sees synthetic zeros from either tool.
-        if result.returncode != 0 or not result.stdout.strip():
-            logger.warning(
-                "event=lean_ctx_stats_subprocess_failed reason=non_zero_exit rc=%s",
-                result.returncode,
-            )
-            return None
-
-        data = json.loads(result.stdout)
-        summary = data.get("summary", data) if isinstance(data, dict) else {}
-        if not isinstance(summary, dict):
-            logger.warning("event=lean_ctx_stats_subprocess_failed reason=bad_payload")
-            return None
-
-        return _context_tool_summary_payload(
-            tool=_CONTEXT_TOOL_LEAN_CTX,
-            installed=True,
-            summary=summary,
-        )
-    except Exception as exc:
-        logger.warning(
-            "event=lean_ctx_stats_subprocess_failed reason=%s",
-            type(exc).__name__,
-        )
-        return None
-
-
-def _read_context_tool_lifetime_stats(tool: str) -> dict[str, Any] | None:
-    if tool == _CONTEXT_TOOL_LEAN_CTX:
-        return _read_lean_ctx_lifetime_stats()
-    return _read_rtk_lifetime_stats()
-
-
-async def initialize_context_tool_session_baseline() -> None:
-    """Pin the current context-tool counters as the proxy-session baseline."""
-
-    tool = _selected_context_tool()
-    payload = await asyncio.to_thread(_read_context_tool_lifetime_stats, tool)
-    with _context_tool_stats_cache_lock:
-        if payload is None or not payload.get("installed", False):
-            # Failed or tool-absent read: defer the pin to the first
-            # successful read (guarded lazy-init) — pinning zeros here would
-            # inflate session savings by the tool's whole lifetime once it
-            # recovers or gets installed.
-            _context_tool_session_baseline.update(
-                {
-                    "initialized": False,
-                    "tool": tool,
-                    "total_commands": 0,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "tokens_saved": 0,
-                    "total_time_ms": 0,
-                    "captured_at": time.time(),
-                }
-            )
-        else:
-            _context_tool_session_baseline.update(
-                {
-                    "initialized": True,
-                    "tool": tool,
-                    "total_commands": int(payload.get("total_commands", 0) or 0),
-                    "input_tokens": int(payload.get("input_tokens", 0) or 0),
-                    "output_tokens": int(payload.get("output_tokens", 0) or 0),
-                    "tokens_saved": int(payload.get("tokens_saved", 0) or 0),
-                    "total_time_ms": int(payload.get("total_time_ms", 0) or 0),
-                    "captured_at": time.time(),
-                }
-            )
-        _context_tool_stats_cache.update(
-            {
-                "expires_at": 0.0,
-                "has_value": False,
-                "tool": None,
-                "value": None,
-            }
-        )
-
-
-async def initialize_rtk_session_baseline() -> None:
-    """Backward-compatible alias for initialize_context_tool_session_baseline."""
-
-    await initialize_context_tool_session_baseline()
-
-
-def _get_context_tool_stats() -> dict[str, Any] | None:
-    """Get context-tool savings for the current Headroom proxy session.
-
-    RTK and lean-ctx persist project-level lifetime counters. Dashboard stats
-    should be session-local, so we subtract the counter snapshot captured at
-    proxy startup instead of resetting the tool's own history.
-    """
-
-    tool = _selected_context_tool()
-    now = time.monotonic()
-    with _context_tool_stats_cache_lock:
-        cached_value = cast(dict[str, Any] | None, _context_tool_stats_cache["value"])
-        if (
-            _context_tool_stats_cache["has_value"]
-            and now < float(_context_tool_stats_cache["expires_at"])
-            and _context_tool_stats_cache.get("tool") == tool
-        ):
-            return cached_value
-
-    with _context_tool_stats_cache_lock:
-        reported_snapshot = (
-            dict(_context_tool_reported_snapshot["value"])
-            if _context_tool_reported_snapshot.get("tool") == tool
-            and isinstance(_context_tool_reported_snapshot.get("value"), dict)
-            else None
-        )
-
-    payload = reported_snapshot or _read_context_tool_lifetime_stats(tool)
-    payload_source = (
-        "reported" if isinstance(payload, dict) and payload.get("reported") else "local"
-    )
-    payload_scope = str((payload or {}).get("scope") or _context_tool_default_scope(tool))
-    with _context_tool_stats_cache_lock:
-        baseline_freshly_initialized = False
-        tool_installed = payload is not None and bool(payload.get("installed", False))
-        # Baseline mutations only happen on successful reads from an
-        # installed tool. A failed read or tool-absent zero payload must not
-        # pin/re-pin, or recovery would report the whole lifetime as session
-        # savings.
-        if tool_installed and (
-            not _context_tool_session_baseline["initialized"]
-            or _context_tool_session_baseline.get("tool") != tool
-        ):
-            baseline_freshly_initialized = True
-            _context_tool_session_baseline.update(
-                {
-                    "initialized": True,
-                    "tool": tool,
-                    "source": payload_source,
-                    "scope": payload_scope,
-                    "total_commands": int((payload or {}).get("total_commands", 0) or 0),
-                    "input_tokens": int((payload or {}).get("input_tokens", 0) or 0),
-                    "output_tokens": int((payload or {}).get("output_tokens", 0) or 0),
-                    "tokens_saved": int((payload or {}).get("tokens_saved", 0) or 0),
-                    "total_time_ms": int((payload or {}).get("total_time_ms", 0) or 0),
-                    "captured_at": time.time(),
-                }
-            )
-
-        if payload is not None:
-            lifetime_total_commands = int(payload.get("total_commands", 0) or 0)
-            lifetime_input_tokens = int(payload.get("input_tokens", 0) or 0)
-            lifetime_output_tokens = int(payload.get("output_tokens", 0) or 0)
-            lifetime_tokens_saved = int(payload.get("tokens_saved", 0) or 0)
-            lifetime_total_time_ms = int(payload.get("total_time_ms", 0) or 0)
-            baseline_total_commands = int(_context_tool_session_baseline["total_commands"])
-            baseline_input_tokens = int(_context_tool_session_baseline["input_tokens"])
-            baseline_output_tokens = int(_context_tool_session_baseline["output_tokens"])
-            baseline_tokens_saved = int(_context_tool_session_baseline["tokens_saved"])
-            baseline_total_time_ms = int(_context_tool_session_baseline["total_time_ms"])
-            baseline_source = _context_tool_session_baseline.get("source")
-            baseline_scope = _context_tool_session_baseline.get("scope")
-            baseline_unavailable = payload_source == "reported" and (
-                baseline_freshly_initialized
-                or baseline_source != payload_source
-                or baseline_scope != payload_scope
-            )
-            counter_reset_detected = False
-            session_delta_available = True
-            session_delta_unavailable_reason = None
-            if baseline_unavailable:
-                baseline_total_commands = lifetime_total_commands
-                baseline_input_tokens = lifetime_input_tokens
-                baseline_output_tokens = lifetime_output_tokens
-                baseline_tokens_saved = lifetime_tokens_saved
-                baseline_total_time_ms = lifetime_total_time_ms
-                session_delta_available = False
-                session_delta_unavailable_reason = "baseline_unavailable"
-                _context_tool_session_baseline.update(
-                    {
-                        "source": payload_source,
-                        "scope": payload_scope,
-                        "total_commands": baseline_total_commands,
-                        "input_tokens": baseline_input_tokens,
-                        "output_tokens": baseline_output_tokens,
-                        "tokens_saved": baseline_tokens_saved,
-                        "total_time_ms": baseline_total_time_ms,
-                        "captured_at": time.time(),
-                    }
-                )
-            elif tool_installed:
-                counter_reset_detected = (
-                    lifetime_total_commands < baseline_total_commands
-                    or lifetime_input_tokens < baseline_input_tokens
-                    or lifetime_output_tokens < baseline_output_tokens
-                    or lifetime_tokens_saved < baseline_tokens_saved
-                    or lifetime_total_time_ms < baseline_total_time_ms
-                )
-            if counter_reset_detected:
-                baseline_total_commands = lifetime_total_commands
-                baseline_input_tokens = lifetime_input_tokens
-                baseline_output_tokens = lifetime_output_tokens
-                baseline_tokens_saved = lifetime_tokens_saved
-                baseline_total_time_ms = lifetime_total_time_ms
-                session_delta_available = False
-                session_delta_unavailable_reason = "counter_reset"
-                _context_tool_session_baseline.update(
-                    {
-                        "source": payload_source,
-                        "scope": payload_scope,
-                        "total_commands": baseline_total_commands,
-                        "input_tokens": baseline_input_tokens,
-                        "output_tokens": baseline_output_tokens,
-                        "tokens_saved": baseline_tokens_saved,
-                        "total_time_ms": baseline_total_time_ms,
-                        "captured_at": time.time(),
-                    }
-                )
-
-            session_total_commands = max(lifetime_total_commands - baseline_total_commands, 0)
-            session_input_tokens = max(lifetime_input_tokens - baseline_input_tokens, 0)
-            session_output_tokens = max(lifetime_output_tokens - baseline_output_tokens, 0)
-            session_tokens_saved = max(lifetime_tokens_saved - baseline_tokens_saved, 0)
-            session_total_time_ms = max(lifetime_total_time_ms - baseline_total_time_ms, 0)
-            session_savings_pct = (
-                round(session_tokens_saved / session_input_tokens * 100.0, 4)
-                if session_input_tokens > 0
-                else None
-            )
-            session_avg_time_ms = (
-                round(session_total_time_ms / session_total_commands, 2)
-                if session_total_commands > 0 and session_total_time_ms > 0
-                else None
-            )
-            lifetime_savings_pct = float(payload.get("lifetime_avg_savings_pct", 0.0) or 0.0)
-
-            payload = {
-                **payload,
-                "tool": tool,
-                "label": _context_tool_label(tool),
-                # Backward-compatible session-delta fields.
-                "total_commands": session_total_commands,
-                "input_tokens": session_input_tokens,
-                "output_tokens": session_output_tokens,
-                "tokens_saved": session_tokens_saved,
-                "total_time_ms": session_total_time_ms,
-                "session_savings_pct": session_savings_pct,
-                "session_avg_time_ms": session_avg_time_ms,
-                # Keep old field for compatibility, but declare its scope.
-                "avg_savings_pct": lifetime_savings_pct,
-                "avg_savings_pct_scope": "lifetime",
-                "lifetime_avg_savings_pct": lifetime_savings_pct,
-                "lifetime_total_commands": lifetime_total_commands,
-                "lifetime_input_tokens": lifetime_input_tokens,
-                "lifetime_output_tokens": lifetime_output_tokens,
-                "lifetime_tokens_saved": lifetime_tokens_saved,
-                "lifetime_total_time_ms": lifetime_total_time_ms,
-                "session_baseline_total_commands": baseline_total_commands,
-                "session_baseline_input_tokens": baseline_input_tokens,
-                "session_baseline_output_tokens": baseline_output_tokens,
-                "session_baseline_tokens_saved": baseline_tokens_saved,
-                "session_baseline_total_time_ms": baseline_total_time_ms,
-                "session_baseline_source": _context_tool_session_baseline.get("source"),
-                "session_baseline_scope": _context_tool_session_baseline.get("scope"),
-                "session_baseline_captured_at": _context_tool_session_baseline.get(
-                    "captured_at", 0.0
-                ),
-                "session": {
-                    "commands": session_total_commands,
-                    "input_tokens": session_input_tokens,
-                    "output_tokens": session_output_tokens,
-                    "tokens_saved": session_tokens_saved,
-                    "savings_pct": session_savings_pct,
-                    "total_time_ms": session_total_time_ms,
-                    "avg_time_ms": session_avg_time_ms,
-                },
-                "lifetime": {
-                    "commands": lifetime_total_commands,
-                    "input_tokens": lifetime_input_tokens,
-                    "output_tokens": lifetime_output_tokens,
-                    "tokens_saved": lifetime_tokens_saved,
-                    "savings_pct": lifetime_savings_pct,
-                    "total_time_ms": lifetime_total_time_ms,
-                },
-                "baseline": {
-                    "commands": baseline_total_commands,
-                    "input_tokens": baseline_input_tokens,
-                    "output_tokens": baseline_output_tokens,
-                    "tokens_saved": baseline_tokens_saved,
-                    "total_time_ms": baseline_total_time_ms,
-                    "captured_at": _context_tool_session_baseline.get("captured_at", 0.0),
-                },
-                "sampled_at": time.time(),
-                "sample_ttl_seconds": CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS,
-                "refresh_interval_seconds": CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS,
-                "counter_reset_detected": counter_reset_detected,
-                "session_delta_available": session_delta_available,
-                "session_delta_unavailable_reason": session_delta_unavailable_reason,
-            }
-
-        _context_tool_stats_cache.update(
-            {
-                "expires_at": time.monotonic() + CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS,
-                "has_value": True,
-                "tool": tool,
-                "value": payload,
-            }
-        )
-    return payload
-
-
-def _get_rtk_stats() -> dict[str, Any] | None:
-    """Backward-compatible alias for selected context-tool stats."""
-
-    return _get_context_tool_stats()
-
-
 def is_anthropic_auth(headers: dict[str, str]) -> bool:
     """Detect Anthropic auth signals in request headers."""
     if headers.get("x-api-key") or headers.get("anthropic-version"):
@@ -2250,15 +1602,40 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     return strip_internal_headers(headers, mode=get_strip_internal_headers_mode())
 
 
-def merge_extra_headers(headers: dict[str, str], extra: dict[str, str] | None) -> dict[str, str]:
+def merge_extra_headers(
+    headers: dict[str, str],
+    extra: dict[str, str] | None,
+    *,
+    upstream_url: str | None,
+    config: Any = None,
+) -> dict[str, str]:
     """Merge configured extra headers into ``headers``, overriding same-named keys.
 
     ``extra`` comes from ``ProxyConfig.anthropic_extra_headers``/``openai_extra_headers``
     (settings-panel/CLI-configured, for gateways that need one extra header alongside the
     client's own auth). Returns ``headers`` unchanged (no copy) when nothing is configured.
+
+    ``upstream_url`` is where these headers are about to be sent, and it is
+    **required** rather than optional on purpose. These values are secrets, and
+    several handlers accept a per-request upstream from the ``x-headroom-base-url``
+    request header; merging before the destination was known is what let a client
+    redirect the operator's gateway key to a host of its choosing. Making the
+    destination part of the signature means a new forwarder cannot merge a secret
+    without saying where it goes, so this cannot silently regress.
+
+    Pass ``None`` when the caller is going to its configured target with no
+    per-request override. Anything else is checked against
+    ``upstream_trust.is_trusted_upstream``; an undesignated host still gets its
+    request proxied, just without these headers.
     """
     if not extra:
         return headers
+    if upstream_url is not None:
+        from headroom.proxy.upstream_trust import is_trusted_upstream, warn_untrusted_once
+
+        if not is_trusted_upstream(upstream_url, config):
+            warn_untrusted_once(upstream_url)
+            return headers
     # HTTP header names are case-insensitive: drop any existing key that
     # case-insensitively collides with a configured extra so the extra wins.
     # A plain {**headers, **extra} would emit both casings upstream.

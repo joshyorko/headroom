@@ -164,7 +164,7 @@ def test_openrouter_model_prefix_uses_openrouter_backend():
                 },
             )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     assert resp.json()["choices"][0]["message"]["content"] == "ok"
     create.assert_called_once()
     assert create.call_args.kwargs["backend"] == "openrouter"
@@ -482,6 +482,8 @@ def test_output_shaper_applies_to_openai_chat_backend(monkeypatch):
     from headroom.proxy.output_shaper import steering_text
 
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_FEATURES", "proxy_output_shaper")
+    monkeypatch.setenv("HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES", "1")
     monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
     config = _make_config()
     response_body = {

@@ -5,6 +5,20 @@ description: All configuration options for the Headroom Python and TypeScript SD
 
 Headroom can be configured via the SDK constructor, proxy command line, environment variables, or per-request overrides.
 
+## Runtime Rollout Channels
+
+Headroom uses rollout channels to control which behaviors an already-installed
+artifact may expose. They do not select a package or released version.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HEADROOM_ROLLOUT_CHANNEL` | `stable` | Selects `stable`, `beta`, `canary`, or `dev`. |
+| `HEADROOM_FEATURES` | unset | Comma-separated feature names to request explicitly. |
+| `HEADROOM_DISABLE_FEATURES` | unset | Comma-separated feature names to force off. Disable wins over every enable path. |
+| `HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES` | unset | Break-glass override for emergency mitigation only. |
+
+See [Runtime Rollouts](/docs/runtime-rollouts) for policy, provenance, and
+contributor rules.
 If Codex history disappeared after using an older wrapper, see [Recover Codex State](/docs/codex-recovery) before wrapping Codex again.
 
 The proxy reads RTK lifetime savings with global scope by default so a shared
@@ -140,6 +154,30 @@ curl http://127.0.0.1:8787/v1/messages \
 When `HEADROOM_STRIP_INTERNAL_HEADERS` is `enabled` (the default), the proxy
 reads this header for routing and then strips it before forwarding upstream.
 
+#### Configured secret headers are not sent to arbitrary upstreams
+
+`ANTHROPIC_TARGET_API_HEADERS` / `OPENAI_TARGET_API_HEADERS` hold operator
+secrets. Because `x-headroom-base-url` is chosen by the *client*, those headers
+are only attached when the destination is one the operator designated:
+
+- a host in the configured provider targets (`ANTHROPIC_TARGET_API_URL`,
+  `OPENAI_TARGET_API_URL`, and the Gemini/Vertex/Cloud Code equivalents), or
+- a host listed in `HEADROOM_UPSTREAM_ALLOWED_HOSTS` (comma-separated).
+
+A request to any other upstream is **still proxied** — it just does not carry
+your configured headers, and the proxy logs
+`upstream_extra_headers_withheld host=<host>` once per host. If you route to a
+gateway via this header and need your configured headers to reach it, add its
+host to `HEADROOM_UPSTREAM_ALLOWED_HOSTS`:
+
+```bash
+export HEADROOM_UPSTREAM_ALLOWED_HOSTS="gateway.internal,api.example-gateway.ai"
+```
+
+Matching is on the parsed hostname and is exact — no wildcards — so
+`api.anthropic.com.evil.example` and `https://api.anthropic.com@evil.example`
+do not match `api.anthropic.com`.
+
 ## SmartCrusher Configuration
 
 Fine-tune JSON compression behavior:
@@ -198,6 +236,24 @@ response = client.chat.completions.create(
 ```
 
 The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes were removed in 0.9.x. Context management now happens automatically inside the pipeline.
+
+### Claude 1M context window (`headroom wrap claude --1m`)
+
+`headroom wrap claude --1m` opts a Claude Code session into Anthropic's 1M-token context window by selecting a `[1m]`-suffixed model id, which makes Claude Code send the `context-1m` beta header. The model that `--1m` targets is resolved in this order:
+
+1. an explicit `--model` / `ANTHROPIC_MODEL` value (used as-is, with a `[1m]` suffix appended when missing),
+2. otherwise `HEADROOM_1M_MODEL`, when set,
+3. otherwise the built-in default (currently `claude-opus-5`).
+
+Set `HEADROOM_1M_MODEL` to point `--1m` at a specific model without pinning `ANTHROPIC_MODEL` globally, so the default can follow a new Opus generation without a code change:
+
+```bash
+# Route --1m at a specific model for this shell / session
+export HEADROOM_1M_MODEL=claude-opus-5
+headroom wrap claude --1m
+```
+
+`HEADROOM_1M_MODEL` is a fallback only: an explicit `--model` or `ANTHROPIC_MODEL` always wins. The value may be given with or without the `[1m]` suffix; both `claude-opus-5` and `claude-opus-5[1m]` are accepted, and the suffix is added when absent.
 
 ### Claude 1M context window (`headroom wrap claude --1m`)
 

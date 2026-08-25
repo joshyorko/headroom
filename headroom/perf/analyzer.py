@@ -15,6 +15,7 @@ import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from headroom import paths as _paths
 from headroom.pricing.litellm_pricing import resolve_litellm_model
@@ -156,6 +157,12 @@ class PerfRecord:
     tokens_before: int = 0
     tokens_after: int = 0
     tokens_saved: int = 0
+    # Tokens the forwarded request GREW by (PERF ``tok_inflated``). Both
+    # endpoints are clamped — ``tok_saved`` at zero and ``tok_inflated`` at zero
+    # — so a turn that left the proxy bigger reports ``tok_saved=0`` and hides
+    # its growth in a field nothing downstream read. Carrying it here is what
+    # lets the report state net alongside gross instead of implying they agree.
+    tokens_inflated: int = 0
     tool_saved: int = 0
     cache_read: int = 0
     cache_write: int = 0
@@ -218,6 +225,10 @@ class PerfReport:
     transform_records: list[TransformRecord] = field(default_factory=list)
     toin_records: list[ToinRecord] = field(default_factory=list)
     log_files_read: int = 0
+    # Rotated files skipped unopened because they were last written before the
+    # requested window. Reported so coverage stays honest: `log_files_read` on
+    # its own would silently understate how much log exists on disk.
+    log_files_skipped: int = 0
     total_lines_parsed: int = 0
     # Window covered by the report. `requested_hours` is what the caller
     # asked for; `oldest_kept_ts` / `newest_kept_ts` are the actual
@@ -228,6 +239,10 @@ class PerfReport:
     oldest_kept_ts: str | None = None
     newest_kept_ts: str | None = None
     records_filtered_out: int = 0
+    # True when no time cutoff was applied (--hours 0, or a value so large it
+    # overflows datetime arithmetic). The header says "all data" instead of a
+    # misleading "last 0h".
+    window_all_data: bool = False
 
 
 # Log timestamps are emitted by Python's `logging` formatter as
@@ -267,7 +282,17 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     if not log_dir.exists():
         return report
 
-    cutoff = datetime.now() - timedelta(hours=last_n_hours) if last_n_hours > 0 else None
+    # A huge --hours value (e.g. 1e9) overflows datetime arithmetic. Since
+    # "look back a billion hours" is effectively "all data", treat overflow as
+    # no cutoff rather than crashing with a raw OverflowError traceback.
+    if last_n_hours > 0:
+        try:
+            cutoff: datetime | None = datetime.now() - timedelta(hours=last_n_hours)
+        except OverflowError:
+            cutoff = None
+    else:
+        cutoff = None
+    report.window_all_data = cutoff is None
 
     def _within_window(ts_str: str | None) -> bool:
         # Fail-open: records without a parseable timestamp are kept. The
@@ -288,7 +313,31 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
             report.newest_kept_ts = ts_str
 
     # Collect log files: proxy.log, proxy.log.1, proxy.log.2, ...
-    log_files = sorted(log_dir.glob("proxy.log*"), key=lambda p: p.stat().st_mtime)
+    #
+    # A rotated file last written before the cutoff cannot contain a record
+    # inside the window, so skip it without opening it. Without this the cost
+    # of a windowed query is O(total log history) rather than O(window):
+    # `/stats` recomputes throughput over the last hour on a 10s cache TTL, so
+    # a dashboard polling it re-read and re-regexed every byte of every
+    # rotated log, forever, for an answer that lives in the tail of the newest
+    # file. Measured on a developer machine with six rotations (54 MB).
+    #
+    # mtime is the safe discriminator: the logs are append-only, so a file
+    # untouched since before the cutoff has no line written after it. Files
+    # are stat'd once and the value reused for the sort.
+    cutoff_epoch = cutoff.timestamp() if cutoff is not None else None
+    dated_files: list[tuple[float, Path]] = []
+    for path in log_dir.glob("proxy.log*"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            # Rotated away between glob and stat — nothing to read.
+            continue
+        if cutoff_epoch is not None and mtime < cutoff_epoch:
+            report.log_files_skipped += 1
+            continue
+        dated_files.append((mtime, path))
+    log_files = [path for _, path in sorted(dated_files, key=lambda pair: pair[0])]
 
     for log_file in log_files:
         report.log_files_read += 1
@@ -354,6 +403,7 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 tokens_before=int(kv.get("tok_before", 0)),
                                 tokens_after=int(kv.get("tok_after", 0)),
                                 tokens_saved=int(kv.get("tok_saved", 0)),
+                                tokens_inflated=int(kv.get("tok_inflated", 0)),
                                 tool_saved=int(kv.get("tool_saved", 0)),
                                 savings_breakdown=_decode_perf_savings(kv.get("savings", "none")),
                                 cache_read=int(kv.get("cache_read", 0)),
@@ -462,14 +512,15 @@ def format_report(report: PerfReport) -> str:
     lines.append("Headroom Performance Report")
     lines.append("=" * 60)
     if report.requested_hours is not None:
+        window_label = "all data" if report.window_all_data else f"last {report.requested_hours:g}h"
         if report.oldest_kept_ts and report.newest_kept_ts:
             window_str = (
-                f"Window: last {report.requested_hours:g}h "
+                f"Window: {window_label} "
                 f"(actual data: {report.oldest_kept_ts[:19]} → "
                 f"{report.newest_kept_ts[:19]})"
             )
         else:
-            window_str = f"Window: last {report.requested_hours:g}h (no records found in window)"
+            window_str = f"Window: {window_label} (no records found in window)"
         lines.append(window_str)
         if report.records_filtered_out > 0:
             lines.append(
@@ -502,6 +553,19 @@ def format_report(report: PerfReport) -> str:
         # include tool bytes), so it used to render as a rival "Tool saved" line — which
         # read as a side metric and hid the win on tool-heavy turns where tok_saved=0.
         lines.append(f"Tokens saved: {total_headline_saved:,} ({headline_pct:.1f}% reduction)")
+        # Gross vs net. ``tok_saved`` is clamped at zero per request, so turns
+        # where Headroom made the body BIGGER (CCR proactive expansion, memory
+        # injection) contribute nothing negative to the headline — their growth
+        # lands in ``tok_inflated`` instead, which nothing here used to read.
+        # Printing "321,239,562 -> 313,274,727" directly above "8,455,763 saved"
+        # implies the two reconcile; they differ by exactly the inflation. Show
+        # it whenever it is non-zero so the arithmetic closes on the page.
+        total_inflated = sum(r.tokens_inflated for r in records)
+        if total_inflated > 0:
+            lines.append(
+                f"  · inflated      {total_inflated:,} "
+                f"(net message reduction {total_before - total_after:,})"
+            )
         if total_tool_saved > 0:
             lines.append(f"  · messages       {max(0, total_saved):,}")
             lines.append(f"  · tool schemas   {total_tool_saved:,}")
@@ -515,19 +579,37 @@ def format_report(report: PerfReport) -> str:
         lines.append("Per-Model Breakdown")
         lines.append("-" * 40)
         for model, model_recs in sorted(by_model.items()):
+            # Same all-layers construction as the headline above. This loop used to
+            # sum ``tokens_saved`` alone, so every row reported message compression
+            # only while the headline it sat under counted deferral too. The rows
+            # then failed to add up to the total printed inches above them — in the
+            # report that prompted this, four rows summing to 36,071 under a
+            # headline of 625,277, because 589,206 tokens of tool-schema deferral
+            # had no row to land in. A tool-heavy model read "0 tokens saved".
             m_saved = sum(r.tokens_saved for r in model_recs)
+            m_tool_saved = sum(r.tool_saved for r in model_recs)
+            m_headline_saved = m_saved + m_tool_saved
             m_before = sum(r.tokens_before for r in model_recs)
-            m_pct = (m_saved / m_before * 100) if m_before > 0 else 0
+            m_headline_before = m_before + m_tool_saved
+            m_pct = (m_headline_saved / m_headline_before * 100) if m_headline_before > 0 else 0
             list_price = _get_list_price(model)
             price_str = f"${list_price:.2f}/MTok" if list_price else "unknown"
             est_str = (
-                f"  ~${m_saved * list_price / 1_000_000:.2f} at list price" if list_price else ""
+                f"  ~${m_headline_saved * list_price / 1_000_000:.2f} at list price"
+                if list_price
+                else ""
             )
             lines.append(
                 f"  {model}: {len(model_recs)} reqs, "
-                f"{m_saved:,} tokens saved ({m_pct:.0f}%), "
+                f"{m_headline_saved:,} tokens saved ({m_pct:.0f}%), "
                 f"list price {price_str}{est_str}"
             )
+            # Only split the row when there is a split to show; a compression-only
+            # model keeps the single-line shape it has always had.
+            if m_tool_saved > 0:
+                lines.append(
+                    f"      · messages {max(0, m_saved):,}  · tool schemas {m_tool_saved:,}"
+                )
         lines.append("  * Actual bill savings depend on provider caching behavior")
         lines.append("")
 
@@ -654,6 +736,31 @@ def format_report(report: PerfReport) -> str:
             lines.append(
                 f"  {name}: {avg_pct:.1f}% avg reduction, {len(recs)} uses, {total_s:,} saved"
             )
+        # This table is built ONLY from "Transform NAME: B -> A tokens (saved N)"
+        # lines, which just one engine emits (transforms/pipeline.py). The
+        # OpenAI-Responses engine (transforms/compression_units.py +
+        # compression_batches.py) applies the same strategies and contains no
+        # logging calls at all, so none of its work appears above. On real
+        # traffic that hid ~7M of ~8.5M message-token savings — the table read
+        # "content_router: 189,783 saved" against a PERF total 44x larger, which
+        # invites exactly the wrong conclusion about which compressors work.
+        #
+        # State the divergence, NOT a coverage ratio. The two totals are
+        # different populations and neither strictly contains the other: the
+        # Transform lines carry no request_id, fire once per pipeline STAGE (so
+        # several can describe one request), and are emitted before the forwarder
+        # decides anything — a mutation later discarded by the signed-thinking
+        # byte-lock still logs its "saved" here while the request's PERF line
+        # correctly reports 0. So "table covers X of Y" would be a false subset
+        # claim in both directions; report the two sums and let the reader judge.
+        table_total = sum(r.tokens_saved for r in report.transform_records)
+        perf_total = sum(r.tokens_saved for r in report.perf_records)
+        if table_total != perf_total:
+            lines.append(
+                f"  ! stage-level total {table_total:,} != PERF message total {perf_total:,} "
+                "— this table sees only engines that emit a Transform line, counts "
+                "per stage, and does not check whether the mutation shipped"
+            )
         lines.append("")
 
     # Router routing breakdown
@@ -673,10 +780,23 @@ def format_report(report: PerfReport) -> str:
                 f"  Excluded:    {total_excluded} ({total_excluded / total_all * 100:.0f}%) — Read/Glob outputs"
             )
             lines.append(
-                f"  Skipped:     {total_skipped} ({total_skipped / total_all * 100:.0f}%) — <50 words"
+                f"  Skipped:     {total_skipped} ({total_skipped / total_all * 100:.0f}%) — below size floor"
             )
             lines.append(
                 f"  Unchanged:   {total_unchanged} ({total_unchanged / total_all * 100:.0f}%) — ratio too high"
+            )
+            # These four buckets are NOT the router's full outcome space — the
+            # `[router] route_counts=` line carries 17 keys, and the ones omitted
+            # here (cache_hit, system_msg, error_protected, already_compressed,
+            # …) are individually larger than "Excluded". Percentages taken over
+            # this subset therefore overstate every share: on real traffic the
+            # "skipped" bucket read 77% here against 49.5% of actual terminal
+            # fates, which reads as a mis-set threshold rather than a narrow
+            # denominator. Say what the denominator is instead of implying it is
+            # everything.
+            lines.append(
+                f"  (shares are of these 4 buckets only, n={total_all}; "
+                "see `[router] route_counts=` for the full outcome space)"
             )
         if total_excluded > total_compressed * 3:
             lines.append("  ! Excluded tools dominate — consider compressing stale Read outputs")
@@ -759,6 +879,7 @@ PERF_RECORD_FIELDS = [
     # Appended last so every existing CSV column keeps its position; a reader
     # that indexes by name is unaffected either way.
     "from_response_cache",
+    "tokens_inflated",
 ]
 
 

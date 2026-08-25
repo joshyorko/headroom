@@ -1362,8 +1362,8 @@ async def test_ensure_initialized_fast_paths_and_qdrant_variants(
     )
     assert scope is not None
     assert scope.mode is MemoryStorageMode.PROJECT
-    assert scope.project_key == "proj-a"
-    assert effective_user == "alice::proj-a"
+    assert scope.project_key.startswith("proj-a-")
+    assert effective_user.startswith("alice::proj-a-")
     assert seen["config"] == {
         "qdrant_url": None,
         "qdrant_host": "localhost",
@@ -1371,7 +1371,7 @@ async def test_ensure_initialized_fast_paths_and_qdrant_variants(
         "qdrant_api_key": None,
         "neo4j_uri": "neo4j://localhost:7687",
         "neo4j_user": "neo4j",
-        "neo4j_password": "password",
+        "neo4j_password": "",
         "enable_graph": True,
     }
 

@@ -68,7 +68,7 @@ Avoid setting process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_P
 |--------|---------|-------------|
 | `--mode token` | | Prioritize token compression; prior turns may be rewritten for maximum savings. |
 | `--mode cache` | default | Freeze prior turns to maximize provider prefix-cache hit rate. This is the effective default (see [Savings profiles](#savings-profiles)). |
-| `--intercept-tool-results` | `false` | Opt into tool-result interceptors such as ast-grep Read outlining. |
+| `--intercept-tool-results` | `false` | Opt into canary tool-result interceptors such as ast-grep Read outlining. Requires `HEADROOM_ROLLOUT_CHANNEL=canary` (or `dev`). |
 | `--no-read-lifecycle` | `false` | Disable stale/superseded Read-output compression. |
 | `--code-aware` / `--no-code-aware` | disabled | Enable or disable AST-based code compression. Requires `headroom-ai[code]`. |
 | `--code-graph` | `false` | Enable the proxy's live code-graph file watcher for the current project. |
@@ -249,7 +249,7 @@ Coding agents re-read the same files repeatedly; these control how stale reads a
 | Flag / env | Default | Effect |
 |---|---|---|
 | `--no-read-lifecycle` | lifecycle on | Stop replacing stale/superseded file reads with CCR markers. |
-| `--read-maturation` / `HEADROOM_READ_MATURATION` | `false` | *(Experimental)* Hold freshly-read files out of the prefix cache until the file quiesces. |
+| `--read-maturation` / `HEADROOM_READ_MATURATION` | `false` | *(Beta)* Hold freshly-read files out of the prefix cache until the file quiesces. Requires `HEADROOM_ROLLOUT_CHANNEL=beta` (or `dev`). |
 | `--read-maturation-quiesce-turns` | `5` | Turns of no change before a held read is admitted. |
 
 ### Reliability: timeouts, retries, limits
@@ -284,6 +284,7 @@ Rewrite the upstream model per request — for example, send small, tool-free ca
 | `--telemetry` / `HEADROOM_TELEMETRY` | off | **Local-only** usage stats for your own `/stats`, `/metrics`, and dashboard. Nothing leaves the machine. |
 | `--log-file` / `HEADROOM_LOG_FILE` | none | JSONL request/response log. |
 | `--log-messages` | `false` | Include full message bodies in the log (may contain sensitive data). |
+| `HEADROOM_LOG_LEVEL` | `warning` | uvicorn's log level (`critical`, `error`, `warning`, `info`, `debug`, `trace`). Raise to `info` for the per-request access log when diagnosing a deployed proxy. An unrecognized value warns and falls back to `warning`. |
 | `HEADROOM_OTEL_METRICS_ENABLED` | `false` | Export OpenTelemetry metrics (`HEADROOM_OTEL_METRICS_ENDPOINT`, …). See [OTLP export](/docs/metrics#opentelemetry-otlp-export). |
 | `HEADROOM_LANGFUSE_ENABLED` | `false` | Emit Langfuse traces (`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`). |
 

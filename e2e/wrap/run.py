@@ -796,8 +796,9 @@ def verify_vscode_wrap(base_env: dict[str, str], project_dir: Path) -> None:
             "VS Code wrap should route Copilot Chat generation through Headroom",
         )
         assert_true(
-            '"github.copilot.advanced.debug.overrideAuthType": "token"' in configured,
-            "VS Code wrap should configure token auth",
+            "overrideAuthType" not in configured,
+            "VS Code wrap must not write overrideAuthType: no such setting exists in "
+            "the modern Copilot Chat extension, so VS Code flags it as unknown (#3076)",
         )
         assert_true(
             "synthetic-e2e-token" not in configured, "Settings must not contain credentials"

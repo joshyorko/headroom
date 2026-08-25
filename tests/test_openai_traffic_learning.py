@@ -143,7 +143,11 @@ def test_openai_responses_feeds_traffic_learner() -> None:
     )
     app = create_app(config)
 
-    with TestClient(app) as client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        client=("127.0.0.1", 12345),
+    ) as client:
         proxy = client.app.state.proxy
         backend = object()
         proxy.memory_handler = SimpleNamespace(
@@ -215,7 +219,11 @@ def test_openai_responses_feeds_request_scoped_user_to_traffic_learner() -> None
     )
     app = create_app(config)
 
-    with TestClient(app) as client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        client=("127.0.0.1", 12345),
+    ) as client:
         proxy = client.app.state.proxy
         backend = object()
         proxy.memory_handler = _FakeScopedMemoryHandler(backend)
@@ -281,7 +289,11 @@ def test_openai_responses_memory_save_keeps_request_context() -> None:
     )
     app = create_app(config)
 
-    with TestClient(app) as client:
+    with TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        client=("127.0.0.1", 12345),
+    ) as client:
         proxy = client.app.state.proxy
         memory_handler = _FakeMemoryHandler()
         proxy.memory_handler = memory_handler

@@ -8,6 +8,8 @@ const childProcess = nodeRequire("node:child_process") as typeof import("node:ch
 const fs = nodeRequire("node:fs") as typeof import("node:fs");
 
 const BASE_URL_HEADER = "x-headroom-base-url";
+const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+const PROJECT_HEADER = "x-headroom-project";
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 const STATE_KEY = Symbol.for("headroom.opencode.transport");
 
@@ -24,12 +26,14 @@ type ChildFork = typeof childProcess.fork;
 
 interface InstallOptions {
   proxyUrl: string;
+  project?: string;
   debug?: boolean;
 }
 
 interface TransportState {
   refs: number;
   proxyUrl: string;
+  project: string | undefined;
   debug: boolean;
   originalFetch: typeof fetch;
   originalHttpRequest: HttpRequest;
@@ -192,6 +196,31 @@ function routedUrl(upstream: URL, proxy: URL): URL {
   return new URL(`${upstream.pathname}${upstream.search}`, proxy.origin);
 }
 
+function normalizedOpenAiProxyPath(pathname: string): string | undefined {
+  if (pathname.endsWith("/chat/completions")) {
+    return "/v1/chat/completions";
+  }
+  if (pathname.endsWith("/responses")) {
+    return "/v1/responses";
+  }
+  return undefined;
+}
+
+function routedUrlForOpenCode(upstream: URL, proxy: URL): { url: URL; originalPath: string | undefined } {
+  const normalizedPath = normalizedOpenAiProxyPath(upstream.pathname);
+  if (!normalizedPath) {
+    return {
+      url: routedUrl(upstream, proxy),
+      originalPath: undefined,
+    };
+  }
+
+  return {
+    url: new URL(`${normalizedPath}${upstream.search}`, proxy.origin),
+    originalPath: upstream.pathname,
+  };
+}
+
 function requestUrl(input: RequestInfo | URL): URL {
   if (input instanceof Request) {
     return new URL(input.url);
@@ -202,7 +231,13 @@ function requestUrl(input: RequestInfo | URL): URL {
   return new URL(String(input));
 }
 
-function mergeFetchHeaders(input: RequestInfo | URL, init?: RequestInit, upstream?: URL): Headers {
+function mergeFetchHeaders(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  upstream: URL | undefined,
+  originalPath: string | undefined = undefined,
+  project: string | undefined = undefined,
+): Headers {
   const headers = new Headers(input instanceof Request ? input.headers : undefined);
   if (init?.headers) {
     new Headers(init.headers).forEach((value, key) => headers.set(key, value));
@@ -211,20 +246,26 @@ function mergeFetchHeaders(input: RequestInfo | URL, init?: RequestInit, upstrea
     headers.set(BASE_URL_HEADER, upstream.origin);
     headers.delete("host");
   }
+  if (originalPath) {
+    headers.set(ORIGINAL_PATH_HEADER, originalPath);
+  }
+  if (project) {
+    headers.set(PROJECT_HEADER, project);
+  }
   return headers;
 }
 
-function withRoutedFetchInput(input: RequestInfo | URL, init: RequestInit | undefined, proxy: URL): FetchArgs {
+function withRoutedFetchInput(input: RequestInfo | URL, init: RequestInit | undefined, proxy: URL, project: string | undefined): FetchArgs {
   const upstream = requestUrl(input);
   if (!shouldRoute(upstream, proxy)) {
     return [input, init];
   }
 
+  const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
   const nextInit = {
     ...init,
-    headers: mergeFetchHeaders(input, init, upstream),
+    headers: mergeFetchHeaders(input, init, upstream, originalPath, project),
   };
-  const nextUrl = routedUrl(upstream, proxy);
 
   if (input instanceof Request) {
     return [new Request(nextUrl, input), nextInit];
@@ -276,9 +317,20 @@ function urlFromRequestOptions(options: Record<string, unknown>): URL | undefine
   }
 }
 
-function headersForNodeRequest(options: Record<string, unknown>, upstream: URL): Record<string, string> {
+function headersForNodeRequest(
+  options: Record<string, unknown>,
+  upstream: URL,
+  originalPath: string | undefined,
+  project: string | undefined,
+): Record<string, string> {
   const headers = new Headers(options.headers as HeadersInit | undefined);
   headers.set(BASE_URL_HEADER, upstream.origin);
+  if (originalPath) {
+    headers.set(ORIGINAL_PATH_HEADER, originalPath);
+  }
+  if (project) {
+    headers.set(PROJECT_HEADER, project);
+  }
   headers.delete("host");
 
   const result: Record<string, string> = {};
@@ -288,12 +340,12 @@ function headersForNodeRequest(options: Record<string, unknown>, upstream: URL):
   return result;
 }
 
-function routedNodeOptions(parts: NodeRequestParts, proxy: URL): Record<string, unknown> | undefined {
+function routedNodeOptions(parts: NodeRequestParts, proxy: URL, project: string | undefined): Record<string, unknown> | undefined {
   if (!parts.url || !shouldRoute(parts.url, proxy)) {
     return undefined;
   }
 
-  const nextUrl = routedUrl(parts.url, proxy);
+  const { url: nextUrl, originalPath } = routedUrlForOpenCode(parts.url, proxy);
   const {
     agent: _agent,
     auth: _auth,
@@ -321,7 +373,7 @@ function routedNodeOptions(parts: NodeRequestParts, proxy: URL): Record<string, 
     hostname: nextUrl.hostname,
     port: nextUrl.port || undefined,
     path: `${nextUrl.pathname}${nextUrl.search}`,
-    headers: headersForNodeRequest(parts.options, parts.url),
+    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project),
   };
 }
 
@@ -338,7 +390,7 @@ function wrapRequest(
 
     const proxy = normalizeProxyUrl(state.proxyUrl);
     const parts = splitNodeArgs(args);
-    const nextOptions = routedNodeOptions(parts, proxy);
+    const nextOptions = routedNodeOptions(parts, proxy, state.project);
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -379,6 +431,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
   if (existing) {
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
+    existing.project = options.project;
     existing.debug = Boolean(options.debug);
     installProcessEnv(options.proxyUrl);
     return () => uninstallHeadroomTransport();
@@ -387,6 +440,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
   const state: TransportState = {
     refs: 1,
     proxyUrl: options.proxyUrl,
+    project: options.project,
     debug: Boolean(options.debug),
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
@@ -408,7 +462,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
       return state.originalFetch(...args);
     }
     const proxy = normalizeProxyUrl(current.proxyUrl);
-    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy);
+    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project);
     return state.originalFetch(nextInput, nextInit);
   };
 

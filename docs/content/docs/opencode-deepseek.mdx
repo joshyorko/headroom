@@ -71,7 +71,7 @@ curl -s http://127.0.0.1:8787/v1/models \
 Output shaping makes the model's responses shorter — fewer tokens, lower cost:
 
 ```bash
-HEADROOM_OUTPUT_SHAPER=1 HEADROOM_VERBOSITY_LEVEL=2 \
+HEADROOM_ROLLOUT_CHANNEL=beta HEADROOM_OUTPUT_SHAPER=1 HEADROOM_VERBOSITY_LEVEL=2 \
 headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1
 ```
 

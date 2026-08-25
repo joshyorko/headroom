@@ -65,6 +65,8 @@ async def handle_realtime_call(
     api_base_url: str,
     chatgpt_backend: bool,
     extra_headers: dict[str, str] | None = None,
+    config: Any = None,
+    custom_upstream: bool = False,
 ) -> Response:
     """Relay a realtime call without decoding its SDP, multipart, or JSON body."""
     try:
@@ -85,6 +87,8 @@ async def handle_realtime_call(
         request_headers = merge_extra_headers(
             _strip_internal_headers(request_headers),
             extra_headers,
+            upstream_url=upstream_url if custom_upstream else None,
+            config=config,
         )
         upstream = await http_client.request(
             "POST",
@@ -125,6 +129,8 @@ async def relay_realtime_websocket(
     upstream_path: str,
     proxy_token: str | None = None,
     extra_headers: dict[str, str] | None = None,
+    config: Any = None,
+    custom_upstream: bool = False,
 ) -> None:
     """Relay realtime sideband frames without interpreting their contents."""
     import websockets
@@ -153,7 +159,12 @@ async def relay_realtime_websocket(
     )
     headers = normalize_realtime_headers(inbound_headers, websocket=True)
     headers = resolve_codex_routing(headers).headers
-    headers = merge_extra_headers(_strip_internal_headers(headers), extra_headers)
+    headers = merge_extra_headers(
+        _strip_internal_headers(headers),
+        extra_headers,
+        upstream_url=upstream_url if custom_upstream else None,
+        config=config,
+    )
     subprotocols = list(websocket.scope.get("subprotocols", [])) or None
 
     try:

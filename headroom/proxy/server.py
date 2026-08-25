@@ -66,7 +66,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from headroom._version import __version__
-from headroom.agent_savings import proxy_pipeline_kwargs
+from headroom.agent_savings import DEFAULT_PROFILE, proxy_pipeline_kwargs
 from headroom.cache.compression_feedback import get_compression_feedback
 from headroom.cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from headroom.ccr import (
@@ -114,6 +114,7 @@ from headroom.proxy.audit import is_auditable_path, record_admin_action
 from headroom.proxy.auth_mode import should_stamp_codex_client
 from headroom.proxy.background_compression import BackgroundCompressor
 from headroom.proxy.budget_basis_policy import resolve_estimated_basis_policy
+from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
 
 # =============================================================================
 # Extracted modules (re-exported for backward compatibility)
@@ -134,13 +135,9 @@ from headroom.proxy.helpers import (
     MAX_REQUEST_BODY_SIZE,  # noqa: F401
     MAX_SSE_BUFFER_SIZE,  # noqa: F401
     RETRYABLE_OVERLOAD_STATUSES,
-    _get_context_tool_reported_project_stats,
-    _get_context_tool_stats,
     _get_image_compressor,  # noqa: F401
     _read_request_json,  # noqa: F401
     _setup_file_logging,  # noqa: F401
-    ingest_context_tool_stats,
-    initialize_context_tool_session_baseline,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
     resolve_display_provider,
@@ -148,6 +145,7 @@ from headroom.proxy.helpers import (
 )
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
 from headroom.proxy.loopback_guard import is_loopback_host
+from headroom.proxy.malloc_trim import trim_periodically
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
 # Data models (extracted to headroom/proxy/models.py for maintainability)
@@ -964,7 +962,8 @@ class HeadroomProxy(
         self._code_aware_status = "lazy" if config.code_aware_enabled else "disabled"
 
         _intercept_prefix: list = []
-        if os.environ.get("HEADROOM_INTERCEPT_ENABLED"):
+        assert config.rollout is not None
+        if config.rollout.is_enabled("tool_result_interceptors"):
             from headroom.proxy.interceptors import ToolResultInterceptorTransform
 
             _intercept_prefix = [ToolResultInterceptorTransform()]
@@ -1741,6 +1740,38 @@ class HeadroomProxy(
         if self.config.mode == PROXY_MODE_CACHE:
             logger.info("  Prefix freeze: strict (all prior turns immutable)")
             logger.info("  Mutations: latest turn only")
+        # Effective compression posture, resolved (not merely requested). The
+        # savings profile reaches the router through two paths — the config
+        # object and the seeded process env — and `setdefault` semantics mean a
+        # stale HEADROOM_* value silently overrides the profile that names it.
+        # A deployment can therefore log `savings_profile=coding` while actually
+        # running balanced's thresholds, and the only prior evidence was a
+        # single easily-missed WARNING. Print what is actually in force so
+        # "which profile am I really running?" is answerable from the banner.
+        try:
+            _eff = proxy_pipeline_kwargs(self.config)
+            # Read cross-turn dedup off the CONSTRUCTED router, not off the env.
+            # ContentRouter resolves it as `config.enable_cross_turn_dedup OR
+            # $HEADROOM_DEDUPE`, so reporting the env alone would be a guess that
+            # happens to be right only while nothing sets the config field. A
+            # banner line exists to be trusted; it must read what was resolved.
+            _dedupe: object = "unknown"
+            for _t in getattr(self.anthropic_pipeline, "transforms", []):
+                if isinstance(_t, ContentRouter):
+                    _dedupe = bool(getattr(_t, "_cross_turn_dedup_enabled", False))
+                    break
+            logger.info(
+                "Savings profile: %s (effective: min_tokens=%s min_chars_block=%s "
+                "compress_user=%s dedupe=%s tool_search=%s)",
+                self.config.savings_profile or DEFAULT_PROFILE,
+                _eff.get("min_tokens_to_compress", "default"),
+                _eff.get("min_chars_for_block_compression", "default(500)"),
+                _eff.get("compress_user_messages", False),
+                _dedupe,
+                os.environ.get("HEADROOM_TOOL_SEARCH", "1") in ("1", "true", "yes", "on", "auto"),
+            )
+        except Exception:  # never let a banner line block startup
+            logger.debug("effective savings-profile banner skipped", exc_info=True)
         logger.info(f"Caching: {'ENABLED' if self.config.cache_enabled else 'DISABLED'}")
         logger.info(f"Rate Limiting: {'ENABLED' if self.config.rate_limit_enabled else 'DISABLED'}")
         logger.info(
@@ -2540,14 +2571,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     proxy = HeadroomProxy(config)
 
-    from headroom.telemetry.beacon import TelemetryBeacon
-
-    telemetry_beacon = TelemetryBeacon(
-        port=config.port,
-        sdk=os.environ.get("HEADROOM_SDK", "").strip() or "proxy",
-        backend=str(config.backend or "anthropic"),
-    )
-
     # cc-switch reconciler (opt-in: HEADROOM_CC_SWITCH_RECONCILE=1).
     # Keeps Headroom in the request path while cc-switch overwrites
     # ~/.claude/settings.json on every provider switch. See
@@ -2643,8 +2666,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.started_at = time.time()
         app.state.ready = False
         app.state.startup_error = None
-        await initialize_context_tool_session_baseline()
         app.state.periodic_toin_stats_task = None
+        app.state.periodic_malloc_trim_task = None
 
         try:
             try:
@@ -2655,6 +2678,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     app.state.periodic_toin_stats_task = asyncio.create_task(
                         _log_toin_stats_periodically()
                     )
+                # Per-worker on purpose: allocator state is per-process, so
+                # every worker must trim its own zones (no beacon-owner gate).
+                if config.periodic_malloc_trim_enabled:
+                    app.state.periodic_malloc_trim_task = asyncio.create_task(
+                        trim_periodically(config.malloc_trim_interval_seconds)
+                    )
                 if proxy.usage_reporter:
                     await proxy.usage_reporter.start(proxy)
                 if proxy.traffic_learner:
@@ -2664,9 +2693,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
                 # Elect the single owner worker (first worker wins the lock).
                 _beacon_is_owner[0] = _try_acquire_beacon_lock()
-
-                if _beacon_is_owner[0]:
-                    await telemetry_beacon.start()
 
                 # Only the owner worker runs the reconciler. With uvicorn
                 # workers > 1 each worker runs this lifespan; without this guard
@@ -2717,10 +2743,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 )
                 app.state.periodic_toin_stats_task = None
 
+            periodic_malloc_trim_task = app.state.periodic_malloc_trim_task
+            if periodic_malloc_trim_task is not None:
+                periodic_malloc_trim_task.cancel()
+                await _timed(
+                    asyncio.gather(periodic_malloc_trim_task, return_exceptions=True),
+                    label="periodic_malloc_trim.stop",
+                    timeout=3.0,
+                )
+                app.state.periodic_malloc_trim_task = None
+
             if _cc_reconciler is not None:
                 await _timed(_cc_reconciler.stop(), label="cc_reconciler.stop", timeout=3.0)
             if _beacon_is_owner[0]:
-                await telemetry_beacon.stop()
                 _release_beacon_lock()
             if proxy.usage_reporter:
                 await _timed(proxy.usage_reporter.stop(), label="usage_reporter.stop", timeout=3.0)
@@ -3221,7 +3256,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         inbound_id = f"inbound-{time.time_ns()}"
         # Client/project attribution: path prefixes cover clients that cannot
         # send custom headers. Strip /c/<client> before /p/<project> so combined
-        # prefixes like /c/hermes/p/headroom/v1/... reach the canonical routes.
+        # prefixes reach the canonical routes.
         # The prefix strip mutates the scope, so it must happen before
         # request.url is first accessed (Starlette caches the URL).
         prefix_client = strip_client_path_prefix(request.scope)
@@ -3477,18 +3512,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         already an IP-literal-Host, CIDR-trusted dashboard client. Loopback
         callers keep the stricter loopback-only origin check unchanged.
         """
-        if not _request_is_loopback(request):
-            origin = request.headers.get("origin")
-            host_header = request.headers.get("host")
-            if (
-                origin
-                and origin != "null"
-                and host_header
-                and _request_has_same_origin_or_no_provenance(request, host_header)
-                and _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs)
-            ):
-                return
-        _require_same_origin(request)
+        if _request_is_loopback(request):
+            _require_same_origin(request)
+            return
+
+        from headroom.proxy.forwarded_headers import peer_is_trusted_gateway, resolve_client_ip
+        from headroom.proxy.loopback_guard import is_ip_literal_host_header
+
+        host_header = request.headers.get("host")
+        if not is_ip_literal_host_header(host_header) or not peer_is_trusted_gateway(
+            resolve_client_ip(request), trusted_dashboard_client_cidrs
+        ):
+            raise HTTPException(status_code=404)
+        assert host_header is not None
+        if not _request_has_same_origin_or_no_provenance(request, host_header):
+            raise HTTPException(status_code=403, detail="cross-origin request rejected")
 
     @app.get("/admin/upstream", dependencies=[Depends(_require_loopback)])
     async def get_upstream():
@@ -3556,8 +3594,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         Loopback-only. The body is a flat ``{ENV_NAME: "value"}`` map; unknown
         keys and non-string values are ignored. Returns what was applied plus
-        the resulting live config. Last writer wins (overrides are global to the
-        proxy, which is inherent — every wrapper shares one process).
+        the resulting live config. Last writer wins in a single-worker proxy;
+        multi-worker proxies reject the update because overrides are process-local.
         """
         try:
             body = await request.json()
@@ -3568,7 +3606,27 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 status_code=400,
                 content={"error": "expected a JSON object of {ENV_NAME: value}"},
             )
+        if proxy.config.worker_processes > 1:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": (
+                        "runtime environment hot reload is unavailable with multiple "
+                        "worker processes; restart the proxy with the desired environment"
+                    ),
+                    "worker_processes": proxy.config.worker_processes,
+                },
+            )
         applied = runtime_env.set_overrides(body)
+        rollout_aliases = {
+            key: value for key, value in applied.items() if key == "HEADROOM_OUTPUT_SHAPER"
+        }
+        if rollout_aliases:
+            assert proxy.config.rollout is not None
+            proxy.config.rollout = proxy.config.rollout.with_legacy_env(rollout_aliases)
+            async with _stats_snapshot_lock:
+                _stats_snapshot["value"] = None
+                _stats_snapshot["expires_at"] = 0.0
         if applied:
             logger.info("runtime-env hot-reload applied: %s", sorted(applied))
             # Record which runtime-env keys changed (the "what" of a config
@@ -3583,14 +3641,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
         return JSONResponse(
             status_code=200,
-            content={"applied": applied, "runtime_env": runtime_env.effective_runtime_env()},
+            content={
+                "applied": applied,
+                "runtime_env": runtime_env.effective_runtime_env(),
+                "rollout": proxy.config.rollout.to_dict() if proxy.config.rollout else None,
+            },
         )
 
     # Vendored dashboard JS (tailwind/htmx/alpine). Mounted before
     # register_provider_routes' catch-all so it is not tunneled upstream.
     from starlette.staticfiles import StaticFiles
 
-    from headroom.dashboard import STATIC_DIR
+    from headroom.dashboard import STATIC_DIR, register_static_mime_types
+
+    # A host whose mime database maps .js to text/plain (stale Windows registry
+    # entry, minimal container image) would otherwise have these served as plain
+    # text, which the nosniff header above then blocks in the browser (#3179).
+    register_static_mime_types()
 
     # check_dir=False keeps a missing assets directory from aborting proxy
     # startup: the dashboard JS 404s, but proxying itself still works.
@@ -3640,7 +3707,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.post(
         "/settings",
         dependencies=[
-            Depends(_require_loopback_or_trusted_dashboard_client),
             Depends(_require_same_origin_or_trusted_dashboard_client),
         ],
     )
@@ -3690,7 +3756,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.post(
         "/settings/apply",
         dependencies=[
-            Depends(_require_loopback_or_trusted_dashboard_client),
             Depends(_require_same_origin_or_trusted_dashboard_client),
         ],
     )
@@ -3848,59 +3913,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "recent_requests": dashboard_recent_requests,
         }
 
-    def _project_name_from_cwd(cwd: Any) -> str | None:
-        if not isinstance(cwd, str) or not cwd.strip():
-            return None
-        clean = cwd.rstrip("/\\")
-        if not clean:
-            return None
-        return clean.replace("\\", "/").rsplit("/", 1)[-1] or None
-
-    def _merge_context_tool_project_savings(
-        projects: dict[str, Any],
-        context_tool_stats: dict[str, Any] | None,
-        reported_project_stats: dict[str, dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        merged = dict(projects)
-
-        def merge_snapshot(snapshot: dict[str, Any]) -> None:
-            if snapshot.get("scope") != "project":
-                return
-            project = str(snapshot.get("project") or "").strip() or _project_name_from_cwd(
-                snapshot.get("cwd")
-            )
-            if not project:
-                return
-            tokens_saved = int(snapshot.get("tokens_saved", 0) or 0)
-            commands = int(snapshot.get("total_commands", 0) or 0)
-            input_tokens = int(snapshot.get("input_tokens", 0) or 0)
-            existing = dict(merged.get(project, {}))
-            existing["requests"] = max(int(existing.get("requests", 0) or 0), commands)
-            existing["tokens_saved"] = max(int(existing.get("tokens_saved", 0) or 0), tokens_saved)
-            existing["rtk_tokens_saved"] = tokens_saved
-            existing["rtk_commands"] = commands
-            existing["total_input_tokens"] = max(
-                int(existing.get("total_input_tokens", 0) or 0), input_tokens
-            )
-            if input_tokens:
-                existing["savings_percent"] = round((tokens_saved / input_tokens) * 100, 2)
-            existing.setdefault("compression_savings_usd", 0.0)
-            existing.setdefault("total_input_cost_usd", 0.0)
-            reported_at = snapshot.get("reported_at")
-            if reported_at:
-                existing["last_activity_at"] = datetime.fromtimestamp(
-                    float(reported_at), tz=timezone.utc
-                ).isoformat()
-            merged[project] = existing
-
-        if reported_project_stats:
-            for snapshot in reported_project_stats.values():
-                if isinstance(snapshot, dict):
-                    merge_snapshot(snapshot)
-        elif isinstance(context_tool_stats, dict):
-            merge_snapshot(context_tool_stats)
-        return merged
-
     async def _build_stats_payload() -> dict[str, Any]:
         """Build the full `/stats` response payload.
 
@@ -3982,45 +3994,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Build prefix cache stats once (used in both prefix_cache and cost)
         prefix_cache_stats = _build_prefix_cache_stats(m, proxy.cost_tracker)
 
-        # Fetch CLI filtering savings from the selected context tool. These
-        # tokens are avoided before they reach model context.
-        cli_filtering_stats = await asyncio.to_thread(_get_context_tool_stats)
-        cli_filtering_project_stats = await asyncio.to_thread(
-            _get_context_tool_reported_project_stats
-        )
-        cli_filtering_tool = (
-            str(cli_filtering_stats.get("tool", "rtk")) if cli_filtering_stats else "rtk"
-        )
-        cli_filtering_label = (
-            str(cli_filtering_stats.get("label", "RTK")) if cli_filtering_stats else "RTK"
-        )
-        cli_tokens_avoided = (
-            cli_filtering_stats.get("tokens_saved", 0) if cli_filtering_stats else 0
-        )
-        cli_filtering_session = (
-            cli_filtering_stats.get("session", {}) if cli_filtering_stats else {}
-        )
-        cli_filtering_lifetime = (
-            cli_filtering_stats.get("lifetime", {}) if cli_filtering_stats else {}
-        )
-        cli_filtering_baseline = (
-            cli_filtering_stats.get("baseline", {}) if cli_filtering_stats else {}
-        )
-        rtk_tokens_avoided = cli_tokens_avoided if cli_filtering_tool == "rtk" else 0
-        lean_ctx_tokens_avoided = cli_tokens_avoided if cli_filtering_tool == "lean-ctx" else 0
-        cli_filtering_available = bool(
-            cli_filtering_stats and cli_filtering_stats.get("installed", False)
-        )
-
-        # Calculate total tokens before Headroom-side reduction. Proxy
-        # compression and the configured context tool both remove tokens before
-        # they reach model context, so dashboard-facing savings combines them.
+        # Calculate total tokens before Headroom-side reduction.
         proxy_compression_tokens = m.tokens_saved_total
         # "All layers" must include tool-schema deferral (the tool_search layer
         # enumerated in by_layer below) — otherwise the advertised total omits it.
-        all_layers_tokens_saved = (
-            proxy_compression_tokens + cli_tokens_avoided + m.tool_search_saved_total
-        )
+        all_layers_tokens_saved = proxy_compression_tokens + m.tool_search_saved_total
         total_tokens_before = m.tokens_input_total + all_layers_tokens_saved
         proxy_total_before_compression = m.tokens_input_total + proxy_compression_tokens
         # `attempted_input_tokens` is the compressible-only denominator
@@ -4051,13 +4029,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
 
         # Build human-readable summary
-        summary = _build_session_summary(
-            proxy,
-            m,
-            prefix_cache_stats,
-            cli_tokens_avoided=cli_tokens_avoided,
-            total_tokens_before=total_tokens_before,
-        )
+        summary = _build_session_summary(proxy, m, prefix_cache_stats, total_tokens_before)
         # DEBUG: log the summary payload for external upsert consumers
         try:
             logger.debug("/stats summary data: %r", summary)
@@ -4136,17 +4108,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             _oest = get_recorder().estimate()
             if _oest.n_requests > 0:
-                estimate_status = str(getattr(_oest, "estimate_status", "warming"))
-                estimate_reliable = bool(getattr(_oest, "estimate_reliable", False))
-                estimate_reasons = list(getattr(_oest, "estimate_reasons", []))
-                display_tokens_saved = (
-                    round(_oest.tokens_saved)
-                    if estimate_reliable and _oest.tokens_saved > 0
-                    else None
-                )
-                display_reduction_percent = (
-                    round(_oest.pct, 1) if estimate_reliable and _oest.pct > 0 else None
-                )
                 output_reduction = {
                     "available": True,
                     "method": _oest.kind,  # "measured" | "estimated"
@@ -4156,76 +4117,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "ci_low_percent": round(_oest.ci_low_pct, 1),
                     "ci_high_percent": round(_oest.ci_high_pct, 1),
                     "requests": _oest.n_requests,
-                    "estimate_reliable": estimate_reliable,
-                    "estimate_status": estimate_status,
-                    "estimate_quality": str(getattr(_oest, "estimate_quality", estimate_status)),
-                    "estimate_reasons": estimate_reasons,
-                    "display_tokens_saved": display_tokens_saved,
-                    "display_reduction_percent": display_reduction_percent,
                 }
         except Exception:  # pragma: no cover - defensive
             pass
-
-        from headroom.proxy.output_shaper import OutputShaperSettings
-
-        output_shaper_enabled = OutputShaperSettings.from_env().enabled
-        output_shaper_applied_requests = 0
-        output_shaper_level_counts: dict[str, int] = {}
-        output_shaper_by_client: dict[str, int] = {}
-        output_shaper_latest_label: str | None = None
-        for output_log in recent_request_logs:
-            labels = [str(label) for label in output_log.get("transforms_applied", [])]
-            applied_labels = [
-                label
-                for label in labels
-                if label.startswith("output_shaper:")
-                and not label.startswith("output_shaper:control:")
-                and not label.startswith("output_shaper:stratum:")
-            ]
-            if not applied_labels:
-                continue
-            output_shaper_applied_requests += 1
-            output_shaper_latest_label = applied_labels[-1]
-            for label in applied_labels:
-                if label.startswith("output_shaper:verbosity:"):
-                    level = label.rsplit(":", 1)[-1]
-                    output_shaper_level_counts[level] = output_shaper_level_counts.get(level, 0) + 1
-            output_tags = output_log.get("tags")
-            if isinstance(output_tags, dict):
-                output_client = str(output_tags.get("client") or "").strip()
-                if output_client:
-                    output_shaper_by_client[output_client] = (
-                        output_shaper_by_client.get(output_client, 0) + 1
-                    )
-        output_estimate_available = bool(output_reduction.get("available"))
-        output_shaping_activity = {
-            "enabled": output_shaper_enabled,
-            "applied": output_shaper_applied_requests > 0,
-            "available": output_estimate_available or output_shaper_applied_requests > 0,
-            "estimate_available": output_estimate_available,
-            "method": (
-                output_reduction.get("method")
-                if output_estimate_available
-                else "request_steering"
-                if output_shaper_applied_requests > 0
-                else None
-            ),
-            "applied_requests": output_shaper_applied_requests,
-            "level_counts": output_shaper_level_counts,
-            "by_client": output_shaper_by_client,
-            "latest_label": output_shaper_latest_label,
-        }
 
         return {
             "summary": summary,
             "agent_usage": agent_usage,
             "savings": {
                 "total_tokens": total_tokens_all_layers,
-                "per_project": _merge_context_tool_project_savings(
-                    persistent_savings.get("projects", {}),
-                    cli_filtering_stats,
-                    cli_filtering_project_stats,
-                ),
+                "per_project": persistent_savings.get("projects", {}),
                 # Attribution only: these rows explain the canonical headline
                 # and are not added to it again.
                 "by_source": sorted(
@@ -4233,59 +4134,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     key=lambda row: (-int(row.get("tokens", 0)), str(row["source"])),
                 ),
                 "by_layer": {
-                    "cli_filtering": {
-                        "tool": cli_filtering_tool,
-                        "label": cli_filtering_label,
-                        "available": cli_filtering_available,
-                        "tokens": cli_tokens_avoided,
-                        "tokens_saved": cli_tokens_avoided,
-                        "session": cli_filtering_session,
-                        "lifetime": cli_filtering_lifetime,
-                        "baseline": cli_filtering_baseline,
-                        "session_delta_available": (
-                            cli_filtering_stats.get("session_delta_available")
-                            if cli_filtering_stats
-                            else None
-                        ),
-                        "session_delta_unavailable_reason": (
-                            cli_filtering_stats.get("session_delta_unavailable_reason")
-                            if cli_filtering_stats
-                            else None
-                        ),
-                        "session_savings_pct": (
-                            cli_filtering_stats.get("session_savings_pct")
-                            if cli_filtering_stats
-                            else None
-                        ),
-                        "lifetime_savings_pct": (
-                            cli_filtering_stats.get("lifetime_avg_savings_pct")
-                            if cli_filtering_stats
-                            else None
-                        ),
-                        "refresh_interval_seconds": (
-                            cli_filtering_stats.get("refresh_interval_seconds")
-                            if cli_filtering_stats
-                            else None
-                        ),
-                        "included_in": "tokens.saved",
-                        "description": (
-                            f"Tokens avoided by CLI output filtering ({cli_filtering_label}) "
-                            "before reaching context. "
-                            "Included in dashboard token savings, but not in dollar savings."
-                        ),
-                    },
                     "compression": {
                         "tokens": proxy_compression_tokens,
                         "proxy_tokens": proxy_compression_tokens,
-                        "cli_filtering_tokens": cli_tokens_avoided,
-                        "rtk_tokens": rtk_tokens_avoided,
-                        "lean_ctx_tokens": lean_ctx_tokens_avoided,
                         "all_layers_tokens": all_layers_tokens_saved,
-                        "description": (
-                            "Tokens removed by Headroom proxy compression. "
-                            "Dashboard token savings also includes CLI context-tool filtering "
-                            "and deferred tool schemas."
-                        ),
+                        "description": ("Tokens removed by Headroom proxy compression."),
                     },
                     "prefix_cache": {
                         "discount_usd": round(cache_net_usd, 4),
@@ -4297,7 +4150,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     },
                     "output_shaping": {
                         **output_reduction,
-                        **output_shaping_activity,
                         "description": (
                             "OUTPUT tokens the model didn't emit because the shaper "
                             "steered verbosity / routed effort down. Counterfactual — "
@@ -4338,10 +4190,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "output_reduction": output_reduction,
                 "saved": all_layers_tokens_saved,
                 "proxy_compression_saved": proxy_compression_tokens,
-                "cli_filtering_saved": cli_tokens_avoided,
-                "rtk_saved": rtk_tokens_avoided,
-                "lean_ctx_saved": lean_ctx_tokens_avoided,
-                "cli_tokens_avoided": cli_tokens_avoided,
                 "proxy_total_before_compression": proxy_total_before_compression,
                 "total_before_compression": total_tokens_before,
                 "all_layers_saved": all_layers_tokens_saved,
@@ -4524,7 +4372,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "cost": _merge_cost_stats(
                 proxy.cost_tracker.stats() if proxy.cost_tracker else None,
                 prefix_cache_stats,
-                cli_tokens_avoided=cli_tokens_avoided,
             ),
             "compression": {
                 "ccr_entries": compression_stats.get("entry_count", 0),
@@ -4534,7 +4381,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "ccr_retrievals": compression_stats.get("total_retrievals", 0),
             },
             "compression_cache": compression_cache_stats,
-            "anon_telemetry_shipping": is_telemetry_enabled(),
+            # Always False: the anonymous telemetry beacon was removed, so no
+            # telemetry is ever shipped externally (local collection only).
+            "anon_telemetry_shipping": False,
             "telemetry": {
                 "enabled": telemetry_stats.get("enabled", False),
                 "total_compressions": telemetry_stats.get("total_compressions", 0),
@@ -4558,13 +4407,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ),
             },
             "toin": get_toin().get_stats(),
-            "context_tool": {
-                "configured": cli_filtering_tool,
-                "label": cli_filtering_label,
-                "available": cli_filtering_available,
-                "stats": cli_filtering_stats,
-            },
-            "cli_filtering": cli_filtering_stats,
             "proxy_inbound": proxy.metrics.inbound_snapshot(),
             "cache": await proxy.cache.stats() if proxy.cache else None,
             "rate_limiter": await proxy.rate_limiter.stats() if proxy.rate_limiter else None,
@@ -4572,6 +4414,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "log_full_messages": proxy.config.log_full_messages if proxy else False,
             **get_quota_registry().get_all_stats(),
             "throughput": throughput,
+            # Effective state from the running process. This is the supported
+            # black-box provenance surface for benchmark/qualification tools.
+            "rollout": proxy.config.rollout.to_dict() if proxy.config.rollout else None,
         }
 
     def _dashboard_config_payload() -> dict[str, Any]:
@@ -4663,7 +4508,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # _build_stats_payload bakes these in; strip for network callers.
             payload.pop("recent_requests", None)
             payload.pop("request_logs", None)
-        payload["per_request_metadata_hidden"] = not include_sensitive
         return payload
 
     @app.get("/stats-lifetime")
@@ -4681,39 +4525,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 payload["persistence"] = {**persistence, "error": None}
         return payload
 
-    @app.post("/stats/context-tool")
-    async def report_context_tool_stats(request: Request):
-        """Accept aggregate context-tool counters from a remote workstation."""
-
-        try:
-            body = await request.json()
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPException(status_code=400, detail="invalid JSON body") from None
-        try:
-            stats_payload = ingest_context_tool_stats(
-                body,
-                source=request.client.host if request.client else "unknown",
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        if stats_payload.get("scope") == "project" and stats_payload.get("project"):
-            proxy.metrics.savings_tracker.upsert_context_tool_project_snapshot(
-                str(stats_payload["project"]),
-                commands=int(stats_payload.get("total_commands", 0) or 0),
-                tokens_saved=int(stats_payload.get("tokens_saved", 0) or 0),
-                input_tokens=int(stats_payload.get("input_tokens", 0) or 0),
-                timestamp=datetime.fromtimestamp(
-                    float(stats_payload.get("reported_at", 0) or 0), tz=timezone.utc
-                ),
-            )
-
-        async with _stats_snapshot_lock:
-            _stats_snapshot["value"] = None
-            _stats_snapshot["expires_at"] = 0.0
-
-        return {"ok": True, "context_tool": stats_payload}
-
     @app.post(
         "/stats/reset",
         dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
@@ -4723,7 +4534,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         await proxy.metrics.reset_runtime()
         if proxy.cost_tracker:
             proxy.cost_tracker.reset_runtime()
-        await initialize_context_tool_session_baseline()
         async with _stats_snapshot_lock:
             _stats_snapshot["value"] = None
             _stats_snapshot["expires_at"] = 0.0
@@ -4744,25 +4554,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 headers={"Content-Disposition": f'attachment; filename="{filename}"'},
             )
 
-        history = proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
-
-        try:
-            cli_stats = await asyncio.to_thread(_get_context_tool_stats)
-        except Exception:
-            logger.debug("stats-history: context-tool stats unavailable", exc_info=True)
-            cli_stats = None
-        if cli_stats:
-            history["cli_filtering"] = {
-                "tool": str(cli_stats.get("tool", "rtk")),
-                "label": str(cli_stats.get("label", "RTK")),
-                "available": bool(cli_stats.get("installed", False)),
-                "lifetime": cli_stats.get("lifetime", {}),
-                "session": cli_stats.get("session", {}),
-            }
-        else:
-            history["cli_filtering"] = None
-
-        return history
+        return proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
 
     @app.get("/transformations/feed", dependencies=[Depends(_require_loopback)])
     async def transformations_feed(limit: int = 20):
@@ -4911,7 +4703,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """
         data = await request.json()
         hash_key = data.get("hash")
-        query = data.get("query")
 
         if not hash_key:
             raise HTTPException(status_code=400, detail="hash required")
@@ -4924,15 +4715,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 status_code=404,
                 detail=format_retrieval_miss_detail(entry_status),
             )
-
-        if query:
-            results = store.search(hash_key, query)
-            return {
-                "hash": hash_key,
-                "query": query,
-                "results": results,
-                "count": len(results),
-            }
 
         # Retrieval is by hash: always return the full original content.
         entry = store.retrieve(hash_key)
@@ -5251,7 +5033,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
 
     @app.get("/v1/retrieve/{hash_key}", dependencies=[Depends(_require_loopback)])
-    async def ccr_retrieve_get(hash_key: str, query: str | None = None):
+    async def ccr_retrieve_get(hash_key: str):
         """GET version of CCR retrieve for easier testing."""
         store = get_compression_store()
         entry_status = store.get_entry_status(hash_key, clean_expired=True)
@@ -5261,15 +5043,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 status_code=404,
                 detail=format_retrieval_miss_detail(entry_status),
             )
-
-        if query:
-            results = store.search(hash_key, query)
-            return {
-                "hash": hash_key,
-                "query": query,
-                "results": results,
-                "count": len(results),
-            }
 
         # Retrieval is by hash: always return the full original content.
         entry = store.retrieve(hash_key)
@@ -5333,21 +5106,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         provider = data.get("provider", "anthropic")
 
         # Parse the tool call
-        parsed_tool_call = parse_tool_call(tool_call, provider)
+        hash_key = parse_tool_call(tool_call, provider)
 
-        if parsed_tool_call is None:
-            raise HTTPException(
-                status_code=400, detail=f"Invalid tool call or not a {CCR_TOOL_NAME} call"
-            )
-        if isinstance(parsed_tool_call, tuple):
-            hash_key, _query = parsed_tool_call
-        else:
-            hash_key, _query = parsed_tool_call, None
         if hash_key is None:
             raise HTTPException(
                 status_code=400, detail=f"Invalid tool call or not a {CCR_TOOL_NAME} call"
             )
-        assert hash_key is not None
 
         # Perform retrieval
         store = get_compression_store()
@@ -5445,6 +5209,10 @@ def _json_ready(value: Any) -> Any:
 def _proxy_config_payload(config: ProxyConfig) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     for field in fields(config):
+        if field.name == "rollout":
+            assert config.rollout is not None
+            payload["_rollout_snapshot"] = config.rollout.to_internal_dict()
+            continue
         value = _json_ready(getattr(config, field.name))
         try:
             json.dumps(value)
@@ -5458,13 +5226,25 @@ def _proxy_config_from_env() -> ProxyConfig:
     raw_config = os.environ.get(_MULTI_WORKER_CONFIG_ENV)
     if raw_config:
         try:
-            return ProxyConfig(**json.loads(raw_config))
-        except (TypeError, ValueError, json.JSONDecodeError):
+            values = json.loads(raw_config)
+            if not isinstance(values, dict):
+                raise TypeError("proxy config JSON must be an object")
+            if "_rollout_snapshot" in values:
+                rollout_value = values.pop("_rollout_snapshot")
+                from headroom.rollout import RolloutSnapshot
+
+                values["rollout"] = RolloutSnapshot.from_internal_dict(rollout_value)
+            return ProxyConfig(**values)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             logger.warning(
                 "Invalid %s; falling back to HEADROOM_* env vars", _MULTI_WORKER_CONFIG_ENV
             )
 
+    from headroom.rollout import resolve_rollout
+
+    rollout = resolve_rollout()
     return ProxyConfig(
+        rollout=rollout,
         host=_get_env_str("HEADROOM_HOST", "127.0.0.1"),
         port=_get_env_int("HEADROOM_PORT", 8787),
         openai_api_url=os.environ.get("OPENAI_TARGET_API_URL"),
@@ -5473,6 +5253,10 @@ def _proxy_config_from_env() -> ProxyConfig:
             "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
             600,
             min_value=1,
+        ),
+        buffered_ccr_grace_seconds=_get_env_float(
+            "HEADROOM_BUFFERED_CCR_GRACE_SECONDS",
+            DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
         ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
@@ -5493,6 +5277,10 @@ def _proxy_config_from_env() -> ProxyConfig:
         http2=_get_env_bool("HEADROOM_HTTP2", True),
         http_proxy=os.environ.get("HEADROOM_HTTP_PROXY") or None,
         periodic_toin_stats_enabled=_get_env_bool("HEADROOM_PERIODIC_TOIN_STATS", True),
+        periodic_malloc_trim_enabled=_get_env_bool(
+            "HEADROOM_MALLOC_TRIM", sys.platform == "darwin"
+        ),
+        malloc_trim_interval_seconds=_get_env_int("HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS", 60),
         proxy_token=os.environ.get("HEADROOM_PROXY_TOKEN") or None,
         offline=_get_env_bool("HEADROOM_OFFLINE", False),
         # Default mode is CACHE (Headroom's coding posture): delta-only compression
@@ -5502,7 +5290,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         # posture (compress_user, protect_recent, min_tokens). HEADROOM_SAVINGS_PROFILE
         # overrides.
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
-        read_maturation=_get_env_bool("HEADROOM_READ_MATURATION", False),
+        read_maturation=rollout.is_enabled("read_maturation"),
         read_maturation_quiesce_turns=_get_env_int("HEADROOM_READ_MATURATION_QUIESCE_TURNS", 5),
         read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
         read_maturation_min_size_bytes=_get_env_int(
@@ -5592,6 +5380,9 @@ def run_server(
     seed_proxy_env_defaults()
 
     config = config or ProxyConfig()
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
+    config.worker_processes = workers
     code_aware_status = _get_code_aware_banner_status(config)
 
     # Format connection pool info
@@ -5707,11 +5498,18 @@ def run_server(
     else:
         app_target = create_app(config)
 
+    # "warning" keeps the default terminal quiet (uvicorn's access log is one line
+    # per request). It was previously hardcoded, which left deployed proxies with
+    # no way to turn request logging on: operators diagnosing a production
+    # incident could not see uvicorn's view of the traffic at all, with no env var
+    # and no CLI flag to change it. Overridable now; the default is unchanged.
+    uvicorn_log_level = _resolve_uvicorn_log_level()
+
     uvicorn.run(
         app_target,
         host=config.host,
         port=config.port,
-        log_level="warning",
+        log_level=uvicorn_log_level,
         workers=workers if workers > 1 else None,  # None = single process (default)
         limit_concurrency=limit_concurrency,
         # Defense-in-depth: the loopback guard for /debug/* endpoints trusts
@@ -5776,6 +5574,30 @@ def _get_env_float(name: str, default: float) -> float:
 def _get_env_str(name: str, default: str) -> str:
     """Get string from environment variable."""
     return os.environ.get(name, default)
+
+
+# uvicorn rejects anything outside this set with a KeyError during startup, so an
+# operator typo in HEADROOM_LOG_LEVEL must not be able to stop the proxy booting.
+_UVICORN_LOG_LEVELS = frozenset({"critical", "error", "warning", "info", "debug", "trace"})
+_UVICORN_LOG_LEVEL_DEFAULT = "warning"
+
+
+def _resolve_uvicorn_log_level() -> str:
+    """Resolve uvicorn's log level from ``HEADROOM_LOG_LEVEL``.
+
+    Falls back to the previous hardcoded default on an unset or unrecognized
+    value, warning loudly rather than failing the boot.
+    """
+    raw = _get_env_str("HEADROOM_LOG_LEVEL", _UVICORN_LOG_LEVEL_DEFAULT).strip().lower()
+    if raw in _UVICORN_LOG_LEVELS:
+        return raw
+    logger.warning(
+        "Ignoring unrecognized HEADROOM_LOG_LEVEL=%r; using %r. Valid values: %s",
+        raw,
+        _UVICORN_LOG_LEVEL_DEFAULT,
+        ", ".join(sorted(_UVICORN_LOG_LEVELS)),
+    )
+    return _UVICORN_LOG_LEVEL_DEFAULT
 
 
 def _parse_exclude_tools(cli_excludes: str | None) -> set[str]:
@@ -6168,7 +5990,11 @@ if __name__ == "__main__":
         args.protect_tool_results or os.environ.get("HEADROOM_PROTECT_TOOL_RESULTS")
     )
 
+    from headroom.rollout import resolve_rollout
+
+    rollout = resolve_rollout()
     config = ProxyConfig(
+        rollout=rollout,
         host=_get_env_str("HEADROOM_HOST", args.host),
         port=_get_env_int("HEADROOM_PORT", args.port),
         openai_api_url=_get_env_str("OPENAI_TARGET_API_URL", args.openai_api_url),
@@ -6222,7 +6048,7 @@ if __name__ == "__main__":
         keepalive_expiry=_get_env_float("HEADROOM_KEEPALIVE_EXPIRY", args.keepalive_expiry),
         http2=not args.no_http2 and _get_env_bool("HEADROOM_HTTP2", True),
         http_proxy=_get_env_str("HEADROOM_HTTP_PROXY", args.http_proxy or "") or None,
-        read_maturation=_get_env_bool("HEADROOM_READ_MATURATION", False),
+        read_maturation=rollout.is_enabled("read_maturation"),
         read_maturation_quiesce_turns=_get_env_int("HEADROOM_READ_MATURATION_QUIESCE_TURNS", 5),
         read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
         read_maturation_min_size_bytes=_get_env_int(

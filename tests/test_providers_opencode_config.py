@@ -197,13 +197,7 @@ def test_inject_provider_config_creates_file(
     assert config_file.exists()
     config = _parse_json_loose(config_file.read_text())
     assert config["provider"]["headroom"]["npm"] == "@ai-sdk/openai-compatible"
-    # Bare model ids: OpenCode resolves them as "headroom/<id>" (#1657).
-    models = config["provider"]["headroom"]["models"]
-    assert set(models) == {"gpt-4o", "gpt-4.1"}
-    # The injected provider is OpenAI-compatible. Claude models must remain on
-    # OpenCode's native Anthropic provider so they are not sent to OpenAI.
-    assert not any(model_id.startswith("claude-") for model_id in models)
-    assert all(not model_id.startswith("headroom/") for model_id in models)
+    assert "models" not in config["provider"]["headroom"]
     assert "mcp" not in config
     assert "model" not in config  # headroom provider is a transparent pass-through
 

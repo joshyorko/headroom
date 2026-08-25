@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -69,13 +70,19 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
         step["run"] for step in manifest["steps"] if step["name"] == "Create multi-arch manifest"
     )
     assert 'digest_count="$(find "${DIGEST_DIR}" -maxdepth 1 -type f | wc -l)"' in manifest_script
-    assert '"${digest_count}" -ne 2' in manifest_script
-    assert manifest_script.index('"${digest_count}" -ne 2') < manifest_script.index(
+    assert '"${digest_count}" -ne 1' in manifest_script
+    assert manifest_script.index('"${digest_count}" -ne 1') < manifest_script.index(
         "docker buildx imagetools create"
     )
-    guard_start = manifest_script.index('"${digest_count}" -ne 2')
+    guard_start = manifest_script.index('"${digest_count}" -ne 1')
     create_start = manifest_script.index("docker buildx imagetools create")
     assert guard_start < manifest_script.index("exit 1", guard_start) < create_start
+
+
+def test_self_hosted_image_keeps_bedrock_and_memory_stack_dependencies() -> None:
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    target = bake.split('target "runtime-self-hosted"', 1)[1].split('\ntarget "', 1)[0]
+    assert 'HEADROOM_EXTRAS = "proxy,code,memory-stack,bedrock"' in target
 
 
 def test_release_workflow_publishes_both_node_packages_to_github_packages() -> None:
@@ -216,6 +223,9 @@ def test_no_native_tls_in_wheel_build_tree() -> None:
     place.
     """
     import subprocess
+
+    if shutil.which("cargo") is None:
+        pytest.skip("cargo is unavailable in this environment")
 
     for crate in ("headroom-py", "headroom-proxy", "headroom-core"):
         result = subprocess.run(

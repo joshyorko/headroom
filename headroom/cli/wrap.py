@@ -36,7 +36,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from headroom._subprocess import pid_alive, run
 
@@ -192,9 +192,7 @@ from headroom.providers.zcode import (
 from headroom.providers.zcode import (
     upstream_to_proxy_urls as _zcode_upstream_to_urls,
 )
-from headroom.proxy.project_context import (
-    with_client_prefix as _with_client_prefix,
-)
+from headroom.proxy.project_context import with_client_prefix as _with_client_prefix
 from headroom.proxy.project_context import (
     with_copilot_upstream_prefix as _with_copilot_upstream_prefix,
 )
@@ -843,7 +841,7 @@ _RETIRED_CONTEXT_TOOL_MESSAGE = (
     "rewrote shell commands through a third-party binary Headroom no longer "
     "manages. Drop --context-tool / --no-context-tool and unset "
     f"{_RETIRED_CONTEXT_TOOL_ENV}; `headroom wrap` uninstalls what they left "
-    "behind on first run."
+    "behind automatically."
 )
 
 
@@ -903,8 +901,10 @@ def _report_context_tool_purge() -> None:
     default: the Claude ``PreToolUse`` hook, the vendored binaries and the
     injected hint-file guidance are all durable on disk. Running this once per
     ``wrap`` / ``unwrap`` invocation is what actually makes the tools go away.
-    Silent when there is nothing to do, which is the steady state after the first
-    run, and never fatal — a cleanup failure must not block launching the tool.
+    Silent when there is nothing to do — the common case once the machine-global
+    half is stamped done, though the project- and config-directory-scoped half
+    still runs every launch — and never fatal: a cleanup failure must not block
+    launching the tool.
 
     Reports on **stderr**: some subcommands (``wrap/unwrap openclaw
     --prepare-only``) emit machine-readable JSON on stdout as their entire
@@ -1200,6 +1200,235 @@ def _wrap_marker_path(settings_path: Path) -> Path:
     return settings_path.parent / ".headroom_wrap_marker.json"
 
 
+def _wrap_owners_path(settings_path: Path) -> Path:
+    """Sidecar recording which live wrap sessions own each settings env key.
+
+    Separate from ``.headroom_wrap_marker.json`` on purpose: that marker
+    describes a single writer and is consumed by doctor, unwrap and the
+    staleness checks. Concurrency ownership is additive state, so it lives in
+    its own file rather than changing a shape those readers depend on.
+    """
+    return settings_path.parent / ".headroom_wrap_owners.json"
+
+
+def _wrap_settings_lock(settings_path: Path) -> Any:
+    """Serialize settings read-modify-write across concurrent wrap sessions.
+
+    Writing the proxy URL into ``settings.local.json`` is a read-modify-write,
+    and several ``headroom wrap`` sessions in one project run it concurrently.
+    The write itself is atomic, so the file never tears -- but without this the
+    updates are still lost against each other (#3205).
+    """
+    from contextlib import nullcontext
+
+    lock_path = settings_path.parent / ".headroom_wrap_settings.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a+b")  # noqa: SIM115
+    except OSError:
+        # Matches _proxy_start_lock: a workspace that cannot hold lock state is
+        # degraded, not unusable.
+        return nullcontext()
+    return _locked_file(lock_file)
+
+
+@contextmanager
+def _locked_file(lock_file: Any) -> Any:
+    """Hold an exclusive OS lock on an already-open file for the block.
+
+    Shared by ``_proxy_start_lock`` and ``_wrap_settings_lock`` -- the two
+    differ only in which file they lock, and an OS-lock dance duplicated per
+    call site is one place for the platform branches to drift apart.
+    """
+    with lock_file:
+        if sys.platform == "win32":
+            import msvcrt
+
+            # msvcrt.locking operates on bytes from the current file position.
+            lock_file.seek(0)
+            if lock_file.read(1) == b"":
+                lock_file.seek(0)
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            # LK_LOCK has implementation-dependent retry limits, and a holder
+            # may legitimately take longer than that (a proxy loading ML
+            # components), so use the non-blocking primitive in a loop.
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _read_wrap_owners(settings_path: Path) -> dict[str, Any]:
+    try:
+        rec = json.loads(_read_text(_wrap_owners_path(settings_path)))
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def _write_wrap_owners(settings_path: Path, owners: dict[str, Any]) -> None:
+    target = _wrap_owners_path(settings_path)
+    try:
+        if not owners:
+            target.unlink(missing_ok=True)
+            return
+        _write_text(target, json.dumps(owners, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def _live_holders(entry: Any, *, dead_ports: frozenset[int] = frozenset()) -> list[dict[str, Any]]:
+    """Holders in *entry* whose process is still provably alive.
+
+    Reuses the same conservative liveness the proxy-client markers use: a PID
+    that is gone, or that is now provably a different process, is dropped. Any
+    uncertainty keeps the holder, because dropping a live owner is what causes
+    a running session to be unrouted.
+
+    ``dead_ports`` additionally drops holders whose proxy port the caller has
+    *proven* dead. A wrapper process outlives its proxy after a hard reboot or
+    SIGKILL of the proxy alone, and such a holder routes nothing; left in place
+    it would block the #2221 self-heal from clearing a base_url that now points
+    at nothing.
+    """
+    if not isinstance(entry, dict):
+        return []
+    holders = entry.get("holders")
+    if not isinstance(holders, list):
+        return []
+    live: list[dict[str, Any]] = []
+    for holder in holders:
+        if not isinstance(holder, dict):
+            continue
+        pid = holder.get("pid")
+        if not isinstance(pid, int) or not _pid_alive(pid):
+            continue
+        if _identity_mismatch(holder.get("start_src"), holder.get("start_time"), pid):
+            continue
+        port = holder.get("port")
+        if isinstance(port, int) and port in dead_ports:
+            continue
+        live.append(holder)
+    return live
+
+
+def _self_holder(port: int | None) -> dict[str, Any]:
+    ident = _proc_identity(os.getpid())
+    return {
+        "pid": os.getpid(),
+        "start_src": ident[0] if ident else None,
+        "start_time": ident[1] if ident else None,
+        "port": port,
+    }
+
+
+def _claim_wrap_key(
+    settings_path: Path,
+    key: str,
+    current_value: str | None,
+    *,
+    port: int | None = None,
+) -> None:
+    """Register this process as an owner of *key*, recording the true original.
+
+    The first live owner records ``original``; later owners inherit it and are
+    flagged ``inherited`` so their exit knows the value they happened to
+    observe was not the pre-wrap one. Without that, a second wrap session
+    captures the *first session's* proxy URL as the value to restore, and puts
+    a dead proxy back into the file on exit (#3205).
+    """
+    owners = _read_wrap_owners(settings_path)
+    entry = owners.get(key)
+    live = _live_holders(entry)
+    inherited = bool(live) and isinstance(entry, dict) and "original" in entry
+    original = entry.get("original") if inherited and isinstance(entry, dict) else current_value
+    me = _self_holder(port)
+    me["inherited"] = inherited
+    live = [h for h in live if h.get("pid") != me["pid"]]
+    live.append(me)
+    owners[key] = {"original": original, "holders": live}
+    _write_wrap_owners(settings_path, owners)
+
+
+class _KeyRelease(NamedTuple):
+    """Outcome of dropping this process's claim on a settings env key."""
+
+    should_restore: bool
+    original: str | None
+    trust_caller: bool
+    survivor: dict[str, Any] | None
+
+
+def _release_wrap_key(
+    settings_path: Path,
+    key: str,
+    *,
+    force: bool = False,
+    dead_ports: frozenset[int] = frozenset(),
+) -> _KeyRelease:
+    """Drop this process's claim on *key*.
+
+    ``should_restore`` is False while another live wrap session still owns the
+    key -- restoring then silently unroutes a running session. ``force`` is for
+    ``unwrap``, where the user is explicitly asking for their settings back:
+    every claim is dropped and the restore happens regardless.
+
+    ``trust_caller`` says whether the caller's remembered ``previous`` is its
+    own first-hand observation of the pre-wrap value. True when there is no
+    owner record at all (unwrap of a pre-upgrade session, and the legacy
+    callers that pass the value directly), and when this process founded the
+    record. False for an inheriting holder -- it remembers the *first
+    session's* proxy URL, so honouring it writes a dead proxy back, the exact
+    bug #3205 is about -- and false for a caller with no claim of its own,
+    whose marker-derived value is second-hand where the record is not.
+
+    ``survivor`` is a still-live holder the caller can re-point the
+    single-slot wrap marker at, so an exiting session does not take the
+    surviving one's #2221 self-heal record with it.
+    """
+    owners = _read_wrap_owners(settings_path)
+    entry = owners.get(key)
+    if not isinstance(entry, dict):
+        return _KeyRelease(True, None, True, None)
+    me = os.getpid()
+    remaining = [h for h in _live_holders(entry, dead_ports=dead_ports) if h.get("pid") != me]
+    original = entry.get("original")
+    # Look this process's own claim up in the raw holder list, never the
+    # liveness-filtered one: the caller is by definition running, and its claim
+    # is what says whether the value it remembers is first-hand.
+    raw = entry.get("holders")
+    mine = (
+        next((h for h in raw if isinstance(h, dict) and h.get("pid") == me), None)
+        if isinstance(raw, list)
+        else None
+    )
+    trust_caller = mine is not None and not mine.get("inherited")
+    if remaining and not force:
+        owners[key] = {"original": original, "holders": remaining}
+        _write_wrap_owners(settings_path, owners)
+        return _KeyRelease(False, original, trust_caller, remaining[0])
+    owners.pop(key, None)
+    _write_wrap_owners(settings_path, owners)
+    return _KeyRelease(True, original, trust_caller, None)
+
+
 def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: str | None) -> None:
     """Best-effort record of which (pid, port, key) wrote the base_url entry.
 
@@ -1218,6 +1447,53 @@ def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: st
             "previous": previous,
         }
         _write_text(_wrap_marker_path(settings_path), json.dumps(payload))
+    except OSError:
+        pass
+
+
+def _rehome_wrap_marker(
+    settings_path: Path,
+    *,
+    key: str,
+    survivor: dict[str, Any] | None,
+    original: str | None,
+) -> None:
+    """Hand this session's wrap marker to a session that is still running.
+
+    The marker has one slot and the last writer wins it. When that writer exits
+    while a sibling still owns the key, leaving the marker describes a dead
+    process, and deleting it strips the survivor of the #2221 dead-proxy
+    self-heal record. Rewrite it to describe the survivor instead, carrying the
+    owner record's ``original`` as the value to restore -- the marker's own
+    ``previous`` may be an earlier session's proxy URL (#3205).
+
+    Only ever touches a marker this process wrote; a sibling's marker is
+    already accurate.
+    """
+    marker_path = _wrap_marker_path(settings_path)
+    marker = _read_wrap_marker(settings_path)
+    if marker is None or marker.get("key") != key or marker.get("pid") != os.getpid():
+        return
+    port = survivor.get("port") if survivor is not None else None
+    try:
+        if survivor is None or not isinstance(port, int):
+            # No survivor to hand it to, or one whose port we never recorded:
+            # a marker without a usable port is worse than none.
+            marker_path.unlink(missing_ok=True)
+            return
+        _write_text(
+            marker_path,
+            json.dumps(
+                {
+                    "pid": survivor.get("pid"),
+                    "start_src": survivor.get("start_src"),
+                    "start_time": survivor.get("start_time"),
+                    "port": port,
+                    "key": key,
+                    "previous": original,
+                }
+            ),
+        )
     except OSError:
         pass
 
@@ -1345,7 +1621,15 @@ def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str |
         f"running (issue #2221); restoring prior value",
         err=True,
     )
-    _restore_claude_wrap_base_url(previous, settings_path=settings_path, _key_override=key)
+    _restore_claude_wrap_base_url(
+        previous,
+        settings_path=settings_path,
+        _key_override=key,
+        # The wrapper process can outlive its proxy (the proxy alone was
+        # SIGKILLed). Its ownership claim would otherwise veto this restore and
+        # leave the base_url pointing at a port proven dead just above (#3205).
+        dead_ports=frozenset({port}) if isinstance(port, int) else frozenset(),
+    )
     return previous
 
 
@@ -1511,16 +1795,21 @@ def _write_claude_wrap_base_url(
     detected and self-healed (issue #1768).
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
-    payload = _read_settings_for_write(path)
-    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
     key = _claude_wrap_base_url_env_key(foundry_mode=foundry_mode, vertex_mode=vertex_mode)
-    previous = env_map.get(key)
-    env_map[key] = proxy_url
-    payload["env"] = env_map
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_text(path, json.dumps(payload, indent=2) + "\n")
-    if port is not None:
-        _write_wrap_marker(path, port=port, key=key, previous=previous)
+    with _wrap_settings_lock(path):
+        payload = _read_settings_for_write(path)
+        env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+        previous = env_map.get(key)
+        # Claim before writing, so the recorded original is the value that was
+        # there before *any* wrap session touched it -- not the previous
+        # session's proxy URL (#3205).
+        _claim_wrap_key(path, key, previous, port=port)
+        env_map[key] = proxy_url
+        payload["env"] = env_map
+        _write_text(path, json.dumps(payload, indent=2) + "\n")
+        if port is not None:
+            _write_wrap_marker(path, port=port, key=key, previous=previous)
     return previous
 
 
@@ -1533,13 +1822,15 @@ def _write_claude_wrap_tool_search(value: str, *, settings_path: Path | None = N
     process, and is restored transactionally when the wrap session exits.
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
-    payload = _read_settings_for_write(path)
-    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
-    previous = env_map.get(_TOOL_SEARCH_ENV)
-    env_map[_TOOL_SEARCH_ENV] = value
-    payload["env"] = env_map
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_text(path, json.dumps(payload, indent=2) + "\n")
+    with _wrap_settings_lock(path):
+        payload = _read_settings_for_write(path)
+        env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+        previous = env_map.get(_TOOL_SEARCH_ENV)
+        _claim_wrap_key(path, _TOOL_SEARCH_ENV, previous)
+        env_map[_TOOL_SEARCH_ENV] = value
+        payload["env"] = env_map
+        _write_text(path, json.dumps(payload, indent=2) + "\n")
     return previous
 
 
@@ -1561,6 +1852,8 @@ def _restore_claude_wrap_base_url(
     vertex_mode: bool = False,
     settings_path: Path | None = None,
     _key_override: str | None = None,
+    force: bool = False,
+    dead_ports: frozenset[int] = frozenset(),
 ) -> None:
     """Restore (or remove) the env key written by _write_claude_wrap_base_url.
 
@@ -1569,40 +1862,63 @@ def _restore_claude_wrap_base_url(
     ``previous`` is None the key is removed; when it has a value it is
     restored — preserving any URL the project already had set. Also clears
     this key's sidecar wrap marker, if any (issue #1768).
+
+    Concurrency (#3205): while another live wrap session still owns the key,
+    this is a no-op — restoring underneath a running session unroutes it. Set
+    ``force`` when the user has explicitly asked for their settings back
+    (``unwrap``), and ``dead_ports`` to name proxy ports already proven dead so
+    holders that outlived their proxy stop counting as live.
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
     key = _key_override or _claude_wrap_base_url_env_key(
         foundry_mode=foundry_mode, vertex_mode=vertex_mode
     )
-    if not path.exists():
-        _clear_wrap_marker(path, key=key)
-        return
-    try:
-        payload = json.loads(_read_text(path))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(payload, dict):
-        return
-    env_map = payload.get("env")
-    if not isinstance(env_map, dict):
-        return
-    if previous is None:
-        if key not in env_map:
+    with _wrap_settings_lock(path):
+        # Another live wrap session in this project may still be using the key.
+        # Restoring underneath it silently unroutes a running session -- traffic
+        # bypasses the proxy with no error anywhere (#3205).
+        release = _release_wrap_key(path, key, force=force, dead_ports=dead_ports)
+        if not release.should_restore:
+            # The value stays, but this session's marker must not linger
+            # describing a process that is gone: hand the slot to a survivor.
+            _rehome_wrap_marker(path, key=key, survivor=release.survivor, original=release.original)
+            return
+        # The owner record holds the value from before *any* wrap session wrote.
+        # Prefer the caller's own value only when the caller observed it
+        # first-hand; a session that started second remembers the first
+        # session's (now dead) proxy URL, and so does the marker an unwrap or a
+        # self-heal reads it from.
+        restore_to = previous if release.trust_caller else release.original
+
+        if not path.exists():
             _clear_wrap_marker(path, key=key)
             return
-        del env_map[key]
-        if env_map:
-            payload["env"] = env_map
+        try:
+            payload = json.loads(_read_text(path))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        env_map = payload.get("env")
+        if not isinstance(env_map, dict):
+            return
+        if restore_to is None:
+            if key not in env_map:
+                _clear_wrap_marker(path, key=key)
+                return
+            del env_map[key]
+            if env_map:
+                payload["env"] = env_map
+            else:
+                payload.pop("env", None)
         else:
-            payload.pop("env", None)
-    else:
-        env_map[key] = previous
-        payload["env"] = env_map
-    if payload:
-        _write_text(path, json.dumps(payload, indent=2) + "\n")
-    else:
-        path.unlink(missing_ok=True)
-    _clear_wrap_marker(path, key=key)
+            env_map[key] = restore_to
+            payload["env"] = env_map
+        if payload:
+            _write_text(path, json.dumps(payload, indent=2) + "\n")
+        else:
+            path.unlink(missing_ok=True)
+        _clear_wrap_marker(path, key=key)
 
 
 def _setup_headroom_mcp(
@@ -1829,6 +2145,40 @@ def _serena_project_skip_reason(root: Path) -> str | None:
 #: Upper bound on the synchronous pre-index. The agent does not launch until
 #: this call returns, so the number is a stall budget, not just a safety net.
 _SERENA_INDEX_TIMEOUT = 300
+_SERENA_INDEX_TIMEOUT_ENV = "HEADROOM_SERENA_INDEX_TIMEOUT"
+
+
+def _resolve_serena_index_timeout_seconds() -> int:
+    """Resolve the Serena pre-index stall budget from env, else the default.
+
+    A wrap launched from a directory Serena has already claimed re-indexes the
+    whole tree on every run, and 300s of that is time the agent is not running
+    (#3093). The budget is therefore tunable per environment, which also keeps
+    it reachable from ``wrap ... -- agents`` sessions that take no flags.
+
+    Unlike :func:`_resolve_wrap_proxy_timeout_seconds`, a bad value is not
+    fatal here: the pre-index is best-effort, so an unusable setting falls back
+    to the default rather than aborting a launch that would otherwise succeed.
+    It is reported unconditionally, because a knob that looks applied but is
+    not is the failure this issue is about.
+    """
+    raw = os.environ.get(_SERENA_INDEX_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _SERENA_INDEX_TIMEOUT
+
+    timeout_seconds: int | None
+    try:
+        timeout_seconds = int(raw)
+    except ValueError:
+        timeout_seconds = None
+    if timeout_seconds is None or timeout_seconds <= 0:
+        click.echo(
+            f"  Serena: ignoring {_SERENA_INDEX_TIMEOUT_ENV}={raw!r} "
+            f"(want a positive integer number of seconds) "
+            f"— using {_SERENA_INDEX_TIMEOUT}s"
+        )
+        return _SERENA_INDEX_TIMEOUT
+    return timeout_seconds
 
 
 def _kill_serena_index_tree(proc: subprocess.Popen) -> None:
@@ -1888,8 +2238,9 @@ def _index_serena_project(*, verbose: bool = False) -> None:
     so any failure here is survivable.
 
     This runs on the launch path, synchronously: the agent starts only once it
-    returns, so the timeout below is time the user spends staring at nothing.
-    Two guards keep that bounded (#2938):
+    returns, so the timeout below is time the user spends staring at nothing —
+    ``HEADROOM_SERENA_INDEX_TIMEOUT`` resizes that budget (#3093). Two guards
+    keep it bounded (#2938):
 
     * ``stdin`` is ``DEVNULL``. Serena prompts when it has to auto-create
       ``project.yml``, and because stdout is captured the question never
@@ -1904,6 +2255,8 @@ def _index_serena_project(*, verbose: bool = False) -> None:
         if verbose:
             click.echo("  Serena: uvx not found — skipping pre-index")
         return
+
+    timeout_seconds = _resolve_serena_index_timeout_seconds()
 
     popen_kwargs: dict[str, Any] = {
         "stdout": subprocess.PIPE,
@@ -1944,7 +2297,7 @@ def _index_serena_project(*, verbose: bool = False) -> None:
     # the output is captured, so without this line the wrap looks hung.
     click.echo("  Serena: pre-indexing project (first run can take a while)…")
     try:
-        _stdout, stderr = proc.communicate(timeout=_SERENA_INDEX_TIMEOUT)
+        _stdout, stderr = proc.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         _kill_serena_index_tree(proc)
         click.echo("  Serena: pre-index timed out (will index on demand)")
@@ -1994,17 +2347,18 @@ def _setup_serena_mcp(
 
     spec = build_serena_spec(context)
     result = registrar.register_server(spec, force=force)
+    owned_drift = (
+        result.status == RegisterStatus.MISMATCH
+        and not force
+        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
+    )
 
     # Migrate a stale Headroom-installed entry. register_server won't overwrite
     # a differing spec without force, so an older Headroom Serena entry would
     # otherwise persist across re-wraps. Force-update it only when the ledger
     # proves Headroom installed the entry that's currently on disk — never a
     # user-managed Serena.
-    if (
-        result.status == RegisterStatus.MISMATCH
-        and not force
-        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
-    ):
+    if result.status == RegisterStatus.MISMATCH and not force and owned_drift:
         result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             click.echo("  Serena MCP: migrated previously-installed entry to current spec")
@@ -2017,7 +2371,13 @@ def _setup_serena_mcp(
         result,
         label="Serena MCP",
         verbose=verbose,
-        overwrite_hint="update or remove the existing serena MCP entry, then rerun headroom wrap",
+        overwrite_hint=(
+            "run headroom wrap again"
+            if owned_drift
+            else "run headroom mcp reconcile --adopt"
+            if registrar.name == "claude"
+            else "update or remove the existing serena MCP entry, then rerun headroom wrap"
+        ),
         restart_hint=f"restart {registrar.display_name} if it was already running",
     )
     if line is not None:
@@ -2183,57 +2543,6 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
 
 _CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
 
-
-# rtk instructions for tool surfaces where prompt guidance is still useful.
-# These get injected into AGENTS.md / .cursorrules so the LLM voluntarily
-# uses rtk-prefixed commands. Kept concise to minimize instruction overhead.
-RTK_INSTRUCTIONS_BLOCK = """\
-<!-- headroom:rtk-instructions -->
-# RTK (Rust Token Killer) - Token-Optimized Commands
-
-When running shell commands, **always prefix with `rtk`**. This reduces context
-usage by 60-90% with zero behavior change. If rtk has no filter for a command,
-it passes through unchanged — so it is always safe to use.
-
-## Key Commands
-```bash
-# Git (59-80% savings)
-rtk git status          rtk git diff            rtk git log
-
-# Files & Search (60-75% savings)
-rtk ls <path>           rtk read <file>         rtk grep <pattern>
-rtk find <pattern>      rtk diff <file>
-
-# Test (90-99% savings) — shows failures only
-rtk pytest tests/       rtk cargo test          rtk test <cmd>
-
-# Build & Lint (80-90% savings) — shows errors only
-rtk tsc                 rtk lint                rtk cargo build
-rtk prettier --check    rtk mypy                rtk ruff check
-
-# Analysis (70-90% savings)
-rtk err <cmd>           rtk log <file>          rtk json <file>
-rtk summary <cmd>       rtk deps                rtk env
-
-# GitHub (26-87% savings)
-rtk gh pr view <n>      rtk gh run list         rtk gh issue list
-
-# Infrastructure (85% savings)
-rtk docker ps           rtk kubectl get         rtk docker logs <c>
-
-# Package managers (70-90% savings)
-rtk pip list            rtk pnpm install        rtk npm run <script>
-```
-
-## Rules
-- In command chains, prefix each segment: `rtk git add . && rtk git commit -m "msg"`
-- For debugging, use raw command without rtk prefix
-- `rtk proxy <cmd>` runs command without filtering but tracks usage
-<!-- /headroom:rtk-instructions -->
-"""
-
-# Marker used to detect if instructions are already injected
-_RTK_MARKER = "<!-- headroom:rtk-instructions -->"
 
 # Memory MCP markers
 _MEMORY_MCP_MARKER = "# --- Headroom memory MCP (auto-injected) ---"
@@ -2455,14 +2764,10 @@ def _strip_codex_headroom_blocks(
         text = text.replace(end_marker + "\n", "")
         return text
 
-    # Remove any provider marker → end-marker span, possibly repeated. Accept
-    # legacy init/wrap markers so re-running either command migrates config to
-    # the neutral Headroom Codex provider block.
-    for marker_start, marker_end in (
-        (_CODEX_TOP_LEVEL_MARKER, _CODEX_END_MARKER),
-        *_LEGACY_CODEX_PROVIDER_MARKERS,
-    ):
-        content = _remove_marker_span(content, marker_start, marker_end)
+    # Remove any top-level-marker → end-marker span, possibly repeated.
+    content = _remove_marker_span(content, _CODEX_TOP_LEVEL_MARKER, _CODEX_END_MARKER)
+    for start_marker, end_marker in _LEGACY_CODEX_PROVIDER_MARKERS:
+        content = _remove_marker_span(content, start_marker, end_marker)
 
     if remove_mcp:
         # Remove Headroom-managed MCP blocks written by `wrap codex`.
@@ -2486,17 +2791,12 @@ def _strip_codex_headroom_blocks(
     )
 
     # Strip any orphaned `[model_providers.headroom]` table with the fields we
-    # write.  Recognise Headroom-owned tables by their generated name or
-    # generated env header mapping, not by localhost-only URLs; remote proxy
-    # setups use real hostnames/IPs.
+    # write.  We only remove it if the table is recognisably ours (base_url
+    # mentions localhost and a Headroom proxy port).  This protects users who
+    # happen to have a differently configured `headroom` provider.
     orphan_headroom_table = re.compile(
         r"(?ms)^\[model_providers\.headroom\][^\[]*?"
-        r"("
-        r"name[ \t]*=[ \t]*\"(?:OpenAI via Headroom proxy|Headroom init proxy)\""
-        r"|"
-        r"env_http_headers[ \t]*=.*\"X-Headroom-Project\""
-        r")"
-        r"[^\[]*?"
+        r'name[ \t]*=[ \t]*"OpenAI via Headroom proxy"[^\[]*?'
         r"(?=^\[|\Z)"
     )
     content = orphan_headroom_table.sub("", content)
@@ -2599,9 +2899,9 @@ def _codex_config_has_headroom_markers(content: str) -> bool:
     managed_markers = (
         _CODEX_TOP_LEVEL_MARKER,
         _CODEX_END_MARKER,
+        *[marker for pair in _LEGACY_CODEX_PROVIDER_MARKERS for marker in pair],
         _CODEX_MCP_MARKER,
         _MEMORY_MCP_MARKER,
-        *[marker for marker_pair in _LEGACY_CODEX_PROVIDER_MARKERS for marker in marker_pair],
     )
     return any(marker in content for marker in managed_markers)
 
@@ -2914,9 +3214,7 @@ def _inject_codex_provider_config(port: int, proxy_url: str | None = None) -> st
             user_content = content.strip()
             if user_content:
                 redirected = _redirect_existing_top_level_keys(
-                    user_content,
-                    provider_url,
-                    uses_chatgpt_auth=uses_chatgpt_auth,
+                    user_content, provider_url, uses_chatgpt_auth=uses_chatgpt_auth
                 )
                 top_block = _build_top_level_block(user_content)
                 if top_block:
@@ -3209,9 +3507,14 @@ def _inject_memory_agents_md(file_path: Path) -> bool:
     return True
 
 
-def _resolve_copilot_provider_type(backend: str | None, provider_type: str) -> str:
+def _resolve_copilot_provider_type(
+    backend: str | None,
+    provider_type: str,
+    *,
+    environ: dict[str, str] | None = None,
+) -> str:
     """Resolve Copilot BYOK provider type for the current proxy backend."""
-    return _copilot_resolve_provider_type(backend, provider_type)
+    return _copilot_resolve_provider_type(backend, provider_type, environ=environ)
 
 
 def _query_proxy_config(port: int) -> dict[str, Any] | None:
@@ -4181,39 +4484,8 @@ def _proxy_start_lock(port: int) -> Any:
         # environment.
         yield
         return
-    with lock_file:
-        if sys.platform == "win32":
-            import msvcrt
-
-            # msvcrt.locking operates on bytes from the current file position.
-            lock_file.seek(0)
-            if lock_file.read(1) == b"":
-                lock_file.seek(0)
-                lock_file.write(b"0")
-                lock_file.flush()
-            lock_file.seek(0)
-            # LK_LOCK has implementation-dependent retry limits. A proxy may
-            # legitimately take longer than that to load ML components, so
-            # use the non-blocking primitive in a loop instead.
-            while True:
-                try:
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    time.sleep(0.05)
-            try:
-                yield
-            finally:
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with _locked_file(lock_file):
+        yield
 
 
 @wraps(_ensure_proxy_unlocked)
@@ -4407,6 +4679,20 @@ def _ignore_child_sigint(signum: int | None = None, frame: Any = None) -> None:
     return None
 
 
+def _exit_on_signal(signum: int | None = None, frame: Any = None) -> None:
+    """Unwind on SIGTERM/SIGHUP so the ``finally`` block actually runs.
+
+    Registering ``cleanup`` itself as the handler did not achieve what its call
+    site documented. A Python signal handler that returns normally does not
+    unwind the stack -- under PEP 475 the interrupted ``waitpid`` is simply
+    retried -- so the ``finally`` that restores ``settings.local.json`` never
+    ran, while the handler had already terminated the proxy underneath a child
+    that was still alive. Raising SystemExit reverses that: the settings are
+    restored and cleanup runs exactly once, from ``finally`` (#3205).
+    """
+    raise SystemExit(128 + int(signum or 0))
+
+
 def _launch_tool(
     binary: str,
     args: tuple,
@@ -4438,7 +4724,7 @@ def _launch_tool(
     port_holder: list[int] = [port]
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
-    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGTERM, _exit_on_signal)
 
     try:
         click.echo()
@@ -4470,7 +4756,7 @@ def _launch_tool(
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
-        # If port fell back, update env URLs to point at the actual port
+        # If port fell back, update environment URLs to point at the actual port.
         if actual_port != port:
             for k, v in dict(env).items():
                 env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
@@ -4842,13 +5128,6 @@ def wrap_selfheal(marker: str | None) -> None:
 )
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
-@click.option(
-    "--scope",
-    type=click.Choice(["user", "project"]),
-    default="user",
-    show_default=True,
-    help="Where to write MCP config: 'user' (~/.claude) or 'project' (./.mcp.json)",
-)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def claude(
     port: int,
@@ -4866,7 +5145,6 @@ def claude(
     context_1m: bool,
     verbose: bool,
     prepare_only: bool,
-    scope: str,
     claude_args: tuple,
 ) -> None:
     """Launch Claude Code through Headroom proxy.
@@ -4918,11 +5196,11 @@ def claude(
     )
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
-    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGTERM, _exit_on_signal)
     if hasattr(signal, "SIGHUP"):
         # Terminal close / tmux kill-session sends SIGHUP, not SIGTERM — without
         # this, the finally block's base_url restore never runs (issue #1768).
-        signal.signal(signal.SIGHUP, cleanup)
+        signal.signal(signal.SIGHUP, _exit_on_signal)
 
     # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
     if memory:
@@ -5024,12 +5302,11 @@ def claude(
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
         # Coding-task compressor: Serena (retires any legacy tokensave entry).
-        from headroom.mcp_registry import ClaudeRegistrar
+        from headroom.mcp_registry import CLAUDE_SERENA_CONTEXT, ClaudeRegistrar
 
-        claude_registrar = ClaudeRegistrar(scope=scope, project_dir=Path.cwd())
         _setup_coding_compressor(
-            claude_registrar,
-            serena_context="claude-code",
+            ClaudeRegistrar(),
+            serena_context=CLAUDE_SERENA_CONTEXT,
             serena=serena,
             no_serena=no_serena,
             no_tokensave=no_tokensave,
@@ -5308,6 +5585,10 @@ def unwrap_claude(
             foundry_mode=_foundry,
             vertex_mode=_vertex,
             settings_path=_unwrap_settings_path,
+            # unwrap is the user asking for their settings back, so it drops
+            # every wrap session's claim rather than deferring to a live
+            # sibling and silently doing nothing (#3205).
+            force=True,
         )
 
     # Issue #2238: unwrap restores settings.local.json, but a proxy URL that was
@@ -5462,6 +5743,9 @@ def copilot(
     if proxy_root is not None:
         no_proxy = True
 
+    env = os.environ.copy()
+    _scrub_copilot_proxy_seed_env(env)
+    env.pop("COPILOT_PROVIDER_TYPE", None)
     effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
     if proxy_root is None and _check_proxy(port):
         running_backend = _detect_running_proxy_backend(port)
@@ -5472,12 +5756,8 @@ def copilot(
             )
         effective_backend = running_backend or effective_backend
 
-    provider_env = os.environ.copy()
-    provider_env.pop("COPILOT_PROVIDER_TYPE", None)
-    effective_provider_type = _copilot_resolve_provider_type(
-        effective_backend,
-        provider_type,
-        provider_env,
+    effective_provider_type = _resolve_copilot_provider_type(
+        effective_backend, provider_type, environ=env
     )
     if subscription:
         if effective_backend not in (None, "", "anthropic"):
@@ -5497,8 +5777,6 @@ def copilot(
         backend=effective_backend,
     )
 
-    env = os.environ.copy()
-    _scrub_copilot_proxy_seed_env(env)
     openai_api_url: str | None = None
     copilot_proxy_token: str | None = None
     copilot_refresh_oauth_token: str | None = None
@@ -5517,23 +5795,9 @@ def copilot(
         else:
             client_bearer = resolve_client_bearer_token()
         if not client_bearer:
-            classic_token = next(
-                (
-                    os.environ.get(name)
-                    for name in ("GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN")
-                    if (os.environ.get(name) or "").startswith("ghp")
-                ),
-                None,
-            )
-            if classic_token:
-                raise click.ClickException(
-                    "could not resolve a reusable Copilot bearer token: a classic GitHub PAT "
-                    "does not carry the Copilot Requests permission. Run "
-                    "`headroom copilot-auth login` to create reusable Copilot auth."
-                )
             raise click.ClickException(
-                "could not resolve a reusable Copilot bearer token. No reusable Copilot token "
-                "was found. Run `headroom copilot-auth login` first, or set "
+                "GitHub Copilot subscription mode requires a reusable GitHub/Copilot bearer "
+                "token, but none could be resolved. Run `headroom copilot-auth login` first, or set "
                 "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
             )
 
@@ -5587,19 +5851,6 @@ def copilot(
         env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
         env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
         env.pop("COPILOT_PROVIDER_API_KEY", None)
-        scrubbed_token_vars = [
-            token_var
-            for token_var in ("GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN")
-            if env.get(token_var)
-        ]
-        for token_var in scrubbed_token_vars:
-            env.pop(token_var, None)
-        if scrubbed_token_vars:
-            click.echo(
-                "  Ignoring "
-                + ", ".join(scrubbed_token_vars)
-                + "; using the validated Copilot subscription token instead."
-            )
         # Hand the exact token we resolved (and, for --subscription, validated
         # against GitHub) to the proxy explicitly via copilot_proxy_token below.
         # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
@@ -5613,6 +5864,19 @@ def copilot(
         if subscription_resolution is not None:
             copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
             copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
+        scrubbed_token_vars = [
+            token_var
+            for token_var in ("GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN")
+            if env.get(token_var)
+        ]
+        for token_var in scrubbed_token_vars:
+            env.pop(token_var, None)
+        if scrubbed_token_vars:
+            click.echo(
+                "  Ignoring "
+                + ", ".join(scrubbed_token_vars)
+                + "; using the validated Copilot subscription token instead."
+            )
         env_vars_display = [
             "COPILOT_PROVIDER_TYPE=openai",
             f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}",
@@ -5754,9 +6018,8 @@ def vscode_copilot(
             f'  "github.copilot.advanced.debug.overrideProxyUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
         )
         click.echo(
-            f'  "github.copilot.advanced.debug.overrideCapiUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
+            f'  "github.copilot.advanced.debug.overrideCapiUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}"'
         )
-        click.echo('  "github.copilot.advanced.debug.overrideAuthType": "token"')
 
     _run_proxy_only_watcher(
         agent_label="VS CODE COPILOT",
@@ -5933,11 +6196,7 @@ def _prepare_codex_wrap_state(
         # If a previous wrap used another port, retrieval can silently point
         # at the wrong proxy while model traffic uses the right one.
         _setup_headroom_mcp(
-            CodexRegistrar(),
-            port,
-            proxy_url=proxy_url,
-            verbose=verbose,
-            force=True,
+            CodexRegistrar(), port, proxy_url=proxy_url, verbose=verbose, force=True
         )
     elif verbose:
         click.echo("  Skipping MCP retrieve tool (--no-mcp)")
@@ -6211,7 +6470,6 @@ def codex(
         headroom wrap codex --no-mcp                # Skip MCP retrieve tool registration
         headroom wrap codex --code-memory none      # No code-memory MCP
         headroom wrap codex --port 9999             # Custom proxy port
-        headroom wrap codex --proxy-url http://10.10.10.89  # Use an existing proxy
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
     return _run_codex_wrap(
@@ -6507,9 +6765,10 @@ def kimi(
     """Launch Kimi CLI through Headroom proxy.
 
     \b
-    Sets KIMI_BASE_URL to route Kimi's OpenAI-compatible /chat/completions
-    traffic through Headroom. Kimi's own OAuth bearer is forwarded upstream,
-    so no extra login is required — run `kimi` once to authenticate first.
+    Sets KIMI_CODE_BASE_URL for managed Kimi Code and KIMI_BASE_URL for legacy
+    kimi-cli to route OpenAI-compatible /chat/completions traffic through
+    Headroom. Managed Kimi Code needs one `/login` after the proxy URL changes
+    so its OAuth slot matches that URL; legacy kimi-cli keeps its existing login.
 
     \b
     Examples:
@@ -6527,9 +6786,20 @@ def kimi(
         click.echo("Install Kimi CLI: https://github.com/MoonshotAI/kimi-cli")
         raise SystemExit(1)
 
-    env, env_vars_display = _build_kimi_launch_env(
-        port, os.environ, project=_project_name_from_cwd()
-    )
+    project = _project_name_from_cwd()
+    env, env_vars_display = _build_kimi_launch_env(port, os.environ, project=project)
+
+    def configure_kimi_launch(
+        actual_port: int,
+        current_args: tuple,
+        current_env: dict[str, str],
+        current_display: list[str],
+    ) -> tuple[tuple, dict[str, str], list[str]]:
+        del current_display
+        updated_env, updated_display = _build_kimi_launch_env(
+            actual_port, current_env, project=project
+        )
+        return current_args, updated_env, updated_display
 
     _launch_tool(
         binary=kimi_bin,
@@ -6544,6 +6814,7 @@ def kimi(
         agent_type="kimi",
         code_graph=code_graph,
         openai_api_url=kimi_api_url,
+        configure_launch=configure_kimi_launch,
     )
 
 

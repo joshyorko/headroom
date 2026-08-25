@@ -75,6 +75,30 @@ def test_build_manifest_python_runtime_keeps_explicit_memory_db_path() -> None:
     assert "--memory-db-path" in manifest.proxy_args
 
 
+def test_build_manifest_falls_back_from_windows_service_to_task(monkeypatch) -> None:
+    monkeypatch.setattr("headroom.install.planner.sys.platform", "win32")
+
+    manifest = build_manifest(
+        profile="default",
+        preset=InstallPreset.PERSISTENT_SERVICE.value,
+        runtime_kind="python",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        proxy_mode="token",
+        memory_enabled=False,
+        telemetry_enabled=False,
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+    )
+
+    assert manifest.preset == InstallPreset.PERSISTENT_TASK.value
+    assert manifest.supervisor_kind == "task"
+
+
 def test_build_manifest_uses_provider_slice_env_builders_for_all_supported_targets() -> None:
     manifest = build_manifest(
         profile="default",
@@ -265,6 +289,17 @@ def test_build_manifest_persists_intercept_tool_results() -> None:
     manifest = build_manifest(**_base_manifest_kwargs(intercept_tool_results=True))
 
     assert "--intercept-tool-results" in manifest.proxy_args
+    assert manifest.base_env["HEADROOM_ROLLOUT_CHANNEL"] == "canary"
+
+
+def test_build_manifest_rejects_interceptor_below_required_rollout_channel() -> None:
+    with pytest.raises(click.ClickException, match="requires HEADROOM_ROLLOUT_CHANNEL=canary"):
+        build_manifest(
+            **_base_manifest_kwargs(
+                intercept_tool_results=True,
+                extra_env={"HEADROOM_ROLLOUT_CHANNEL": "stable"},
+            )
+        )
 
 
 def test_build_manifest_persists_protect_tool_results() -> None:

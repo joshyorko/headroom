@@ -9,7 +9,6 @@ pytest.importorskip("fastapi")
 from fastapi.responses import JSONResponse  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from headroom.proxy import helpers  # noqa: E402
 from headroom.proxy.outcome import RequestOutcome, emit_request_outcome  # noqa: E402
 from headroom.proxy.project_context import (  # noqa: E402
     classify_project,
@@ -28,33 +27,6 @@ from headroom.proxy.savings_tracker import (  # noqa: E402
     sanitize_project_name,
 )
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app  # noqa: E402
-
-
-@pytest.fixture(autouse=True)
-def _reset_context_tool_reported_projects():
-    with helpers._context_tool_stats_cache_lock:
-        helpers._context_tool_reported_snapshot.update(
-            {"tool": None, "value": None, "reported_at": 0.0, "source": None}
-        )
-        helpers._context_tool_reported_project_snapshots.clear()
-        helpers._context_tool_stats_cache.update(
-            {"expires_at": 0.0, "has_value": False, "tool": None, "value": None}
-        )
-        helpers._context_tool_session_baseline.update(
-            {
-                "initialized": True,
-                "tool": "rtk",
-                "source": None,
-                "scope": None,
-                "total_commands": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "tokens_saved": 0,
-                "total_time_ms": 0,
-                "captured_at": 0.0,
-            }
-        )
-
 
 # ---------------------------------------------------------------------------
 # sanitize_project_name / classify_project
@@ -368,104 +340,6 @@ def test_funnel_attributes_savings_from_context_and_stats_exposes_them(tmp_path,
         history = client.get("/stats-history").json()
         assert history["schema_version"] == 5
         assert history["projects"]["ctx-project"]["requests"] == 1
-
-
-def test_stats_merges_multiple_reported_rtk_projects_with_persistent_savings(tmp_path, monkeypatch):
-    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
-    config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
-    with helpers._context_tool_stats_cache_lock:
-        helpers._context_tool_reported_snapshot.update(
-            {"tool": None, "value": None, "reported_at": 0.0, "source": None}
-        )
-        helpers._context_tool_reported_project_snapshots.clear()
-        helpers._context_tool_stats_cache.update(
-            {"expires_at": 0.0, "has_value": False, "tool": None, "value": None}
-        )
-        helpers._context_tool_session_baseline.update(
-            {
-                "initialized": True,
-                "tool": "rtk",
-                "source": None,
-                "scope": None,
-                "total_commands": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "tokens_saved": 0,
-                "total_time_ms": 0,
-                "captured_at": 0.0,
-            }
-        )
-
-    with TestClient(create_app(config)) as client:
-        proxy = client.app.state.proxy
-        _emit_outcome(proxy, project_field="persistent-project")
-
-        for cwd, saved in (("/work/headroom", 111), ("/work/codex-desktop-linux", 222)):
-            response = client.post(
-                "/stats/context-tool",
-                json={
-                    "tool": "rtk",
-                    "scope": "project",
-                    "cwd": cwd,
-                    "summary": {
-                        "total_commands": 1,
-                        "total_input": saved * 2,
-                        "total_output": saved,
-                        "total_saved": saved,
-                    },
-                },
-            )
-            assert response.status_code == 200
-
-        per_project = client.get("/stats?cached=0").json()["savings"]["per_project"]
-        assert per_project["persistent-project"]["tokens_saved"] == 400
-        assert per_project["headroom"]["rtk_tokens_saved"] == 111
-        assert per_project["codex-desktop-linux"]["rtk_tokens_saved"] == 222
-
-
-def test_context_tool_project_report_is_idempotent_and_durable(tmp_path, monkeypatch):
-    savings_path = tmp_path / "savings.json"
-    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
-    config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
-    payload = {
-        "tool": "rtk",
-        "scope": "project",
-        "cwd": "/work/headroom",
-        "summary": {
-            "total_commands": 12,
-            "total_input": 1000,
-            "total_output": 250,
-            "total_saved": 750,
-        },
-    }
-
-    with TestClient(
-        create_app(config),
-        base_url="http://127.0.0.1",
-        client=("127.0.0.1", 12345),
-    ) as client:
-        client.app.state.proxy.metrics.savings_tracker.record_request(
-            model="gpt-4o",
-            input_tokens=100,
-            tokens_saved=400,
-            project="headroom",
-        )
-        assert client.post("/stats/context-tool", json=payload).status_code == 200
-        assert client.post("/stats/context-tool", json=payload).status_code == 200
-
-        project = client.get("/stats-lifetime").json()["projects"]["headroom"]
-        assert project["requests"] == 12
-        assert project["tokens_saved"] == 750
-        assert project["proxy_tokens_saved"] == 400
-        assert project["rtk_commands"] == 12
-        assert project["rtk_tokens_saved"] == 750
-        assert project["savings_percent"] == 75.0
-
-    reloaded = SavingsTracker(path=str(savings_path)).lifetime_response()["projects"][
-        "headroom"
-    ]
-    assert reloaded["requests"] == 12
-    assert reloaded["tokens_saved"] == 750
 
 
 # ---------------------------------------------------------------------------

@@ -986,7 +986,9 @@ def test_build_copilot_upstream_url_strips_v1_for_configured_enterprise_api_url(
 
 
 def test_apply_copilot_api_auth_replaces_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1018,7 +1020,9 @@ def test_apply_copilot_api_auth_replaces_authorization(monkeypatch: pytest.Monke
 def test_apply_copilot_api_auth_passes_through_existing_api_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         raise AssertionError("provider should not be called for existing API token")
 
     monkeypatch.setattr(
@@ -1044,7 +1048,9 @@ def test_apply_copilot_api_auth_passes_through_existing_api_token(
 def test_apply_copilot_api_auth_replaces_managed_seeded_api_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-refreshed",
             expires_at=time.time() + 3600,
@@ -1117,7 +1123,9 @@ def test_apply_copilot_api_auth_passes_through_github_oauth_bearer(
 def test_apply_copilot_api_auth_replaces_non_bearer_auth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1172,7 +1180,9 @@ def test_is_forwardable_copilot_bearer_token_matches_expected_prefixes() -> None
 def test_apply_copilot_api_auth_injects_required_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1203,7 +1213,9 @@ def test_apply_copilot_api_auth_injects_required_headers(
 def test_apply_copilot_api_auth_preserves_existing_copilot_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1237,7 +1249,9 @@ def test_apply_copilot_api_auth_preserves_existing_copilot_headers(
 def test_apply_copilot_api_auth_preserves_existing_headers_case_insensitively(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,

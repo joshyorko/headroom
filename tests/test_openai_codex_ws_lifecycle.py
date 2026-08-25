@@ -21,8 +21,6 @@ import headroom.proxy.handlers.openai as openai_module
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 
-OUTPUT_SHAPER_SENTINEL = "<headroom_output_shaping>"
-
 # ---------------------------------------------------------------------------
 # Test doubles
 # ---------------------------------------------------------------------------
@@ -379,15 +377,6 @@ def _codex_lite_headers(*, chatgpt: bool) -> dict[str, str]:
     return headers
 
 
-def _waste_signal_frame() -> str:
-    return json.dumps(
-        {
-            "type": "response.create",
-            "response": {"model": "gpt-5.4", "input": "<div>" * 20},
-        }
-    )
-
-
 @pytest.mark.asyncio
 async def test_ws_first_frame_output_shaper_rewrites_without_compression(monkeypatch):
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
@@ -541,15 +530,7 @@ async def test_ws_first_frame_compression_uses_bounded_executor(monkeypatch):
         json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
         json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
     ]
-
-    class _TwoFrameUpstream(_FakeUpstream):
-        async def _iter(self):
-            while len(self.sent) < 2:
-                await asyncio.sleep(0)
-            for event in self._events:
-                yield event
-
-    upstream = _TwoFrameUpstream(upstream_events)
+    upstream = _FakeUpstream(upstream_events)
     fake_ws_mod = _make_fake_websockets_module(upstream)
 
     client_ws = _FakeWebSocket(frames=[_first_frame()])
@@ -873,92 +854,6 @@ async def test_happy_path_registry_empty_after_response_completed():
 
 
 @pytest.mark.asyncio
-async def test_ws_output_shaper_shapes_every_response_create_and_records_response_local_labels(
-    monkeypatch,
-):
-    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
-    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
-    monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "0")
-
-    first_frame = json.dumps(
-        {
-            "type": "response.create",
-            "response": {
-                "model": "gpt-5.4",
-                "instructions": "Follow project rules.",
-                "input": "first turn",
-            },
-        }
-    )
-    second_frame = json.dumps(
-        {
-            "type": "response.create",
-            "response": {
-                "model": "gpt-5.4",
-                "instructions": "Follow updated project rules.",
-                "input": "second turn",
-            },
-        }
-    )
-    upstream_events = [
-        json.dumps(
-            {
-                "type": "response.completed",
-                "response": {
-                    "id": "r_1",
-                    "usage": {
-                        "input_tokens": 20,
-                        "output_tokens": 5,
-                        "input_tokens_details": {"cached_tokens": 0},
-                    },
-                },
-            }
-        ),
-        json.dumps(
-            {
-                "type": "response.completed",
-                "response": {
-                    "id": "r_2",
-                    "usage": {
-                        "input_tokens": 45,
-                        "output_tokens": 12,
-                        "input_tokens_details": {"cached_tokens": 0},
-                    },
-                },
-            }
-        ),
-    ]
-    upstream = _FakeUpstream(upstream_events)
-    fake_ws_mod = _make_fake_websockets_module(upstream)
-    client_ws = _FakeWebSocket(frames=[first_frame, second_frame])
-    handler = _DummyOpenAIHandler()
-    outcomes = []
-
-    async def _capture_outcome(outcome):
-        outcomes.append(outcome)
-
-    handler._record_request_outcome = _capture_outcome
-
-    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
-        await handler.handle_openai_responses_ws(client_ws)
-
-    sent_frames = [json.loads(frame) for frame in upstream.sent]
-    response_creates = [frame for frame in sent_frames if frame.get("type") == "response.create"]
-    assert len(response_creates) == 2
-    for frame in response_creates:
-        instructions = frame["response"]["instructions"]
-        assert instructions.count(OUTPUT_SHAPER_SENTINEL) == 1
-
-    assert len(outcomes) == 2
-    for outcome in outcomes:
-        assert "output_shaper:verbosity:L2" in outcome.transforms_applied
-        assert (
-            sum(1 for label in outcome.transforms_applied if label == "output_shaper:verbosity:L2")
-            == 1
-        )
-
-
-@pytest.mark.asyncio
 async def test_ws_session_metrics_include_response_completed_usage():
     """Codex WS sessions should report real upstream usage, not zero-token sessions."""
 
@@ -994,40 +889,6 @@ async def test_ws_session_metrics_include_response_completed_usage():
     assert recorded["cache_read_tokens"] == 75
     assert recorded["cache_write_tokens"] == 25
     assert recorded["uncached_input_tokens"] == 25
-
-
-@pytest.mark.asyncio
-async def test_ws_session_metrics_include_waste_signals():
-    """Codex WS per-turn metrics should feed detected waste into /stats."""
-
-    upstream_events = [
-        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
-        json.dumps(
-            {
-                "type": "response.completed",
-                "response": {
-                    "id": "r_1",
-                    "usage": {
-                        "input_tokens": 100,
-                        "input_tokens_details": {"cached_tokens": 75},
-                        "output_tokens": 12,
-                    },
-                },
-            }
-        ),
-    ]
-    upstream = _FakeUpstream(upstream_events)
-    fake_ws_mod = _make_fake_websockets_module(upstream)
-
-    client_ws = _FakeWebSocket(frames=[_waste_signal_frame()])
-    handler = _DummyOpenAIHandler()
-
-    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
-        await handler.handle_openai_responses_ws(client_ws)
-
-    assert handler.metrics.recorded_requests
-    recorded = handler.metrics.recorded_requests[-1]
-    assert recorded["waste_signals"]["html_noise"] > 0
 
 
 @pytest.mark.asyncio
@@ -2382,3 +2243,56 @@ async def test_ws_memory_continuation_continues_pre_stream_and_passes_late_call(
     assert second_response[6]["item"] == function_call_two
     assert second_response[7]["response"]["id"] == "r-2"
     assert executed == [("memory_search", {}, "user-1", "openai")]
+
+
+@pytest.mark.asyncio
+async def test_ws_session_metrics_track_model_per_response_create():
+    """A model switch on one WS session must affect the next request outcome."""
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "model": "model-a",
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                },
+            }
+        ),
+        json.dumps({"type": "response.created", "response": {"id": "r_2"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_2",
+                    "model": "model-b",
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                },
+            }
+        ),
+    ]
+    first_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "model-a", "input": "first turn"},
+        }
+    )
+    second_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "model-b", "input": "second turn"},
+        }
+    )
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[first_frame, second_frame])
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert [request["model"] for request in handler.metrics.recorded_requests] == [
+        "model-a",
+        "model-b",
+    ]

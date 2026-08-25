@@ -39,6 +39,7 @@ Pure module: no I/O except explicit ``load``/``save``.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -67,6 +68,8 @@ from .output_savings_policy import (
 from .output_savings_policy import (
     stratum_label as stratum_label,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -120,6 +123,17 @@ class BaselineModel:
     def observe(self, key: str, output_tokens: int) -> None:
         self.strata.setdefault(key, _Accum()).add(output_tokens)
         self.glob.add(output_tokens)
+
+    def merge(self, other: BaselineModel) -> None:
+        """Accumulate another learned baseline without losing its sample weights."""
+        for key, source in other.strata.items():
+            target = self.strata.setdefault(key, _Accum())
+            target.n += source.n
+            target.sum += source.sum
+            target.sumsq += source.sumsq
+        self.glob.n += other.glob.n
+        self.glob.sum += other.glob.sum
+        self.glob.sumsq += other.glob.sumsq
 
     def lookup(self, key: str) -> tuple[float, float, int]:
         """Return ``(mean, var, n)`` for *key* with hierarchical back-off.
@@ -347,9 +361,13 @@ class SavingsLedger:
     def save(self, path: Any) -> None:
         from pathlib import Path
 
+        from headroom import fsutil
+
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(self.to_dict(), separators=(",", ":")))
+        # fsutil.write_text is atomic (temp file + os.replace), so a crash
+        # mid-write cannot truncate the ledger already on disk (#18).
+        fsutil.write_text(p, json.dumps(self.to_dict(), separators=(",", ":")))
 
     @classmethod
     def load(cls, path: Any) -> SavingsLedger:
@@ -360,7 +378,11 @@ class SavingsLedger:
             return cls()
         try:
             return cls.from_dict(json.loads(p.read_text()))
-        except (json.JSONDecodeError, ValueError, OSError):
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
+            # Fail open (empty ledger), but surface the loss — silently
+            # swallowing a corrupt file made lost history indistinguishable
+            # from no history yet (#18).
+            logger.warning("output-savings ledger %s unreadable, starting empty: %s", p, exc)
             return cls()
 
 

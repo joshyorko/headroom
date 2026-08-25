@@ -44,8 +44,7 @@ def test_unwrapped_model_forms_drops_leading_segments() -> None:
         ("groq/llama-3.3-70b-versatile", 0.59, 0.79),
         # Non-OpenAI models reachable through the OpenAI-compatible passthrough.
         ("gemini-2.5-flash", 0.30, 2.50),
-        # The self-hosted compatibility alias maps this retired name to V4 Flash.
-        ("deepseek-chat", 0.14, 0.28),
+        ("deepseek-chat", 0.44, 1.32),
     ],
 )
 def test_provider_prices_models_its_table_never_covered(

@@ -62,10 +62,7 @@ def test_openai_realtime_call_preserves_raw_body_query_and_location() -> None:
     assert len(fake.calls) == 1
     method, url, kwargs = fake.calls[0]
     assert method == "POST"
-    assert url == (
-        "https://api.openai.test/v1/realtime/calls"
-        "?intent=quicksilver&architecture=avas"
-    )
+    assert url == ("https://api.openai.test/v1/realtime/calls?intent=quicksilver&architecture=avas")
     assert kwargs["content"] == body
     assert kwargs["headers"]["authorization"] == "Bearer api-key"  # type: ignore[index]
     assert kwargs["headers"]["content-type"] == (  # type: ignore[index]
@@ -77,7 +74,11 @@ def test_openai_realtime_call_preserves_raw_body_query_and_location() -> None:
     assert kwargs["headers"]["x-gateway-key"] == "configured"  # type: ignore[index]
 
 
-def test_openai_realtime_call_honors_custom_upstream_without_leaking_header() -> None:
+def test_openai_realtime_call_honors_custom_upstream_without_leaking_header(monkeypatch) -> None:
+    async def safe_upstream(_url):  # type: ignore[no-untyped-def]
+        return True
+
+    monkeypatch.setattr("headroom.providers.proxy_routes.is_safe_upstream_url_async", safe_upstream)
     with TestClient(create_app(ProxyConfig())) as client:
         fake = FakeAsyncClient()
         client.app.state.proxy.http_client = fake
@@ -116,9 +117,7 @@ def test_chatgpt_realtime_call_preserves_backend_json_shape() -> None:
     assert len(fake.calls) == 1
     method, url, kwargs = fake.calls[0]
     assert method == "POST"
-    assert url == (
-        "https://chatgpt.com/backend-api/codex/realtime/calls?architecture=avas"
-    )
+    assert url == ("https://chatgpt.com/backend-api/codex/realtime/calls?architecture=avas")
     assert kwargs["content"] == body
     assert kwargs["headers"]["chatgpt-account-id"] == "acct_123"  # type: ignore[index]
 
@@ -165,6 +164,11 @@ def test_realtime_websocket_route_honors_custom_upstream(monkeypatch) -> None:
 
     monkeypatch.setattr("headroom.providers.proxy_routes.relay_realtime_websocket", fake_relay)
 
+    async def safe_upstream(_url):  # type: ignore[no-untyped-def]
+        return True
+
+    monkeypatch.setattr("headroom.providers.proxy_routes.is_safe_upstream_url_async", safe_upstream)
+
     with TestClient(create_app(ProxyConfig())) as client:
         with client.websocket_connect(
             "/v1/live/rtc_123",
@@ -182,9 +186,7 @@ def test_realtime_websocket_relays_query_headers_subprotocol_and_binary_frame(
     monkeypatch,
 ) -> None:
     connect_calls: list[tuple[str, dict[str, object]]] = []
-    token = _jwt(
-        {"https://api.openai.com/auth": {"chatgpt_account_id": "acct-from-jwt"}}
-    )
+    token = _jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acct-from-jwt"}})
 
     class FakeUpstream:
         subprotocol = "realtime"
@@ -258,9 +260,7 @@ def test_realtime_websocket_relays_query_headers_subprotocol_and_binary_frame(
     assert websocket.frames == [b"\x00opaque-event"]
     assert len(connect_calls) == 1
     url, kwargs = connect_calls[0]
-    assert url == (
-        "wss://api.openai.test/v1/realtime?call_id=rtc_123&intent=quicksilver"
-    )
+    assert url == ("wss://api.openai.test/v1/realtime?call_id=rtc_123&intent=quicksilver")
     assert kwargs["subprotocols"] == ["realtime"]
     assert kwargs["additional_headers"] == {
         "authorization": f"Bearer {token}",
@@ -272,11 +272,14 @@ def test_realtime_websocket_relays_query_headers_subprotocol_and_binary_frame(
 def test_realtime_websocket_url_preserves_custom_upstream_prefix() -> None:
     from headroom.providers.openai_realtime import openai_realtime_websocket_url
 
-    assert openai_realtime_websocket_url(
-        "https://gateway.example/p/team/v1",
-        "/v1/live/rtc_123",
-        "intent=quicksilver",
-    ) == "wss://gateway.example/p/team/v1/live/rtc_123?intent=quicksilver"
+    assert (
+        openai_realtime_websocket_url(
+            "https://gateway.example/p/team/v1",
+            "/v1/live/rtc_123",
+            "intent=quicksilver",
+        )
+        == "wss://gateway.example/p/team/v1/live/rtc_123?intent=quicksilver"
+    )
 
 
 def test_realtime_websocket_rejects_remote_client_without_proxy_token(monkeypatch) -> None:

@@ -14,7 +14,6 @@ class CCRToolCall:
 
     tool_call_id: str
     hash_key: str
-    query: str | None = None
     tool_name: str | None = None
 
 
@@ -110,14 +109,7 @@ def parse_ccr_tool_calls(
     other_calls: list[dict[str, Any]] = []
 
     for tool_call in extract_tool_calls(response, provider):
-        parsed = parse_tool_call(tool_call, provider)
-        if parsed is None:
-            other_calls.append(tool_call)
-            continue
-        if isinstance(parsed, tuple):
-            hash_key, query = parsed
-        else:
-            hash_key, query = parsed, None
+        hash_key = parse_tool_call(tool_call, provider)
         if hash_key is None:
             other_calls.append(tool_call)
             continue
@@ -129,12 +121,7 @@ def parse_ccr_tool_calls(
             if isinstance(function_call, dict) and function_call.get("id"):
                 tool_name = str(function_call.get("name", CCR_TOOL_NAME))
         ccr_calls.append(
-            CCRToolCall(
-                tool_call_id=tool_call_id,
-                hash_key=hash_key,
-                query=query,
-                tool_name=tool_name,
-            )
+            CCRToolCall(tool_call_id=tool_call_id, hash_key=hash_key, tool_name=tool_name)
         )
 
     return ccr_calls, other_calls

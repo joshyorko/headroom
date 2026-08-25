@@ -25,6 +25,7 @@ actually reports.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -399,7 +400,12 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
-    from headroom.proxy.savings_attribution import encode, from_tags, public_tags
+    from headroom.proxy.savings_attribution import (
+        encode,
+        from_tags,
+        public_tags,
+        timings_from_tags,
+    )
     from headroom.telemetry.session import record_outcome
 
     # GitHub Copilot: requests routed to the Copilot API travel on the OpenAI or
@@ -450,10 +456,17 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             from headroom.proxy.output_savings import get_recorder
 
             _rec = get_recorder()
-            _rec.record_from_labels(outcome.transforms_applied, outcome.output_tokens)
-            output_tokens_saved_est = _rec.estimate_request_savings(
-                outcome.transforms_applied, outcome.output_tokens
-            )
+
+            def _record_and_estimate() -> int:
+                _rec.record_from_labels(outcome.transforms_applied, outcome.output_tokens)
+                return _rec.estimate_request_savings(
+                    outcome.transforms_applied, outcome.output_tokens
+                )
+
+            # Both calls take the recorder lock, and the every-Nth record also
+            # does a full read-modify-write of the ledger file — run them
+            # together off the event loop (#18) so a slow flush can't stall it.
+            output_tokens_saved_est = await asyncio.to_thread(_record_and_estimate)
         except Exception:  # pragma: no cover - defensive
             pass
 
@@ -466,6 +479,20 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # session summary / cost summary / all-layers total can surface the layer.
     tool_search_saved = tool_schema_saved_from_tags(outcome.tags or {})
     savings_breakdown = from_tags(outcome.tags)
+
+    # Stage timings contributed from OUTSIDE the handler, folded in here rather
+    # than in each handler so every provider picks them up from one place.
+    #
+    # The handler's own timings win a name collision, which cannot happen while
+    # extension stages carry the ``ext:`` prefix but is the safe way round if
+    # that ever changes: a plugin must not be able to overwrite a measurement
+    # the pipeline made of itself.
+    extension_timing = timings_from_tags(outcome.tags)
+    pipeline_timing = (
+        {**extension_timing, **(outcome.pipeline_timing or {})}
+        if extension_timing
+        else outcome.pipeline_timing
+    )
 
     # Billed input volume. Prefer the provider's own count where it reported one
     # — that is what the invoice charges for, and it is the number cache math is
@@ -488,7 +515,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         cached=outcome.cache_hit,
         overhead_ms=outcome.overhead_ms,
         ttfb_ms=outcome.ttfb_ms,
-        pipeline_timing=outcome.pipeline_timing,
+        pipeline_timing=pipeline_timing,
         waste_signals=outcome.waste_signals,
         cache_read_tokens=outcome.cache_read_tokens,
         cache_write_tokens=outcome.cache_write_tokens,
@@ -518,6 +545,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             uncached_tokens=outcome.uncached_input_tokens,
             cache_inferred=outcome.cache_inferred,
             output_tokens=outcome.output_tokens,
+            # Same figure already handed to metrics.record_request above. The
+            # cost tracker feeds the dashboard's per-model table, which read
+            # compression only while its own headline counted both layers.
+            tool_schema_saved=tool_search_saved,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is

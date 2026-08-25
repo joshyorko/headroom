@@ -20,6 +20,7 @@ def resolve_headroom_command() -> list[str]:
 
 #: Default proxy URL used when none is given.
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
+CLAUDE_SERENA_CONTEXT = "claude-code"
 
 
 def get_all_registrars(
@@ -113,11 +114,12 @@ def install_everywhere(
         entries for agents we know about that aren't installed locally.
     """
     spec = build_headroom_spec(proxy_url)
-    selected = (
-        list(registrars)
-        if registrars is not None
-        else get_all_registrars(scope=scope, project_dir=project_dir)
-    )
+    if registrars is not None:
+        selected = list(registrars)
+    elif scope == "user" and project_dir is None:
+        selected = get_all_registrars()
+    else:
+        selected = get_all_registrars(scope=scope, project_dir=project_dir)
 
     if agents is not None:
         agent_set = set(agents)

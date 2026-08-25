@@ -14,12 +14,12 @@ import math
 import os
 import tempfile
 import threading
+from collections.abc import Mapping
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from io import StringIO
 from pathlib import Path
-from collections.abc import Mapping
 from typing import Any
 
 from headroom import paths as _paths
@@ -500,7 +500,16 @@ def _empty_display_session() -> dict[str, Any]:
 def _empty_by_model_entry() -> dict[str, Any]:
     return {
         "requests": 0,
+        # Message-level compression only. Kept as its own bucket rather than
+        # widened in place, so the persisted meaning of an existing field never
+        # changes under a reader that predates this.
         "tokens_saved": 0,
+        # Tool-schema deferral, attributed to the model that benefited. This was
+        # dropped on the floor: `record_request` was handed it and passed only
+        # the message figure down, so a tool-heavy model read "0 tokens saved"
+        # while the headline counted its deferral. Deferral is routinely the
+        # larger half -- 589,206 of 625,277 in the report that prompted this.
+        "tool_tokens_saved": 0,
         "compression_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
@@ -514,9 +523,6 @@ def _empty_project_entry() -> dict[str, Any]:
         "compression_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
-        "rtk_commands": 0,
-        "rtk_tokens_saved": 0,
-        "rtk_input_tokens": 0,
         "last_activity_at": None,
     }
 
@@ -539,9 +545,6 @@ def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
         normalized["total_input_cost_usd"] = round(
             _coerce_float(entry.get("total_input_cost_usd")), 6
         )
-        normalized["rtk_commands"] = _coerce_int(entry.get("rtk_commands"))
-        normalized["rtk_tokens_saved"] = _coerce_int(entry.get("rtk_tokens_saved"))
-        normalized["rtk_input_tokens"] = _coerce_int(entry.get("rtk_input_tokens"))
         last_activity = _parse_timestamp(entry.get("last_activity_at"))
         normalized["last_activity_at"] = _to_utc_iso(last_activity) if last_activity else None
         projects[cleaned_name] = normalized
@@ -568,6 +571,8 @@ def _normalize_by_model(raw: Any) -> dict[str, dict[str, Any]]:
         normalized = _empty_by_model_entry()
         normalized["requests"] = _coerce_int(entry.get("requests"))
         normalized["tokens_saved"] = _coerce_int(entry.get("tokens_saved"))
+        # Absent in state files written before this field existed -> 0.
+        normalized["tool_tokens_saved"] = _coerce_int(entry.get("tool_tokens_saved"))
         normalized["compression_savings_usd"] = round(
             _coerce_float(entry.get("compression_savings_usd")), 6
         )
@@ -747,6 +752,12 @@ class SavingsTracker:
         model: str,
         input_tokens: int,
         tokens_saved: int,
+        # Tool-schema deferral for this request, DISJOINT from ``tokens_saved``
+        # (which is the bare message figure). The caller has always had this
+        # number and already folds it into the priced dollars below; it simply
+        # had no parameter to arrive through, so per-model tokens stayed
+        # message-only while per-model dollars did not.
+        tool_search_saved: int = 0,
         output_tokens_saved: int = 0,
         provider: str | None = None,
         project: str | None = None,
@@ -770,15 +781,36 @@ class SavingsTracker:
             timestamp_dt = _utc_now()
 
         delta_tokens_saved = _coerce_int(tokens_saved)
+        delta_tool_tokens_saved = max(_coerce_int(tool_search_saved), 0)
         delta_input_tokens = _coerce_int(input_tokens)
         delta_output_tokens_saved = max(_coerce_int(output_tokens_saved), 0)
         delta_cache_read_tokens = _coerce_int(cache_read_tokens)
         priced = estimated_savings_usd
-        delta_savings_usd = (
-            max(_coerce_float(priced.get("compression")), 0.0)
-            if priced is not None
-            else _estimate_compression_savings_usd(model, delta_tokens_saved)
-        )
+        # ``estimate_request_savings_usd`` prices FOUR buckets, but this method
+        # only ever read three — ``tool_schema`` was computed and dropped on the
+        # floor. Tool-schema deferral is a quarter of the token headline on real
+        # traffic (2.7M of 11.2M), and ``tokens_saved`` here is the bare
+        # message-level figure (the caller folds deferral in separately for the
+        # ledger, see prometheus_metrics.record_request), so the dollars were
+        # simply missing rather than counted elsewhere. That is why "Cost saved"
+        # read materially below the token-savings percent on the same traffic.
+        # Add it to the compression bucket, matching how the PERF headline and
+        # perf/analyzer fold deferral into one number.
+        if priced is not None:
+            # Two DISJOINT buckets: the caller passes bare message savings as
+            # ``compression_tokens_saved`` and deferral separately as
+            # ``tool_schema_tokens_saved`` (see prometheus_metrics.record_request),
+            # so summing them is additive, not double counting. Written as a
+            # statement rather than folded into the ternary below — a money path
+            # should not depend on the reader knowing that ``a + b if c else d``
+            # groups as ``(a + b) if c else d``.
+            delta_savings_usd = max(_coerce_float(priced.get("compression")), 0.0) + max(
+                _coerce_float(priced.get("tool_schema")), 0.0
+            )
+        else:
+            # No priced breakdown available: only message savings are known here,
+            # so this path stays message-only exactly as before.
+            delta_savings_usd = _estimate_compression_savings_usd(model, delta_tokens_saved)
         delta_output_savings_usd = (
             max(_coerce_float(priced.get("output_shaping")), 0.0)
             if priced is not None
@@ -888,6 +920,7 @@ class SavingsTracker:
                 model,
                 requests_delta=1,
                 tokens_saved_delta=delta_tokens_saved,
+                tool_tokens_saved_delta=delta_tool_tokens_saved,
                 savings_usd_delta=delta_savings_usd,
                 input_tokens_delta=delta_input_tokens,
                 input_cost_usd_delta=delta_input_cost_usd,
@@ -1040,58 +1073,13 @@ class SavingsTracker:
             )
             del projects[evict]
 
-    def upsert_context_tool_project_snapshot(
-        self,
-        project: str | None,
-        *,
-        commands: int,
-        tokens_saved: int,
-        input_tokens: int,
-        timestamp: datetime | str | None = None,
-    ) -> bool:
-        """Persist cumulative RTK project counters without double-counting reports."""
-        name = sanitize_project_name(project)
-        if name is None:
-            return False
-        timestamp_dt = (
-            _parse_timestamp(timestamp)
-            if isinstance(timestamp, str)
-            else timestamp.astimezone(timezone.utc)
-            if isinstance(timestamp, datetime)
-            else _utc_now()
-        ) or _utc_now()
-
-        with self._lock:
-            projects: dict[str, dict[str, Any]] = self._state.setdefault("projects", {})
-            entry = projects.setdefault(name, _empty_project_entry())
-            before = (
-                entry.get("rtk_commands", 0),
-                entry.get("rtk_tokens_saved", 0),
-                entry.get("rtk_input_tokens", 0),
-            )
-            entry["rtk_commands"] = max(_coerce_int(entry.get("rtk_commands")), commands)
-            entry["rtk_tokens_saved"] = max(
-                _coerce_int(entry.get("rtk_tokens_saved")), tokens_saved
-            )
-            entry["rtk_input_tokens"] = max(
-                _coerce_int(entry.get("rtk_input_tokens")), input_tokens
-            )
-            changed = before != (
-                entry["rtk_commands"],
-                entry["rtk_tokens_saved"],
-                entry["rtk_input_tokens"],
-            )
-            if changed:
-                entry["last_activity_at"] = _to_utc_iso(timestamp_dt)
-                self._save_locked()
-            return changed
-
     def _record_by_model_locked(
         self,
         model: str,
         *,
         requests_delta: int = 0,
         tokens_saved_delta: int = 0,
+        tool_tokens_saved_delta: int = 0,
         savings_usd_delta: float = 0.0,
         input_tokens_delta: int = 0,
         input_cost_usd_delta: float = 0.0,
@@ -1106,6 +1094,7 @@ class SavingsTracker:
         entry = by_model.setdefault(key, _empty_by_model_entry())
         entry["requests"] += max(requests_delta, 0)
         entry["tokens_saved"] += max(tokens_saved_delta, 0)
+        entry["tool_tokens_saved"] += max(tool_tokens_saved_delta, 0)
         entry["compression_savings_usd"] = round(
             entry["compression_savings_usd"] + max(savings_usd_delta, 0.0), 6
         )
@@ -1125,23 +1114,9 @@ class SavingsTracker:
         result: dict[str, dict[str, Any]] = {}
         for name, entry in ranked:
             view = dict(entry)
-            proxy_tokens_saved = entry["tokens_saved"]
-            rtk_tokens_saved = _coerce_int(entry.get("rtk_tokens_saved"))
-            view["proxy_requests"] = entry["requests"]
-            view["proxy_tokens_saved"] = proxy_tokens_saved
-            view["requests"] = max(entry["requests"], _coerce_int(entry.get("rtk_commands")))
-            # RTK and proxy snapshots can cover different historical windows.
-            # Use the stronger cumulative observation for the shared headline
-            # instead of adding them and manufacturing savings above 100%.
-            view["tokens_saved"] = max(proxy_tokens_saved, rtk_tokens_saved)
-            rtk_input_tokens = _coerce_int(entry.get("rtk_input_tokens"))
-            total_before = (
-                rtk_input_tokens
-                if rtk_tokens_saved > 0 and rtk_input_tokens > 0
-                else proxy_tokens_saved + entry["total_input_tokens"]
-            )
+            total_before = entry["tokens_saved"] + entry["total_input_tokens"]
             view["savings_percent"] = round(
-                (view["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
+                (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
                 2,
             )
             result[name] = view
@@ -1152,15 +1127,26 @@ class SavingsTracker:
         by_model = self._state.get("by_model", {})
         ranked = sorted(
             by_model.items(),
-            key=lambda item: item[1]["tokens_saved"],
+            key=lambda item: item[1]["tokens_saved"] + item[1].get("tool_tokens_saved", 0),
             reverse=True,
         )
         result: dict[str, dict[str, Any]] = {}
         for model, entry in ranked:
             view = dict(entry)
-            total_before = entry["tokens_saved"] + entry["total_input_tokens"]
+            tool_saved = _coerce_int(entry.get("tool_tokens_saved"))
+            # Deferred tool schemas never reached the model, so they were never in
+            # ``total_input_tokens`` — the pre-Headroom denominator is the input we
+            # sent plus what we withheld. Same construction the PERF headline and
+            # perf/analyzer use, so a row and the total printed above it share one
+            # definition of "saved".
+            headline_saved = entry["tokens_saved"] + tool_saved
+            total_before = headline_saved + entry["total_input_tokens"]
+            # Named "headline" rather than "total" because this module already uses
+            # ``total_tokens_saved`` for the cumulative lifetime figure on history
+            # points; reusing it here would mean two different things in one file.
+            view["headline_tokens_saved"] = headline_saved
             view["savings_percent"] = round(
-                (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
+                (headline_saved / total_before * 100) if total_before > 0 else 0.0,
                 2,
             )
             result[model] = view

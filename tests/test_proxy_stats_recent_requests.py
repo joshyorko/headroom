@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from headroom.proxy.models import ProxyConfig
 from headroom.proxy.server import create_app
+from headroom.rollout import resolve_rollout
 
 
 class FakeRequestLogger:
@@ -26,6 +27,35 @@ class FakeRequestLogger:
 class FakeLogEntry(dict[str, object]):
     def __getattr__(self, name: str) -> object:
         return self.get(name)
+
+
+def test_stats_exposes_actual_running_rollout_snapshot() -> None:
+    rollout = resolve_rollout(
+        {
+            "HEADROOM_ROLLOUT_CHANNEL": "canary",
+            "HEADROOM_FEATURES": "tool_result_interceptors",
+        }
+    )
+    app = create_app(
+        ProxyConfig(
+            rollout=rollout,
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            http2=False,
+        )
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        payload = client.get("/stats").json()["rollout"]
+
+    assert payload == rollout.to_dict()
+    assert payload["qualification_eligible"] is True
 
 
 def test_stats_refreshes_recent_requests_when_cached() -> None:

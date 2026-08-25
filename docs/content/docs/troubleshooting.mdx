@@ -223,6 +223,18 @@ See [issue #746](https://github.com/headroomlabs-ai/headroom/issues/746) for the
 
 `ENABLE_TOOL_SEARCH` is unaffected and can stay enabled for context-window savings while routing through Headroom.
 
+## Server-managed settings unavailable through custom ANTHROPIC_BASE_URL
+
+**Symptom**: Settings pushed from **Admin Settings > Claude Code > Managed settings** in the claude.ai console (server-managed settings) don't apply to sessions running through Headroom, even though they apply fine without the proxy.
+
+**Cause**: This is a Claude-side gate, not a Headroom limitation. Per Anthropic's docs, server-managed settings require a direct connection to `api.anthropic.com`; if `ANTHROPIC_BASE_URL` is set to any non-default host — which is exactly what wrapping via Headroom does — Claude Code skips the settings fetch entirely for that session. The request never reaches Headroom, so there is no endpoint for Headroom to implement or proxy.
+
+This is separate from the OS-level `managed-settings.json` file (macOS `/Library/Application Support/ClaudeCode/`, Linux `/etc/claude-code/`, Windows `C:\Program Files\ClaudeCode\`): that file is read straight from local disk at startup and is unaffected by `ANTHROPIC_BASE_URL` or Headroom. If that file isn't taking effect, the cause is unrelated to proxying (path, permissions, or JSON syntax) — check `claude --debug-file <path>` and search the log for `Remote settings`.
+
+**Fix**: None available on the Headroom side — this is an intentional Anthropic security boundary (a proxy in the path could otherwise forge org policy). If your org relies on server-managed settings, deploy the same policy as [endpoint-managed settings](https://code.claude.com/docs/en/settings#settings-files) (MDM profile, Windows registry, or a local `managed-settings.json`) instead, since those are read locally and unaffected by proxying.
+
+See [Server-managed settings platform availability](https://code.claude.com/docs/en/server-managed-settings#platform-availability) and [issue #3074](https://github.com/headroomlabs-ai/headroom/issues/3074).
+
 ## Compression Too Aggressive
 
 **Symptom**: LLM responses are missing information that was in tool outputs.

@@ -415,7 +415,7 @@ Everything in this repo stays open source (Apache 2.0). The managed offering is 
 uv tool install --python 3.13 "headroom-ai[all]"  # CLI, isolated app env
 pip install "headroom-ai[all]"                    # Python, everything — includes the `headroom` CLI
 npm install headroom-ai                           # TypeScript SDK (library only — no `headroom` CLI)
-docker pull ghcr.io/chopratejas/headroom:latest
+docker pull ghcr.io/headroomlabs-ai/headroom:latest
 ```
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-v2-base), `[code]`, `[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in `[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.

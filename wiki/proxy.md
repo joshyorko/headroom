@@ -323,13 +323,18 @@ The provider caches the bytes you *forwarded*, which compression already changed
 
 ```python
 forwarded = []
+
+
 def next_turn(new_messages):
-    r = requests.post(f"{proxy}/v1/compress", json={
-        "messages": forwarded + new_messages,
-        "model": "claude-sonnet-4-6",
-        "config": {"frozen_message_count": len(forwarded)},
-    }).json()
-    forwarded[:] = r["messages"]   # next turn's frozen prefix
+    r = requests.post(
+        f"{proxy}/v1/compress",
+        json={
+            "messages": forwarded + new_messages,
+            "model": "claude-sonnet-4-6",
+            "config": {"frozen_message_count": len(forwarded)},
+        },
+    ).json()
+    forwarded[:] = r["messages"]  # next turn's frozen prefix
     return forwarded
 ```
 

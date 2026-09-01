@@ -38,6 +38,16 @@ def test_kamal_proxy_allows_long_running_generation_requests() -> None:
     deploy_config = (Path(__file__).parents[1] / "config" / "deploy.yml").read_text()
 
     assert "response_timeout: <%= headroom_request_timeout %>" in deploy_config
+    assert (
+        'HEADROOM_WRITE_TIMEOUT_SECONDS: "<%= headroom_write_timeout_seconds %>"' in deploy_config
+    )
+
+
+def test_kamal_config_removes_unused_effort_settings() -> None:
+    deploy_config = (Path(__file__).parents[1] / "config" / "deploy.yml").read_text()
+
+    assert "HEADROOM_EFFORT_ROUTER" not in deploy_config
+    assert "HEADROOM_MECHANICAL_EFFORT" not in deploy_config
 
 
 def test_kamal_proxy_exposes_trusted_dashboard_cidr_settings() -> None:

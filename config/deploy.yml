@@ -16,12 +16,12 @@ headroom_memory_injection_mode = ENV.fetch("HEADROOM_MEMORY_INJECTION_MODE", "li
 headroom_strip_internal_headers = ENV.fetch("HEADROOM_STRIP_INTERNAL_HEADERS", "enabled")
 headroom_output_shaper = ENV.fetch("HEADROOM_OUTPUT_SHAPER", "1")
 headroom_output_holdout = ENV.fetch("HEADROOM_OUTPUT_HOLDOUT", "0.10")
-headroom_effort_router = ENV.fetch("HEADROOM_EFFORT_ROUTER", "1")
 headroom_target_ratio = ENV.fetch("HEADROOM_TARGET_RATIO", "0.4")
 headroom_memory_top_k = ENV.fetch("HEADROOM_MEMORY_TOP_K", "5")
 headroom_min_evidence = ENV.fetch("HEADROOM_MIN_EVIDENCE", "3")
 headroom_memory_context_timeout_seconds = ENV.fetch("HEADROOM_MEMORY_CONTEXT_TIMEOUT_SECONDS", "1.0")
 headroom_request_timeout = ENV.fetch("HEADROOM_REQUEST_TIMEOUT", "600")
+headroom_write_timeout_seconds = ENV.fetch("HEADROOM_WRITE_TIMEOUT_SECONDS", headroom_request_timeout)
 headroom_proxy_trusted_gateway_cidrs = ENV.fetch(
   "HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", ""
 )
@@ -140,6 +140,7 @@ env:
     HEADROOM_MIN_EVIDENCE: "<%= headroom_min_evidence %>"
     HEADROOM_MEMORY_CONTEXT_TIMEOUT_SECONDS: "<%= headroom_memory_context_timeout_seconds %>"
     HEADROOM_REQUEST_TIMEOUT: "<%= headroom_request_timeout %>"
+    HEADROOM_WRITE_TIMEOUT_SECONDS: "<%= headroom_write_timeout_seconds %>"
     HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS: "<%= headroom_proxy_trusted_gateway_cidrs %>"
     HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS: "<%= headroom_proxy_trusted_dashboard_client_cidrs %>"
     HEADROOM_MEMORY_INJECTION_MODE: "<%= headroom_memory_injection_mode %>"
@@ -155,8 +156,6 @@ env:
 <% unless headroom_verbosity_level.empty? %>
     HEADROOM_VERBOSITY_LEVEL: "<%= headroom_verbosity_level %>"
 <% end %>
-    HEADROOM_EFFORT_ROUTER: "<%= headroom_effort_router %>"
-    HEADROOM_MECHANICAL_EFFORT: low
     HEADROOM_LOG_MESSAGES: "0"
     HEADROOM_DEBUG_DUMP: "<%= headroom_debug_dump %>"
     HEADROOM_WS_ORIGINS: "<%= headroom_ws_origins %>"

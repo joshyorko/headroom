@@ -1009,7 +1009,15 @@ def test_anthropic_tools_unsorted_order_preserves_byte_faithful_request() -> Non
     assert [tool["name"] for tool in forwarded["tools"]] == ["zeta", "alpha"]
 
 
-def test_anthropic_tools_unsorted_reordered_and_canonicalized_when_optimized() -> None:
+def test_anthropic_tools_unsorted_reordered_and_canonicalized_when_optimized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This asserts an exact upstream body to pin *tool* canonicalization, so
+    # isolate it from output shaping, which is on by default for an optimized
+    # proxy and appends a steering block to the system tail. Shaping is
+    # covered by its own suites; folding its text into this expectation would
+    # make a tool-ordering test fail every time the steering copy is edited.
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "0")
     client, transport = _make_anthropic_app(optimize=True)
     proxy = client.app.state.proxy
     proxy.config.mode = "token"

@@ -294,11 +294,18 @@
                                 </div>
                                 <div class="mt-1 text-xs text-gray-500 leading-relaxed"
                                      x-show="stats.tokens?.output_reduction?.estimate_reliable && stats.tokens?.output_reduction?.display_tokens_saved !== null && stats.tokens?.output_reduction?.display_tokens_saved !== undefined">
-                                    <!-- "measured" = A/B holdout (unbiased); "estimated" = vs learned baseline -->
+                                    <!-- measured = A/B holdout (unbiased) · estimated = vs learned
+                                         baseline · modelled = benchmark factor, not this traffic -->
                                     <span class="uppercase tracking-wide"
-                                          :class="stats.tokens?.output_reduction?.method === 'measured' ? 'text-emerald-400' : 'text-gray-400'"
-                                          x-text="stats.tokens?.output_reduction?.method === 'estimated' ? 'estimated counterfactual' : (stats.tokens?.output_reduction?.method || '')"></span>
-                                    <span x-text="'· 95% CI ' + (stats.tokens?.output_reduction?.ci_low_percent || 0).toFixed(1) + '–' + (stats.tokens?.output_reduction?.ci_high_percent || 0).toFixed(1) + '%'"></span>
+                                          :class="{
+                                            'text-emerald-400': stats.tokens?.output_reduction?.method === 'measured',
+                                            'text-gray-400': stats.tokens?.output_reduction?.method === 'estimated',
+                                            'text-amber-500': stats.tokens?.output_reduction?.method === 'modelled'
+                                          }"
+                                          x-text="stats.tokens?.output_reduction?.method || ''"></span>
+                                    <!-- A modelled band is the spread between the two benchmarked
+                                         models, not a sampling CI. Calling it one would be a lie. -->
+                                    <span x-text="'· ' + (stats.tokens?.output_reduction?.band_is_ci === false ? 'range ' : '95% CI ') + (stats.tokens?.output_reduction?.ci_low_percent || 0).toFixed(1) + '–' + (stats.tokens?.output_reduction?.ci_high_percent || 0).toFixed(1) + '%'"></span>
                                 </div>
                                 <div class="mt-1 text-xs text-gray-600 leading-relaxed"
                                      :title="'raw estimate: ' + formatNumber(stats.tokens?.output_reduction?.tokens_saved || 0) + ' tokens, CI ' + (stats.tokens?.output_reduction?.ci_low_percent || 0).toFixed(1) + '–' + (stats.tokens?.output_reduction?.ci_high_percent || 0).toFixed(1) + '%, reasons: ' + ((stats.tokens?.output_reduction?.estimate_reasons || []).join(', ') || 'none')"
@@ -306,13 +313,23 @@
                                         ? formatNumber(stats.tokens.output_reduction.requests) + ' shaped responses · ' + (stats.tokens.output_reduction.estimate_reliable && stats.tokens.output_reduction.display_tokens_saved !== null && stats.tokens.output_reduction.display_tokens_saved !== undefined ? (stats.tokens.output_reduction.method === 'estimated' ? 'estimated counterfactual' : (stats.tokens.output_reduction.method || 'measured')) : 'estimate ' + (stats.tokens.output_reduction.estimate_quality || stats.tokens.output_reduction.estimate_status || 'warming'))
                                         : formatNumber(stats.savings?.by_layer?.output_shaping?.applied_requests || 0) + ' shaped responses · steering applied'">
                                 </div>
+                                <template x-if="stats.tokens?.output_reduction?.method === 'modelled'">
+                                    <div class="mt-1 text-xs text-amber-600/80 leading-relaxed">
+                                        Approximate: a benchmark factor, not your traffic. Set
+                                        <code class="text-gray-400">HEADROOM_OUTPUT_HOLDOUT=0.05</code>
+                                        to measure it for real.
+                                    </div>
+                                </template>
                             </div>
                         </template>
                         <template x-if="!stats.tokens?.output_reduction?.available">
                             <div class="mt-1 text-xs text-gray-500 leading-relaxed">
                                 <span class="text-2xl font-light tabular-nums text-gray-600">—</span>
-                                <div class="mt-1">Enable the beta output shaper (HEADROOM_ROLLOUT_CHANNEL=beta HEADROOM_OUTPUT_SHAPER=1) and run
-                                    <code class="text-gray-400">headroom learn --verbosity --apply</code> to start measuring.</div>
+                                <div class="mt-1">Enable the beta output shaper
+                                    (<code class="text-gray-400">HEADROOM_ROLLOUT_CHANNEL=beta HEADROOM_OUTPUT_SHAPER=1</code>)
+                                    and run
+                                    <code class="text-gray-400">headroom learn --verbosity --apply</code>
+                                    to start measuring.</div>
                             </div>
                         </template>
                     </div>

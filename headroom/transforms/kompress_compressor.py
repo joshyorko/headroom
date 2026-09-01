@@ -1243,6 +1243,12 @@ class KompressConfig:
     model_id: str = HF_MODEL_ID
     chunk_words: int = 350
     score_threshold: float = 0.5
+    # Lossy word-dropping below this size is a net loss: the CCR retrieval
+    # marker alone is ~20 words, and short blocks are disproportionately
+    # instruction-like (sanitizer banners, section headers) where dropped
+    # words read as garbling rather than compression. Values below the
+    # historical floor of 10 are clamped up to it.
+    min_input_words: int = 64
 
 
 @dataclass
@@ -1268,6 +1274,26 @@ class KompressResult:
         return (self.tokens_saved / self.original_tokens) * 100
 
 
+def ccr_retrieval_marker(
+    n_words: int, compressed_count: int, ccr_source: str, cache_key: str
+) -> str:
+    """The retrieval marker appended after a lossy Kompress pass.
+
+    Says "words" — Kompress drops words from prose; the counts are word
+    counts. The old wording said "items", which models (and humans) read
+    as an item-structured payload that compression mangled. The source
+    line span is reported so a reader can tell content was compressed
+    away rather than absent (#2586).
+    """
+    source_lines = ccr_source.count("\n") + 1
+    line_word = "line" if source_lines == 1 else "lines"
+    return (
+        f"\n[{n_words} words compressed to {compressed_count}"
+        f" (from {source_lines} source {line_word})."
+        f" Retrieve more: hash={cache_key}]"
+    )
+
+
 def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) -> str | None:
     """Store an original->compressed mapping in the proxy-local CCR store and
     return its retrieval hash (or None on any failure).
@@ -1288,8 +1314,12 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
             compressed,
             original_tokens=original_tokens,
             compressed_tokens=compressed_tokens,
-            original_item_count=original_tokens,
-            compressed_item_count=compressed_tokens,
+            # No item counts: kompress compresses prose, not item lists.
+            # These fields used to carry the word counts, so a retrieval
+            # of a 33-word banner reported "original_item_count: 33" — a
+            # model (and a debugging human) reads that as a 33-item data
+            # structure that compression mangled. Token counts already
+            # carry the size story in their own fields above.
             tool_signature_hash=signature.structure_hash,
             compression_strategy="kompress",
         )
@@ -1477,7 +1507,7 @@ class KompressCompressor(Transform):
         words = content.split()
         n_words = len(words)
 
-        if n_words < 10 or self._degraded_reason is not None:
+        if n_words < max(10, self.config.min_input_words) or self._degraded_reason is not None:
             return self._passthrough(content, n_words)
 
         # Cooperative wall-clock budget (#1171): kompress ONNX inference is
@@ -1696,12 +1726,8 @@ class KompressCompressor(Transform):
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    source_lines = ccr_source.count("\n") + 1
-                    line_word = "line" if source_lines == 1 else "lines"
-                    result.compressed += (
-                        f"\n[{n_words} items compressed to {compressed_count}"
-                        f" (from {source_lines} source {line_word})."
-                        f" Retrieve more: hash={cache_key}]"
+                    result.compressed += ccr_retrieval_marker(
+                        n_words, compressed_count, ccr_source, cache_key
                     )
 
             if inference_ms >= 1000.0:
@@ -1887,9 +1913,10 @@ class KompressCompressor(Transform):
 
         # Short texts short-circuit to passthrough — no model call needed.
         max_chunk_words = self.config.chunk_words
+        _floor = max(10, self.config.min_input_words)
         chunk_queue: list[tuple[int, int, list[str], float | None]] = []
         for i, (words, ratio) in enumerate(zip(word_lists, ratios, strict=True)):
-            if len(words) < 10:
+            if len(words) < _floor:
                 results[i] = self._passthrough(contents[i], len(words))
                 continue
             for chunk_start in range(0, len(words), max_chunk_words):
@@ -2094,12 +2121,8 @@ class KompressCompressor(Transform):
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    source_lines = ccr_source.count("\n") + 1
-                    line_word = "line" if source_lines == 1 else "lines"
-                    result.compressed += (
-                        f"\n[{n_words} items compressed to {compressed_count}"
-                        f" (from {source_lines} source {line_word})."
-                        f" Retrieve more: hash={cache_key}]"
+                    result.compressed += ccr_retrieval_marker(
+                        n_words, compressed_count, ccr_source, cache_key
                     )
 
             results[text_idx] = result
@@ -2196,7 +2219,9 @@ class KompressCompressor(Transform):
             role = message.get("role", "")
             content = message.get("content", "")
 
-            if not isinstance(content, str) or len(content.split()) < 10:
+            if not isinstance(content, str) or len(content.split()) < max(
+                10, self.config.min_input_words
+            ):
                 transformed.append(message)
                 continue
 

@@ -965,6 +965,26 @@ class PrefixCacheTracker:
     def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._last_forwarded_messages)
 
+    def record_returned(
+        self,
+        original_messages: list[dict[str, Any]],
+        returned_messages: list[dict[str, Any]],
+    ) -> None:
+        """Record the compressed form handed back to a compress-only caller.
+
+        Sidecar mode (session-aware ``/v1/compress``): Headroom does not
+        forward upstream, but whatever it RETURNS is what the caller forwards
+        — the same fact ``update_from_response`` records in proxy mode, just
+        captured at return time instead of send time. Only the transcript
+        snapshots and the activity clock move here; frozen-prefix counts are
+        left untouched because no provider response has confirmed anything
+        yet — they advance when the caller relays usage via ``/v1/usage``
+        (``update_from_response``), or stay at their conservative local value.
+        """
+        self._last_activity = time.time()
+        self._last_original_messages = copy.deepcopy(original_messages)
+        self._last_forwarded_messages = copy.deepcopy(returned_messages)
+
     def resolved_cache_ttl_seconds(self) -> int:
         """Effective prompt-cache lifetime for this session's provider."""
         if self.config.cache_ttl_seconds is not None:
@@ -1248,6 +1268,26 @@ class SessionTrackerStore:
         # but different tool profiles must never share frozen-prefix state.
         self._lineage_affinities: dict[str, str | None] = {}
         self._lineage_counter = itertools.count(1)
+
+    def peek(self, session_id: str) -> PrefixCacheTracker | None:
+        """Return the live tracker for ``session_id``, else None.
+
+        Never creates: lookup paths that must not leave a footprint (e.g. the
+        ``/v1/usage`` unknown-session check, where ``get_or_create`` would let
+        a flood of novel ids grow the store unboundedly within each TTL
+        window) use this instead of :meth:`get_or_create`.
+
+        A TTL-expired-but-unswept tracker answers None too: the sweep runs
+        lazily from get_or_create at 60s granularity, so without this check an
+        expired session would keep answering with stale pre-expiry state — and
+        a caller that then touched it (``update_from_response`` stamps
+        ``_last_activity``) would resurrect the dead tracker indefinitely,
+        making the documented 404-on-expired contract nondeterministic.
+        """
+        tracker = self._trackers.get(session_id)
+        if tracker is None or tracker.is_expired:
+            return None
+        return tracker
 
     def get_or_create(self, session_id: str, provider: str) -> PrefixCacheTracker:
         """Get existing tracker or create a new one for this session."""

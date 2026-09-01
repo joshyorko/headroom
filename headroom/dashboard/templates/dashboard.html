@@ -248,7 +248,34 @@
                         </div>
                     </div>
 
-                    <!-- Output Shaping (counterfactual) -->
+                    <!-- Cost Saved: dollars Headroom itself kept off the bill
+                         (compression + tool-schema deferral + extension
+                         attribution), split measured vs projected. The
+                         provider's prefix-cache discount is shown on its own
+                         line, outside the headline — it is paid on cache reads
+                         with or without Headroom. -->
+                    <div class="bg-surface rounded-lg p-4 border border-border">
+                        <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Cost Saved</div>
+                        <div class="flex items-baseline gap-2">
+                            <span class="text-3xl font-light tabular-nums text-emerald-400"
+                                  x-text="'$' + formatCurrency(stats.summary?.cost?.total_saved_usd || 0)"
+                                  title="Dollars Headroom kept off the bill: message compression and tool-schema deferral, priced at what those tokens would actually have been billed given each request's cache mix."></span>
+                            <span class="text-sm text-emerald-400"
+                                  x-text="(stats.summary?.cost?.savings_pct || 0).toFixed(1) + '%'"
+                                  title="Total saved as a fraction of the without-Headroom baseline"></span>
+                        </div>
+                        <div class="mt-1 text-xs text-gray-500 leading-relaxed"
+                             x-text="'Measured $' + formatCurrency(stats.summary?.cost?.measured_saved_usd || 0) + ' · projected $' + formatCurrency(stats.summary?.cost?.projected_saved_usd || 0)"
+                             title="Measured: compression and tool-schema deferral. Projected: extension-attributed estimates such as model routing."></div>
+                        <div class="mt-1 text-xs text-gray-600 leading-relaxed"
+                             x-text="'$' + formatCurrency(stats.summary?.cost?.with_headroom_usd || 0) + ' spent vs $' + formatCurrency(stats.summary?.cost?.without_headroom_usd || 0) + ' baseline'"
+                             title="Spend is input + output at the provider's billed rates."></div>
+                        <div class="mt-1 text-xs text-cyan-600 leading-relaxed"
+                             x-text="'+ $' + formatCurrency(stats.summary?.cost?.provider_cache_discount_usd || 0) + ' provider cache discount'"
+                             title="Discount the provider gives on prompt-cache reads. Headroom's CacheAligner and prefix freeze raise the hit rate, but the discount is provider-native, so it is not counted as Headroom savings."></div>
+                    </div>
+
+                    <!-- Output Shaping / Output Tokens Saved (counterfactual) -->
                     <div class="bg-surface rounded-lg p-4 border border-border">
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1"
                              x-text="stats.tokens?.output_reduction?.estimate_reliable && stats.tokens?.output_reduction?.display_tokens_saved !== null && stats.tokens?.output_reduction?.display_tokens_saved !== undefined ? 'Output Tokens Saved' : 'Output Shaping'"></div>
@@ -884,6 +911,107 @@
                     </template>
                 </div>
 
+                <!-- Model Routing: shown only when a routing-stats provider is
+                     registered (stats.routing; see headroom.proxy.routing_stats). -->
+                <template x-if="(stats.routing?.pairs || []).length > 0">
+                    <div class="bg-surface rounded-lg p-4 border border-border mb-6">
+                        <div class="flex items-center justify-between mb-1">
+                            <span class="text-sm font-medium text-gray-300">Model Routing</span>
+                            <span class="text-xs text-gray-500 font-mono"
+                                  x-text="(stats.routing.downgrades || 0) + ' downgraded · ' + (stats.routing.upgrades || 0) + ' upgraded · ' + (stats.routing.unchanged || 0) + ' unchanged · ' + formatNumber(stats.routing.decisions || 0) + ' decisions'"></span>
+                        </div>
+                        <!-- Two windows, one box. Session answers "is this working for ME,
+                             right now"; lifetime answers "what has this layer been worth".
+                             Neither substitutes for the other: routing savings accrue across
+                             sessions, so session-only understates the layer badly, while a
+                             lifetime total moves ~0.1% per turn and looks frozen during a
+                             live demo. -->
+                        <div class="grid grid-cols-2 gap-3 mb-4">
+                            <!-- THIS SESSION -->
+                            <div class="bg-bg rounded px-3 py-2 border border-border">
+                                <div class="flex items-center gap-1.5 mb-1">
+                                    <span class="relative flex h-2 w-2" x-show="(stats.routing.session?.decisions || 0) > 0">
+                                        <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                                        <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                                    </span>
+                                    <span class="text-xs text-gray-400 uppercase tracking-wide">This session</span>
+                                </div>
+                                <div class="text-xl font-semibold tabular-nums"
+                                     :class="(stats.routing.session?.savings_usd || 0) > 0 ? 'text-emerald-400' : 'text-gray-500'"
+                                     x-text="'$' + formatCurrency(stats.routing.session?.savings_usd || 0)"></div>
+                                <div class="text-xs text-gray-500 font-mono mt-0.5"
+                                     x-text="formatNumber(stats.routing.session?.decisions || 0) + ' decisions · '
+                                             + (stats.routing.session?.downgrades || 0) + ' downgraded · '
+                                             + (stats.routing.session?.unchanged || 0) + ' kept'"></div>
+                                <!-- "Kept" is the router working, not idling: against a warm
+                                     prefix cache, switching costs a cold write on the target
+                                     that usually exceeds the cheaper per-token rate. Without
+                                     this the panel reads as broken during exactly the
+                                     sessions where the router is behaving correctly. -->
+                                <div class="text-xs text-gray-600 mt-1 leading-snug"
+                                     x-show="(stats.routing.session?.decisions || 0) > 0
+                                             && (stats.routing.session?.downgrades || 0) === 0"
+                                     title="Every turn was evaluated. Keeping the model is the correct call when the prefix cache is warm — switching would pay a cold write on the target.">
+                                    Evaluating every turn; cache is warm, so switching would cost more than it saves.
+                                </div>
+                            </div>
+                            <!-- ALL TIME -->
+                            <div class="bg-bg rounded px-3 py-2 border border-border">
+                                <div class="text-xs text-gray-400 uppercase tracking-wide mb-1">All time</div>
+                                <div class="text-xl font-semibold tabular-nums"
+                                     :class="(stats.routing.savings_usd || 0) > 0 ? 'text-emerald-400' : 'text-gray-500'"
+                                     x-text="'$' + formatCurrency(stats.routing.savings_usd || 0)"></div>
+                                <div class="text-xs text-gray-500 font-mono mt-0.5"
+                                     x-text="formatNumber(stats.routing.decisions || 0) + ' decisions · '
+                                             + (stats.routing.downgrades || 0) + ' downgraded · '
+                                             + (stats.routing.unchanged || 0) + ' kept'"></div>
+                                <div class="text-xs text-gray-600 mt-1 leading-snug">
+                                    Survives restarts — kept in routemegood's decision log, not proxy memory.
+                                </div>
+                            </div>
+                        </div>
+                        <div class="text-xs text-gray-500 mb-2">Every decision on record, by requested → served pair</div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm">
+                                <thead>
+                                    <tr class="text-xs text-gray-500 uppercase tracking-wide text-left">
+                                        <th class="py-1 pr-2 font-medium">Requested</th>
+                                        <th class="py-1 pr-2 font-medium"></th>
+                                        <th class="py-1 pr-4 font-medium">Served</th>
+                                        <th class="py-1 pr-4 font-medium text-right">Requests</th>
+                                        <th class="py-1 pr-4 font-medium text-right">Enforced</th>
+                                        <th class="py-1 pr-4 font-medium text-right">Holdout</th>
+                                        <th class="py-1 pr-4 font-medium text-right">Measured</th>
+                                        <th class="py-1 font-medium text-right">Saved</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <template x-for="p in stats.routing.pairs" :key="p.requested + '>' + p.served">
+                                        <tr class="border-t border-border">
+                                            <td class="py-1.5 pr-2 font-mono text-xs" x-text="p.requested"></td>
+                                            <td class="py-1.5 pr-2 text-xs"
+                                                :class="p.direction === 'downgrade' ? 'text-emerald-400' : (p.direction === 'upgrade' ? 'text-amber-400' : 'text-gray-500')"
+                                                x-text="p.direction === 'downgrade' ? '↓' : (p.direction === 'upgrade' ? '↑' : '→')"></td>
+                                            <td class="py-1.5 pr-4 font-mono text-xs" x-text="p.served"></td>
+                                            <td class="py-1.5 pr-4 text-right tabular-nums" x-text="formatNumber(p.count)"></td>
+                                            <td class="py-1.5 pr-4 text-right tabular-nums" x-text="formatNumber(p.enforced)"></td>
+                                            <td class="py-1.5 pr-4 text-right tabular-nums text-gray-500" x-text="formatNumber(p.holdout)"></td>
+                                            <td class="py-1.5 pr-4 text-right tabular-nums text-gray-500" x-text="formatNumber(p.measured)"></td>
+                                            <td class="py-1.5 text-right tabular-nums"
+                                                :class="p.savings_usd > 0 ? 'text-emerald-400' : (p.savings_usd < 0 ? 'text-red-400' : 'text-gray-500')"
+                                                x-text="(p.savings_usd < 0 ? '-$' : '$') + formatCurrency(Math.abs(p.savings_usd || 0))"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="mt-2 text-xs text-gray-600">
+                            Saved = measured baseline-model cost minus served cost, on rerouted rows with provider-reported usage.
+                            The requested model is a ceiling; holdout rows stay unrouted as the control arm.
+                        </div>
+                    </div>
+                </template>
+
                 <!-- Recent Requests Table (with expandable rows) -->
                 <div class="bg-surface rounded-lg border border-border overflow-hidden mb-6">
                     <div class="px-4 py-3 border-b border-border flex justify-between items-center">
@@ -900,7 +1028,8 @@
                                 <div class="px-4 py-3 font-medium">Model</div>
                                 <div class="px-4 py-3 font-medium text-right">Input</div>
                                 <div class="px-4 py-3 font-medium text-right">Output</div>
-                                <div class="px-4 py-3 font-medium text-right">Saved</div>
+                                <div class="px-4 py-3 font-medium text-right"
+                                     title="Message-compression share of this request only. Tool-schema deferral, cache discounts and routing savings are counted in the headline cards, not per row.">Msg&nbsp;Saved</div>
                                 <div class="px-4 py-3 font-medium text-right">Latency</div>
                             </div>
                             <!-- Data rows -->

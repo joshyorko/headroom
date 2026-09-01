@@ -36,7 +36,7 @@ _ORPHAN_OPENAI_BASE_URL = re.compile(
     r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n'
 )
 _ORPHAN_REALTIME_BASE_URL = re.compile(
-    r'(?m)^[ \t]*experimental_realtime_(?:webrtc_call|ws)_base_url[ \t]*=[ \t]*'
+    r"(?m)^[ \t]*experimental_realtime_(?:webrtc_call|ws)_base_url[ \t]*=[ \t]*"
     r'"http://127\.0\.0\.1:\d+/(?:v1|backend-api/codex)"[ \t]*\r?\n'
 )
 _ORPHAN_HEADROOM_TABLE = re.compile(

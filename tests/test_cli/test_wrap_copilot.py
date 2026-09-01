@@ -322,17 +322,16 @@ def test_wrap_copilot_prefers_existing_oauth_session(
     assert result.exit_code == 0, result.output
     env = captured["env"]
     assert isinstance(env, dict)
-    assert env["COPILOT_PROVIDER_TYPE"] == "openai"
-    assert env["COPILOT_PROVIDER_BASE_URL"] == (
-        f"http://127.0.0.1:8787{_expected_copilot_prefix()}/v1"
-    )
-    assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
-    assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-existing"
+    assert env["COPILOT_API_URL"] == f"http://127.0.0.1:8787{_expected_copilot_prefix()}"
+    assert "COPILOT_PROVIDER_TYPE" not in env
+    assert "COPILOT_PROVIDER_BASE_URL" not in env
+    assert "COPILOT_PROVIDER_WIRE_API" not in env
+    assert "COPILOT_PROVIDER_BEARER_TOKEN" not in env
     assert env["GITHUB_COPILOT_API_URL"] == DEFAULT_API_URL
     assert env["OPENAI_TARGET_API_URL"] == DEFAULT_API_URL
     assert "COPILOT_PROVIDER_API_KEY" not in env
     assert captured["openai_api_url"] == DEFAULT_API_URL
-    assert f"COPILOT_PROVIDER_API_URL={DEFAULT_API_URL}" in captured["env_vars_display"]
+    assert "COPILOT_AUTH_MODE=github-native" in captured["env_vars_display"]
 
 
 @pytest.mark.parametrize(
@@ -349,7 +348,7 @@ def test_wrap_copilot_oauth_defaults_wire_api_for_selected_model(
     model: str,
     expected_wire_api: str,
 ) -> None:
-    """OAuth sessions use the same model-aware wire API default as subscriptions."""
+    """Implicit OAuth leaves wire selection to Copilot's native router."""
     _wrap_cli, main = wrap_modules
     _clear_copilot_env(monkeypatch)
     captured: dict[str, object] = {}
@@ -371,8 +370,8 @@ def test_wrap_copilot_oauth_defaults_wire_api_for_selected_model(
     assert result.exit_code == 0, result.output
     env = captured["env"]
     assert isinstance(env, dict)
-    assert env["COPILOT_PROVIDER_WIRE_API"] == expected_wire_api
-    assert f"COPILOT_PROVIDER_WIRE_API={expected_wire_api}" in captured["env_vars_display"]
+    assert "COPILOT_PROVIDER_WIRE_API" not in env
+    assert env["COPILOT_API_URL"].startswith("http://127.0.0.1:8787")
 
 
 @pytest.mark.parametrize("wire_api", ["completions", "responses"])
@@ -404,7 +403,8 @@ def test_wrap_copilot_oauth_honors_existing_wire_api(
     assert result.exit_code == 0, result.output
     env = captured["env"]
     assert isinstance(env, dict)
-    assert env["COPILOT_PROVIDER_WIRE_API"] == wire_api
+    assert "COPILOT_PROVIDER_WIRE_API" not in env
+    assert env["COPILOT_API_URL"].startswith("http://127.0.0.1:8787")
 
 
 def test_wrap_copilot_subscription_uses_github_auth_without_provider_key(
@@ -1012,7 +1012,8 @@ def test_wrap_copilot_oauth_keeps_generic_endpoint_when_account_advertised(
     assert result.exit_code == 0, result.output
     env = captured["env"]
     assert isinstance(env, dict)
-    assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-oauth"
+    assert "COPILOT_PROVIDER_BEARER_TOKEN" not in env
+    assert env["COPILOT_API_URL"].startswith("http://127.0.0.1:8787")
     assert captured["openai_api_url"] == DEFAULT_API_URL
     assert env["OPENAI_TARGET_API_URL"] == DEFAULT_API_URL
     assert env["GITHUB_COPILOT_API_URL"] == DEFAULT_API_URL
@@ -1059,6 +1060,52 @@ def test_wrap_copilot_oauth_proxy_url_encodes_generic_upstream(
         f"{_expected_copilot_prefix()}"
         f"/_copilot/{_encoded_copilot_api_url(DEFAULT_API_URL)}/v1"
     )
+
+
+def test_wrap_copilot_native_remote_proxy_encodes_upstream_and_preserves_prefixes(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native routing must not bypass a reused remote proxy or lose attribution."""
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution("gho-native"),
+        ),
+        patch("headroom.cli.wrap._native_api_url_supported", return_value=True),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "copilot",
+                "--native",
+                "--no-rtk",
+                "--proxy-url",
+                "http://10.10.10.89/dashboard/",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_API_URL"] == (
+        "http://10.10.10.89"
+        f"{_expected_copilot_prefix()}"
+        f"/_copilot/{_encoded_copilot_api_url(DEFAULT_API_URL)}"
+    )
+    assert not any(key.startswith("COPILOT_PROVIDER_") for key in env)
+    assert captured["no_proxy"] is True
 
 
 def test_wrap_copilot_oauth_honors_api_url_override(

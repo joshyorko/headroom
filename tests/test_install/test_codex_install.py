@@ -52,8 +52,7 @@ def test_keyring_chatgpt_auth_emits_provider_flag(monkeypatch, tmp_path: Path) -
     content = config.read_text(encoding="utf-8")
     assert "requires_openai_auth = true" in content
     assert (
-        'experimental_realtime_webrtc_call_base_url = '
-        '"http://127.0.0.1:8787/backend-api/codex"'
+        'experimental_realtime_webrtc_call_base_url = "http://127.0.0.1:8787/backend-api/codex"'
     ) in content
     assert 'experimental_realtime_ws_base_url = "http://127.0.0.1:8787/v1"' in content
 
@@ -71,9 +70,7 @@ def test_keyring_non_chatgpt_auth_keeps_provider_flag_off(monkeypatch, tmp_path:
 
     content = config.read_text(encoding="utf-8")
     assert "requires_openai_auth" not in content
-    assert (
-        'experimental_realtime_webrtc_call_base_url = "http://127.0.0.1:8787/v1"'
-    ) in content
+    assert ('experimental_realtime_webrtc_call_base_url = "http://127.0.0.1:8787/v1"') in content
     assert 'experimental_realtime_ws_base_url = "http://127.0.0.1:8787/v1"' in content
 
 

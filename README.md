@@ -283,7 +283,13 @@ For GitHub.com Enterprise Cloud URLs such as
 override. Headroom uses GitHub's normal token-exchange endpoint and the Copilot
 API endpoint advertised for the signed-in account.
 
-Platform support note: macOS auth reuse via Copilot CLI Keychain storage has been smoke-tested. Windows Credential Manager, Linux Secret Service / `secret-tool`, and Docker/CI token-injection paths are implemented or planned as auth-discovery paths, but still need real OS validation before they should be considered fully vetted. For Docker and CI, prefer passing an explicit `GITHUB_COPILOT_TOKEN` or `GITHUB_COPILOT_GITHUB_TOKEN` rather than relying on host keychain access.
+Platform support note: macOS auth reuse via Copilot CLI Keychain storage and
+Windows Headroom device authentication have been live-tested. Copilot CLI 1.0.81
+does not expose its working Windows login through the legacy Credential Manager
+schema Headroom recognizes, so run `headroom copilot-auth login` on Windows.
+Linux Secret Service / `secret-tool` reuse still needs real OS validation. For
+Docker and CI, prefer passing an explicit `GITHUB_COPILOT_TOKEN` or
+`GITHUB_COPILOT_GITHUB_TOKEN` rather than relying on host keychain access.
 
 ### GitHub Copilot in Visual Studio Code
 

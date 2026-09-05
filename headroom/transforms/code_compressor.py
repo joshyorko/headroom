@@ -43,8 +43,11 @@ Reference:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
+import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -104,6 +107,109 @@ def _tree_sitter_importable() -> bool:
 
 
 _UNSAFE_TREE_SITTER_LANGUAGES: frozenset[str] = frozenset({"perl"})
+
+# ---------------------------------------------------------------------------
+# Per-language invalid-syntax circuit breaker.
+#
+# The AST pass validates its own output and discards anything that no longer
+# parses ("never serve broken code"), so a misbehaving grammar costs the full
+# compression latency and then throws the work away — measured in the field at
+# 270 discarded TypeScript compressions in one install's retained logs, each
+# preceded by ~1.2s of compressor time. When a language keeps failing its own
+# validation, stop attempting it for a cooldown instead of burning the latency
+# on every request. The static _UNSAFE_TREE_SITTER_LANGUAGES set above is for
+# grammars unsafe to LOAD; this breaker is for grammars that load fine but
+# mangle real code.
+#
+# SCOPE: process-global, deliberately. One pathological payload pauses that
+# language for every session served by this process, which is right for the
+# single-user local proxy this ships as (a failing grammar is a property of the
+# process's tree-sitter build, not of the caller) and wrong for a shared or
+# hosted deployment, where one tenant would pause a language for the others.
+# Keying by tenant needs a caller identity plumbed through the Transform
+# interface, which carries code and language only; until something needs that,
+# HEADROOM_CODE_SYNTAX_BREAKER=0 is the per-deployment opt-out.
+_SYNTAX_BREAKER_WINDOW = 20
+_SYNTAX_BREAKER_MIN_FAILURES = 10
+_SYNTAX_BREAKER_COOLDOWN_S = 1800.0
+_syntax_breaker_lock = threading.Lock()
+_syntax_breaker_outcomes: dict[str, deque[bool]] = {}
+_syntax_breaker_open_until: dict[str, float] = {}
+_syntax_breaker_trips: dict[str, int] = {}
+
+
+def _now() -> float:
+    """Monotonic clock behind one indirection, so tests patch this instead of
+    the real ``time`` module (which anything else running concurrently reads)."""
+    return time.monotonic()
+
+
+def syntax_breaker_status() -> dict[str, dict[str, Any]]:
+    """Per-language breaker state, surfaced on /stats.
+
+    While the breaker is open that language compresses at ratio 1.0, so savings
+    drop with nothing in the payload explaining why. Empty until something
+    trips, so a healthy install carries no extra keys.
+    """
+    now = _now()
+    with _syntax_breaker_lock:
+        languages = set(_syntax_breaker_trips) | set(_syntax_breaker_open_until)
+        return {
+            language: {
+                "open": _syntax_breaker_open_until.get(language, 0.0) > now,
+                "trips": _syntax_breaker_trips.get(language, 0),
+                "reopens_in_seconds": max(
+                    0.0, round(_syntax_breaker_open_until.get(language, 0.0) - now, 1)
+                ),
+            }
+            for language in sorted(languages)
+        }
+
+
+def _syntax_breaker_enabled() -> bool:
+    return os.environ.get("HEADROOM_CODE_SYNTAX_BREAKER", "1").strip().lower() not in (
+        "0",
+        "false",
+        "off",
+    )
+
+
+def _syntax_breaker_open(language: str) -> bool:
+    """True while AST compression for *language* is paused after repeat failures."""
+    if not _syntax_breaker_enabled():
+        return False
+    with _syntax_breaker_lock:
+        if _syntax_breaker_open_until.get(language, 0.0) <= _now():
+            return False
+    logger.debug("Code compression for %s skipped: syntax breaker open", language)
+    return True
+
+
+def _record_syntax_outcome(language: str, valid: bool) -> None:
+    """Track validation outcomes; trip the breaker on a failing window."""
+    if not _syntax_breaker_enabled():
+        return
+    tripped_failures = 0
+    with _syntax_breaker_lock:
+        window = _syntax_breaker_outcomes.setdefault(language, deque(maxlen=_SYNTAX_BREAKER_WINDOW))
+        window.append(valid)
+        failures = sum(1 for ok in window if not ok)
+        if failures >= _SYNTAX_BREAKER_MIN_FAILURES:
+            _syntax_breaker_open_until[language] = _now() + _SYNTAX_BREAKER_COOLDOWN_S
+            _syntax_breaker_trips[language] = _syntax_breaker_trips.get(language, 0) + 1
+            # A fresh window after the cooldown must re-earn the trip.
+            window.clear()
+            tripped_failures = failures
+    if tripped_failures:
+        logger.warning(
+            "Code compression for %s paused for %.0f min: %d of the last %d attempts "
+            "produced invalid syntax and were discarded "
+            "(HEADROOM_CODE_SYNTAX_BREAKER=0 disables this breaker)",
+            language,
+            _SYNTAX_BREAKER_COOLDOWN_S / 60.0,
+            tripped_failures,
+            _SYNTAX_BREAKER_WINDOW,
+        )
 
 
 def _get_parser(language: str) -> Any:
@@ -1227,6 +1333,22 @@ class CodeAwareCompressor(Transform):
                 syntax_valid=True,
             )
 
+        # A language that keeps failing its own output validation gets its
+        # attempts paused (see _record_syntax_outcome) — return the original
+        # without paying the parse/compress latency for work that would be
+        # discarded anyway.
+        if _syntax_breaker_open(detected_lang.value):
+            return CodeCompressionResult(
+                compressed=code,
+                original=code,
+                original_tokens=original_tokens,
+                compressed_tokens=original_tokens,
+                compression_ratio=1.0,
+                language=detected_lang,
+                language_confidence=confidence,
+                syntax_valid=True,
+            )
+
         # Parse and compress
         try:
             compressed, structure, symbol_scores = self._compress_with_ast(
@@ -1250,6 +1372,8 @@ class CodeAwareCompressor(Transform):
                     )
                     compressed_tokens = self._estimate_tokens(compressed, tokenizer)
                     syntax_valid = self._verify_syntax(compressed, detected_lang)
+
+            _record_syntax_outcome(detected_lang.value, syntax_valid)
 
             # If syntax invalid, return original (never serve broken code)
             if not syntax_valid:

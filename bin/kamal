@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if command -v kamal >/dev/null 2>&1; then
-  exec kamal "$@"
+if kamal_path="$(command -v kamal 2>/dev/null)" && {
+  [[ "$kamal_path" != "${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims/"* ]] ||
+    mise which kamal >/dev/null 2>&1
+}; then
+  exec "$kamal_path" "$@"
 fi
 
 exec docker run --rm -it \

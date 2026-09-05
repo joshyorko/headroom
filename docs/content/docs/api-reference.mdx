@@ -563,15 +563,6 @@ aligner = CacheAligner()
 result = aligner.apply(messages, tokenizer)
 ```
 
-### RollingWindow
-
-```python
-from headroom import RollingWindow
-
-window = RollingWindow(config)
-result = window.apply(messages, max_tokens=100000)
-```
-
 ### TransformPipeline
 
 ```python
@@ -580,7 +571,6 @@ from headroom import TransformPipeline, SmartCrusher, CacheAligner
 pipeline = TransformPipeline(transforms=[
     SmartCrusher(),
     CacheAligner(),
-    RollingWindow(),
 ])
 
 # model_limit is required for direct pipeline use — HeadroomClient

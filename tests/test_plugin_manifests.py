@@ -48,7 +48,7 @@ def test_plugin_hooks_json_matches_codex_schema() -> None:
 
 
 def test_plugin_metadata_points_to_upstream_repo() -> None:
-    expected_repo = "https://github.com/chopratejas/headroom"
+    expected_repo = "https://github.com/headroomlabs-ai/headroom"
     marketplace = _load_json(".claude-plugin/marketplace.json")
     claude = _load_json("plugins/headroom-agent-hooks/.claude-plugin/plugin.json")
     assert isinstance(marketplace, dict)

@@ -1691,6 +1691,14 @@ class AnthropicHandlerMixin:
                         compressor.close()
 
             _compression_failed = False
+            # Provider-confirmed frozen count, stashed BEFORE prepare_turn
+            # clamps it against the local byte-replay cache: the overlay's
+            # unconditional-replay floor must cover everything the provider
+            # has cached, not just what local state can byte-replay (the
+            # replay source is the positional prev_fwd snapshot, which does
+            # not depend on the CompressionCache). Stays 0 on paths that
+            # never compute a tracker count (backpressure, cache mode).
+            _confirmed_frozen = 0
             original_messages = messages  # Preserve for 400-retry fallback
             _decision = CompressionDecision.decide(
                 headers=request.headers,
@@ -1766,6 +1774,7 @@ class AnthropicHandlerMixin:
                             prepare_turn,
                         )
 
+                        _confirmed_frozen = max(int(frozen_message_count or 0), 0)
                         _prep = prepare_turn(
                             comp_cache,
                             messages,
@@ -2150,6 +2159,17 @@ class AnthropicHandlerMixin:
                         previous_original_messages,
                         previous_forwarded_messages,
                         count_tokens=tokenizer.count_messages,
+                        # The provider-confirmed prefix is replayed
+                        # unconditionally: those bytes are exactly what the
+                        # provider cached, so declining a byte-larger replay
+                        # there re-forwards freshly recompressed history at
+                        # the full input rate and busts the cache every time
+                        # background compression improves on an
+                        # already-forwarded message. Beyond the confirmed
+                        # floor the size bound still lets improvements
+                        # through, and a collapsed floor (cold cache) lets
+                        # every accumulated improvement land at once.
+                        confirmed_frozen_count=_confirmed_frozen,
                     )
                     _overlay_replayed = _final.replayed
                     if _overlay_replayed:

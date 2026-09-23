@@ -79,6 +79,8 @@ jobs:
               - 'rust-toolchain.toml'
               - 'docker/**'
               - 'Dockerfile'
+              - 'config/deploy.yml'
+              - 'docker-bake.hcl'
               - 'e2e/**'
               - 'scripts/install*'
               - 'pyproject.toml'

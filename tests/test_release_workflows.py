@@ -40,6 +40,9 @@ def test_ci_covers_self_hosted_pushes_and_pull_requests() -> None:
     assert workflow["run-name"] == "CI / ${{ github.ref_name }}"
     assert "self-hosted" in workflow["on"]["push"]["branches"]
     assert "self-hosted" in workflow["on"]["pull_request"]["branches"]
+    native_filter = workflow["jobs"]["changes"]["steps"][1]["with"]["filters"]
+    assert "'config/deploy.yml'" in native_filter
+    assert "'docker-bake.hcl'" in native_filter
 
 
 def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:

@@ -60,7 +60,7 @@ def _expected_headroom_mcp_calls(proxy_url: str) -> list[list[str]]:
         "add",
         "headroom",
         "-s",
-        "user",
+        "project",
         "-e",
         f"HEADROOM_PROXY_URL={proxy_url}",
         "--",
@@ -162,7 +162,7 @@ def _verify_copilot_global(ctx: CaseContext) -> None:
         content = shell_file.read_text(encoding="utf-8")
         for literal in (
             'export COPILOT_PROVIDER_TYPE="openai"',
-            'export COPILOT_PROVIDER_BASE_URL="http://127.0.0.1:9005/v1"',
+            'export COPILOT_PROVIDER_BASE_URL="http://127.0.0.1:9005/c/copilot/_copilot/aHR0cHM6Ly9hcGkuZ2l0aHViY29waWxvdC5jb20/v1"',
             'export COPILOT_PROVIDER_WIRE_API="completions"',
         ):
             if literal not in content:
@@ -180,24 +180,27 @@ def _verify_copilot_global(ctx: CaseContext) -> None:
 
 
 def _verify_codex_local(ctx: CaseContext) -> None:
-    config = (ctx.project / ".codex" / "config.toml").read_text(encoding="utf-8")
+    project_config = (ctx.project / ".codex" / "config.toml").read_text(encoding="utf-8")
+    user_config = (ctx.home / ".codex" / "config.toml").read_text(encoding="utf-8")
     hooks = json.loads((ctx.project / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     profile = init_cli._local_profile(ctx.project)
 
-    if 'base_url = "http://127.0.0.1:9012/v1"' not in config:
-        raise AssertionError("Codex config should point at the requested proxy port (9012)")
-    if 'env_key = "OPENAI_API_KEY"' in config:
+    # Codex provider/auth settings stay user-scoped, while project init owns
+    # hooks and feature flags in the project's .codex directory.
+    if 'base_url = "http://127.0.0.1:9012/v1"' not in user_config:
+        raise AssertionError("Codex user config should point at the requested proxy port (9012)")
+    if 'env_key = "OPENAI_API_KEY"' in user_config:
         raise AssertionError("Codex local init should preserve OAuth and never inject env_key")
     # Bug 3 (#406): requires_openai_auth must be absent from headroom provider blocks.
-    if "requires_openai_auth" in config:
+    if "requires_openai_auth" in user_config:
         raise AssertionError(
             "Codex local init must NOT inject requires_openai_auth into the headroom provider block"
         )
-    if "supports_websockets = true" not in config:
+    if "supports_websockets = true" not in user_config:
         raise AssertionError("Codex local init missing 'supports_websockets = true'")
-    if config.count("[features]") != 1:
-        raise AssertionError("Codex config should keep a single [features] table")
-    _expect_codex_hooks_feature(config)
+    if project_config.count("[features]") != 1:
+        raise AssertionError("Codex project config should keep a single [features] table")
+    _expect_codex_hooks_feature(project_config)
     command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     _expect_hook_command(command, profile)
 

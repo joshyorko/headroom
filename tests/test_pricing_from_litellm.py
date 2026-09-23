@@ -49,7 +49,6 @@ def test_unwrapped_model_forms_drops_leading_segments() -> None:
         ("groq/llama-guard-3-8b", 0.20, 0.20),
         # Non-OpenAI models reachable through the OpenAI-compatible passthrough.
         ("gemini-2.5-flash", 0.30, 2.50),
-        ("deepseek-chat", 0.44, 1.32),
     ],
 )
 def test_provider_prices_models_its_table_never_covered(
@@ -58,6 +57,18 @@ def test_provider_prices_models_its_table_never_covered(
     got_in, got_out = OpenAIProvider()._get_pricing(model)
 
     assert (round(got_in, 2), round(got_out, 2)) == (want_in, want_out)
+
+
+@pytest.mark.parametrize("model", ("deepseek-chat", "deepseek-reasoner"))
+def test_deepseek_compatibility_names_use_v4_flash_pricing(
+    model: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = dict(litellm.model_cost["deepseek/deepseek-v4-flash"])
+    target["input_cost_per_token"] = 0.31 / 1_000_000
+    target["output_cost_per_token"] = 1.23 / 1_000_000
+    monkeypatch.setitem(litellm.model_cost, "deepseek/deepseek-v4-flash", target)
+
+    assert OpenAIProvider()._get_pricing(model) == (0.31, 1.23)
 
 
 def test_explicit_config_outranks_litellm() -> None:

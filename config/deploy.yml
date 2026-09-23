@@ -99,7 +99,7 @@ builder:
   context: .
   dockerfile: Dockerfile
   args:
-    HEADROOM_EXTRAS: proxy,code,memory-stack
+    HEADROOM_EXTRAS: proxy,code,memory-stack,bedrock
 
 env:
   secret:

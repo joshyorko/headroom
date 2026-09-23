@@ -63,7 +63,7 @@ def test_mcp_retrieves_proxy_stored_content(fresh_store) -> None:
     hash_key = get_compression_store().store(original, '{"compressed": true}')
 
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
-    result = asyncio.run(server._retrieve_content(hash_key, query=None))
+    result = asyncio.run(server._retrieve_content(hash_key))
 
     assert result.get("source") == "local"
     assert result["original_content"] == original
@@ -183,16 +183,13 @@ def test_mcp_retrieve_returns_full_content(fresh_store) -> None:
     original content (never empty, never a spurious "not found")."""
     original = "the the the the the the the the the the\n" * 5
     hash_key = get_compression_store().store(original, "<<small>>")
-    # Precondition: the query genuinely matches nothing above the BM25 floor.
-    assert get_compression_store().search(hash_key, "zzqx_nonmatching_token") == []
 
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
-    result = asyncio.run(server._retrieve_content(hash_key, query="zzqx_nonmatching_token"))
+    result = asyncio.run(server._retrieve_content(hash_key))
 
     assert "error" not in result
     assert result.get("source") == "local"
     assert result["original_content"] == original
-    assert result["count"] == 0
 
 
 def test_mcp_retrieve_expired_hash_returns_terminal_guidance(

@@ -50,6 +50,12 @@ def test_kamal_config_removes_unused_effort_settings() -> None:
     assert "HEADROOM_MECHANICAL_EFFORT" not in deploy_config
 
 
+def test_kamal_image_includes_every_advertised_runtime_extra() -> None:
+    deploy_config = (Path(__file__).parents[1] / "config" / "deploy.yml").read_text()
+
+    assert "HEADROOM_EXTRAS: proxy,code,memory-stack,bedrock" in deploy_config
+
+
 def test_kamal_proxy_exposes_trusted_dashboard_cidr_settings() -> None:
     deploy_config = (Path(__file__).parents[1] / "config" / "deploy.yml").read_text()
 

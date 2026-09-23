@@ -67,14 +67,6 @@ def create_ccr_tool_definition(
                         "type": "string",
                         "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
                     },
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "Optional search query to filter results. "
-                            "If provided, only returns items matching the query. "
-                            "If omitted, returns all original items."
-                        ),
-                    },
                 },
                 "required": ["hash"],
             },
@@ -100,12 +92,33 @@ def create_ccr_tool_definition(
                         "type": "string",
                         "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
                     },
-                    "query": {
+                },
+                "required": ["hash"],
+            },
+        }
+
+    elif provider == "openai_responses":
+        # Responses API: the same function, declared flat. `name` and
+        # `parameters` sit directly on the tool rather than nested under
+        # "function" as chat completions wants, and the nested shape is
+        # rejected -- so falling through to `openai_definition` here would
+        # inject a tool the provider refuses, on exactly the turns where
+        # compression markers made the tool necessary.
+        return {
+            "type": "function",
+            "name": CCR_TOOL_NAME,
+            "description": (
+                "Retrieve original uncompressed content that was compressed to save tokens. "
+                "Use this when you need more data than what's shown in compressed tool results. "
+                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hash": {
                         "type": "string",
                         "description": (
-                            "Optional search query to filter results. "
-                            "If provided, only returns items matching the query. "
-                            "If omitted, returns all original items."
+                            "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
                         ),
                     },
                 },
@@ -127,10 +140,6 @@ def create_ccr_tool_definition(
                     "hash": {
                         "type": "string",
                         "description": "Hash key from the compression marker",
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Optional search query to filter results",
                     },
                 },
                 "required": ["hash"],
@@ -167,8 +176,7 @@ Some tool outputs have been compressed to reduce context size. If you need
 the full uncompressed data, you can retrieve it using the `{CCR_TOOL_NAME}` tool.
 
 **How to retrieve:**
-- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get all original items
-- Call `{CCR_TOOL_NAME}(hash="<hash>", query="search terms")` to search within
+- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get the full original content back
 
 **Available hashes:** {hash_list}
 
@@ -245,6 +253,15 @@ class CCRToolInjector:
             # redeem (silent data loss, #1006). Match the load-bearing
             # "Retrieve original: hash=" phrase directly.
             re.compile(r"Retrieve original: hash=([a-f0-9]{12,24})"),
+            # CodeCompressor (and any marker that appends "Expires in Nm.]" or
+            # uses "N tokens compressed." rather than "compressed to M"):
+            # `[128 tokens compressed. ... Retrieve more: hash=xxx. Expires in
+            # 30m.]`. The bracket patterns above anchor the hash on a trailing
+            # `]`, so the hash=...`. Expires` suffix (and the missing "to M")
+            # makes them all miss it -- the same silent-data-loss failure as
+            # #1006. Match the load-bearing "Retrieve more: hash=" phrase
+            # directly, matching how parser.py / session_probes detect it.
+            re.compile(r"Retrieve more: hash=([a-f0-9]{12,24})"),
         ]
     )
 
@@ -556,15 +573,15 @@ class CCRToolInjector:
 def parse_tool_call(
     tool_call: dict[str, Any],
     provider: str = "anthropic",
-) -> tuple[str | None, str | None] | str | None:
-    """Parse a CCR tool call to extract hash and query.
+) -> str | None:
+    """Parse a CCR tool call to extract the content hash.
 
     Args:
         tool_call: The tool call object from the LLM response.
         provider: The provider type for format detection.
 
     Returns:
-        Tuple of (hash, query) or (None, None) if not a CCR tool call.
+        The hash key, or None if this is not a (valid) CCR tool call.
     """
     # Get tool name and input data based on provider format
     if provider == "anthropic":
@@ -580,9 +597,8 @@ def parse_tool_call(
         args_str = function.get("arguments", "{}")
         try:
             input_data = json.loads(args_str)
-        except TypeError:
-            return None
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
+            # TypeError covers a null/None `arguments` value (json.loads(None)).
             input_data = {}
     elif provider == "google":
         # Google/Gemini format: {"functionCall": {"name": "...", "args": {...}}}
@@ -598,9 +614,8 @@ def parse_tool_call(
         args_str = tool_call.get("arguments", "{}")
         try:
             input_data = json.loads(args_str)
-        except TypeError:
-            return None
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
+            # TypeError covers a null/None `arguments` value (json.loads(None)).
             input_data = {}
     else:
         # Generic fallback

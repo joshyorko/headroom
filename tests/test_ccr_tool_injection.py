@@ -33,7 +33,8 @@ class TestCCRToolDefinition:
         assert "input_schema" in tool
         assert tool["input_schema"]["type"] == "object"
         assert "hash" in tool["input_schema"]["properties"]
-        assert "query" in tool["input_schema"]["properties"]
+        # Retrieval is by hash only — no query/search parameter.
+        assert "query" not in tool["input_schema"]["properties"]
         assert tool["input_schema"]["required"] == ["hash"]
 
     def test_openai_format(self):
@@ -87,6 +88,32 @@ class TestCCRToolInjector:
                 "content": (
                     "[Read content stale: app.py was modified after this read — "
                     f"re-read the file for current content. Retrieve original: hash={ccr_hash}]"
+                ),
+            },
+        ]
+
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(messages)
+
+        assert ccr_hash in hashes
+        assert injector.has_compressed_content
+
+    def test_scan_detects_code_compressor_marker(self):
+        """CodeCompressor emits `[N tokens compressed. ... Retrieve more:
+        hash=xxx. Expires in Nm.]` — it says 'tokens compressed' (not
+        'compressed to M') and puts '. Expires in Nm.' between the hash and the
+        closing ']'. The bracket patterns anchor the hash on a trailing ']', so
+        they all miss it and the retrieve tool is never offered for
+        code-compressed content — the same silent-data-loss failure as #1006.
+        The 'Retrieve more: hash=' phrase must be detected directly."""
+        ccr_hash = "abc123def456abc123def456"  # 24 hex chars (SHA-256[:24])
+        messages = [
+            {
+                "role": "tool",
+                "content": (
+                    "def process(items):\n    ...\n"
+                    "# [128 tokens compressed. 3 function bodies elided. "
+                    f"Retrieve more: hash={ccr_hash}. Expires in 30m.]"
                 ),
             },
         ]
@@ -302,10 +329,12 @@ class TestParseToolCall:
         tool_call = {
             "id": "toolu_123",
             "name": CCR_TOOL_NAME,
-            "input": {"hash": "abc123def456abc123def456", "query": "errors"},
+            "input": {"hash": "abc123def456abc123def456"},
         }
 
-        assert parse_tool_call(tool_call, "anthropic") == "abc123def456abc123def456"
+        hash_key = parse_tool_call(tool_call, "anthropic")
+
+        assert hash_key == "abc123def456abc123def456"
 
     def test_parse_openai_format(self):
         """Parse OpenAI tool call format."""
@@ -313,11 +342,13 @@ class TestParseToolCall:
             "id": "call_123",
             "function": {
                 "name": CCR_TOOL_NAME,
-                "arguments": json.dumps({"hash": "def456abc123def456abc123", "query": None}),
+                "arguments": json.dumps({"hash": "def456abc123def456abc123"}),
             },
         }
 
-        assert parse_tool_call(tool_call, "openai") == "def456abc123def456abc123"
+        hash_key = parse_tool_call(tool_call, "openai")
+
+        assert hash_key == "def456abc123def456abc123"
 
     def test_parse_null_function_returns_none_without_crashing(self):
         """A tool call with an explicit {"function": null} / {"functionCall": null}
@@ -345,7 +376,9 @@ class TestParseToolCall:
             "input": {"param": "value"},
         }
 
-        assert parse_tool_call(tool_call, "anthropic") is None
+        hash_key = parse_tool_call(tool_call, "anthropic")
+
+        assert hash_key is None
 
     def test_parse_malformed_openai_args(self):
         """Handles malformed JSON in OpenAI arguments."""
@@ -357,7 +390,9 @@ class TestParseToolCall:
             },
         }
 
-        assert parse_tool_call(tool_call, "openai") is None
+        hash_key = parse_tool_call(tool_call, "openai")
+
+        assert hash_key is None
 
     def test_parse_openai_non_object_arguments_returns_none(self):
         """OpenAI arguments that decode to a non-object (array/string/number)
@@ -392,7 +427,8 @@ class TestHashSecurityValidation:
             "input": {"hash": "abc123"},  # Only 6 chars
         }
 
-        assert parse_tool_call(tool_call, "anthropic") is None
+        hash_key = parse_tool_call(tool_call, "anthropic")
+        assert hash_key is None  # Rejected
 
     def test_rejects_long_hash(self):
         """Rejects hash that's too long."""
@@ -401,7 +437,8 @@ class TestHashSecurityValidation:
             "input": {"hash": "abc123def456abc123def456abc123"},  # 30 chars
         }
 
-        assert parse_tool_call(tool_call, "anthropic") is None
+        hash_key = parse_tool_call(tool_call, "anthropic")
+        assert hash_key is None  # Rejected
 
     def test_rejects_non_hex_characters(self):
         """Rejects hash with non-hex characters."""
@@ -410,7 +447,8 @@ class TestHashSecurityValidation:
             "input": {"hash": "abc123xyz456abc123xyz456"},  # Contains xyz
         }
 
-        assert parse_tool_call(tool_call, "anthropic") is None
+        hash_key = parse_tool_call(tool_call, "anthropic")
+        assert hash_key is None  # Rejected
 
     def test_accepts_valid_24_char_hash(self):
         """Accepts properly formatted 24-char hex hash."""
@@ -419,7 +457,8 @@ class TestHashSecurityValidation:
             "input": {"hash": "abc123def456abc123def456"},
         }
 
-        assert parse_tool_call(tool_call, "anthropic") == "abc123def456abc123def456"
+        hash_key = parse_tool_call(tool_call, "anthropic")
+        assert hash_key == "abc123def456abc123def456"
 
     def test_accepts_uppercase_hex(self):
         """Accepts uppercase hex characters (normalized to lowercase internally)."""
@@ -428,8 +467,9 @@ class TestHashSecurityValidation:
             "input": {"hash": "ABC123DEF456ABC123DEF456"},
         }
 
-        # Note: validation accepts uppercase since we use .lower() for hex check.
-        assert parse_tool_call(tool_call, "anthropic") == "abc123def456abc123def456"
+        hash_key = parse_tool_call(tool_call, "anthropic")
+        # Note: validation accepts uppercase since we use .lower() for hex check
+        assert hash_key == "abc123def456abc123def456"
 
 
 class TestSmartCrusherCcrMarkers:
@@ -489,10 +529,12 @@ class TestSmartCrusherCcrMarkers:
         """``parse_tool_call`` accepts a 12-char SmartCrusher hash."""
         tool_call = {
             "name": CCR_TOOL_NAME,
-            "input": {"hash": "e21a26620105", "query": "auth middleware"},
+            "input": {"hash": "e21a26620105"},
         }
 
-        assert parse_tool_call(tool_call, "anthropic") == "e21a26620105"
+        hash_key = parse_tool_call(tool_call, "anthropic")
+
+        assert hash_key == "e21a26620105"
 
     def test_parse_tool_call_still_accepts_24_char_hash(self):
         """24-char legacy hashes remain valid (regression guard)."""
@@ -501,7 +543,9 @@ class TestSmartCrusherCcrMarkers:
             "input": {"hash": "abc123def456abc123def456"},
         }
 
-        assert parse_tool_call(tool_call, "anthropic") == "abc123def456abc123def456"
+        hash_key = parse_tool_call(tool_call, "anthropic")
+
+        assert hash_key == "abc123def456abc123def456"
 
 
 class TestSystemInstructions:

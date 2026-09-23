@@ -740,6 +740,129 @@ def enforce_cache_control_ttl_order(
     return system, messages, tools, stats
 
 
+#: Anthropic rejects a request with more than this many cache_control blocks
+#: across tools, system and messages ("A maximum of 4 blocks with
+#: cache_control may be provided").
+ANTHROPIC_MAX_CACHE_BREAKPOINTS = 4
+
+
+def enforce_cache_breakpoint_budget(
+    system: Any,
+    messages: Any,
+    tools: Any,
+    *,
+    client_messages: Any = None,
+    limit: int = ANTHROPIC_MAX_CACHE_BREAKPOINTS,
+    request_id: str = "",
+) -> tuple[Any, Any, Any, dict[str, Any]]:
+    """Last-stop guard: never forward more ``cache_control`` blocks than allowed.
+
+    A request over the limit is a guaranteed 400, and the client cannot have
+    caused it with its own markers, so whatever pushed it over was added on
+    the way through. Repairs in the order that costs the least caching:
+
+    1. Re-place message markers at the client's own positions
+       (:func:`~headroom.cache.prefix_tracker.normalize_message_cache_control`),
+       which drops markers a replay or transform carried in.
+    2. If still over, drop the OLDEST message markers first: the newest one is
+       the client's write anchor for the growing tail, and system/tools
+       markers cover the hottest, longest-lived prefix.
+    3. If still over, drop system markers, then tools markers, earliest first.
+
+    Returns ``(system, messages, tools, stats)``; the inputs come back by
+    identity when nothing needed repairing. Logs one WARNING per repair with
+    the per-section counts so the source of the extra marker is traceable.
+    """
+    before = count_cache_breakpoints(system, messages, tools)
+    stats: dict[str, Any] = {"repaired": False, "before": before, "after": before}
+    if before["total"] <= limit:
+        return system, messages, tools, stats
+
+    if isinstance(messages, list) and client_messages is not None:
+        from headroom.cache.prefix_tracker import normalize_message_cache_control
+
+        messages = normalize_message_cache_control(messages, None, client_messages=client_messages)
+
+    for section in ("messages", "system", "tools"):
+        excess = count_cache_breakpoints(system, messages, tools)["total"] - limit
+        if excess <= 0:
+            break
+        budget = {"left": excess}
+        # Removal, oldest first in Anthropic's evaluation order. Copy-on-write:
+        # the forwarded body shares structure with the session snapshot.
+        if section == "messages" and isinstance(messages, list):
+            rebuilt: list[Any] = []
+            for msg in messages:
+                if budget["left"] <= 0 or not isinstance(msg, dict):
+                    rebuilt.append(msg)
+                    continue
+                content = msg.get("content")
+                if isinstance(content, list):
+                    new_blocks = []
+                    for block in content:
+                        if budget["left"] > 0 and isinstance(block, dict):
+                            inner = block.get("content")
+                            if isinstance(inner, list):
+                                new_inner = []
+                                for sub in inner:
+                                    if (
+                                        budget["left"] > 0
+                                        and isinstance(sub, dict)
+                                        and "cache_control" in sub
+                                    ):
+                                        sub = {k: v for k, v in sub.items() if k != "cache_control"}
+                                        budget["left"] -= 1
+                                    new_inner.append(sub)
+                                block = {**block, "content": new_inner}
+                            if budget["left"] > 0 and "cache_control" in block:
+                                block = {k: v for k, v in block.items() if k != "cache_control"}
+                                budget["left"] -= 1
+                        new_blocks.append(block)
+                    msg = {**msg, "content": new_blocks}
+                if budget["left"] > 0 and "cache_control" in msg:
+                    msg = {k: v for k, v in msg.items() if k != "cache_control"}
+                    budget["left"] -= 1
+                rebuilt.append(msg)
+            messages = rebuilt
+        elif section in ("system", "tools"):
+            holders = system if section == "system" else tools
+            if isinstance(holders, list):
+                rebuilt_h = []
+                for holder in holders:
+                    if (
+                        budget["left"] > 0
+                        and isinstance(holder, dict)
+                        and "cache_control" in holder
+                    ):
+                        holder = {k: v for k, v in holder.items() if k != "cache_control"}
+                        budget["left"] -= 1
+                    rebuilt_h.append(holder)
+                if section == "system":
+                    system = rebuilt_h
+                else:
+                    tools = rebuilt_h
+
+    after = count_cache_breakpoints(system, messages, tools)
+    stats.update({"repaired": True, "after": after})
+    logger.warning(
+        "event=cache_breakpoint_budget request_id=%s limit=%d "
+        "before_total=%d before_system=%d before_tools=%d before_messages=%d "
+        "after_total=%d after_system=%d after_tools=%d after_messages=%d; "
+        "the outbound request carried more cache_control blocks than the provider accepts",
+        request_id,
+        limit,
+        before["total"],
+        before["system"],
+        before["tools"],
+        before["messages"],
+        after["total"],
+        after["system"],
+        after["tools"],
+        after["messages"],
+    )
+    return system, messages, tools, stats
+
+
 def log_cache_breakpoints(
     *,
     request_id: str | None,
@@ -917,7 +1040,9 @@ def relocate_system_messages_to_top_level(
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved and no content
-    is dropped.
+    is dropped. Only text-shaped content moves: non-text blocks (images,
+    documents) stay in a mid-conversation system section at their original
+    position, because top-level `system` accepts text blocks only (issue #3552).
 
     Returns ``(clean_messages, new_system, changed)``. When no system-role
     message is present the inputs pass through unchanged (``changed=False``) so
@@ -979,14 +1104,48 @@ def relocate_system_messages_to_top_level(
         return messages, system, False
 
     relocated_blocks: list[Any] = []
+    retained: dict[int, dict[str, Any]] = {}
     for i in sorted(system_indices):
-        relocated_blocks.extend(_system_message_to_blocks(messages[i]))
-
-    clean_messages = [m for i, m in enumerate(messages) if i not in system_indices]
+        message = messages[i]
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            # Only text-shaped content may move into the top-level ``system``
+            # parameter (text blocks and bare strings). Non-text blocks such as
+            # images or documents stay in place so nothing is dropped and
+            # upstreams that reject non-text system blocks keep working
+            # (issue #3552).
+            hoisted_from_list: list[Any] = []
+            leftovers: list[Any] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == _TEXT_BLOCK_TYPE:
+                    hoisted_from_list.append(block)
+                elif isinstance(block, str) and block:
+                    hoisted_from_list.append({"type": _TEXT_BLOCK_TYPE, "text": block})
+                else:
+                    leftovers.append(block)
+            relocated_blocks.extend(hoisted_from_list)
+            if leftovers:
+                retained[i] = {**message, "content": leftovers}
+        else:
+            # String (and other) content converts losslessly to text blocks.
+            relocated_blocks.extend(_system_message_to_blocks(message))
 
     if not relocated_blocks:
+        if retained:
+            # Nothing text-shaped to relocate: the sections stay as they are.
+            return messages, system, False
         # System message(s) carried no content — drop the empty entries only.
+        clean_messages = [m for i, m in enumerate(messages) if i not in system_indices]
         return clean_messages, system, True
+
+    clean_messages = []
+    for i, message in enumerate(messages):
+        if i in system_indices:
+            trimmed = retained.get(i)
+            if trimmed is not None:
+                clean_messages.append(trimmed)
+            continue
+        clean_messages.append(message)
 
     if system is None or system == "" or system == []:
         new_system: Any = relocated_blocks
@@ -1561,37 +1720,64 @@ def _headroom_log_dir() -> Path:
     return _paths.log_dir()
 
 
-def _setup_file_logging() -> None:
+_PROXY_LOG_HANDLER_NAME = "headroom.proxy.file"
+
+
+def _setup_file_logging(
+    port: int | None = None,
+    *,
+    process_id: int | None = None,
+) -> None:
     """Add a RotatingFileHandler to the headroom root logger.
 
-    Writes to ~/.headroom/logs/proxy.log with automatic rotation:
+    Writes to a per-port log, with a PID suffix in multi-worker mode:
     - Rotates at 10 MB
     - Keeps 5 backups (~50 MB max)
+
+    The file is keyed by *port* so concurrent instances rotate separate logs.
+    Multi-worker callers also pass *process_id* so same-port workers cannot
+    race during rollover. When *port* is omitted the legacy shared name is used.
     """
     from logging.handlers import RotatingFileHandler
 
     try:
         log_dir = _headroom_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "proxy.log"
+        log_path = _paths.proxy_log_path(port, process_id=process_id)
+        # Attach to the headroom root logger so all sub-loggers are captured.
+        # Disable propagation to root to avoid duplicate writes when
+        # wrap.py redirects stderr to the same log file.
+        headroom_logger = logging.getLogger("headroom")
+        headroom_logger.setLevel(logging.INFO)
+        headroom_logger.propagate = False
+        # Decide BEFORE constructing the handler: constructing a
+        # RotatingFileHandler opens (creates) the file, so building one only to
+        # discard it would leave an empty stray worker log and leak
+        # its fd. Reuse an already-attached handler for the same file; if one
+        # points at a different port during sequential app creation, replace
+        # and close it so later records use the newly selected path.
+        existing = [
+            h
+            for h in headroom_logger.handlers
+            if isinstance(h, RotatingFileHandler) and h.name == _PROXY_LOG_HANDLER_NAME
+        ]
+        if any(Path(h.baseFilename) == log_path for h in existing):
+            return
         handler = RotatingFileHandler(
             log_path,
             maxBytes=10 * 1024 * 1024,  # 10 MB
             backupCount=5,
             encoding="utf-8",
         )
+        handler.set_name(_PROXY_LOG_HANDLER_NAME)
         handler.setLevel(logging.INFO)
         handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
-        # Attach to the headroom root logger so all sub-loggers are captured.
-        # Disable propagation to root to avoid duplicate writes when
-        # wrap.py redirects stderr to the same log file.
-        headroom_logger = logging.getLogger("headroom")
-        headroom_logger.setLevel(logging.INFO)
-        if not any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers):
-            headroom_logger.addHandler(handler)
-        headroom_logger.propagate = False
+        for stale in existing:
+            headroom_logger.removeHandler(stale)
+            stale.close()
+        headroom_logger.addHandler(handler)
     except OSError:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.)
         pass
@@ -2988,11 +3174,8 @@ def claude_code_tool_search_inactive(
         return False
     if not isinstance(tools, list) or not tools:
         return False
-    for tool in tools:
-        if isinstance(tool, dict) and str(tool.get("type", "")).startswith(
-            _TOOL_SEARCH_TOOL_TYPE_PREFIX
-        ):
-            return False
+    if request_already_defers_tools(tools):
+        return False
     beta = (anthropic_beta or "").lower()
     return not any(marker in beta for marker in _TOOL_SEARCH_BETA_MARKERS)
 
@@ -3096,6 +3279,32 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
         "toolsearch",
     }
 )
+
+
+def resolved_core_tools() -> frozenset[str]:
+    """Tools that stay resident, with a deployment override.
+
+    The default keeps the coding loop resident so routine edit/read/run never
+    pays a search round-trip. That default is now out of step with Claude Code,
+    which since v2.1.69 defers its built-ins too and thereby cuts built-in
+    schema context from roughly 14-16K tokens to under 1K. Behind a proxy the
+    client stops deferring, so Headroom carries those schemas in every request
+    while the direct-to-Anthropic baseline does not.
+
+    Deferring them here is NOT obviously right: our deferral is server-side, so
+    each first use of a deferred tool costs a search round trip, and the
+    accuracy and latency of that trade is unmeasured. The default therefore does
+    not change. ``HEADROOM_TOOL_SEARCH_CORE_TOOLS`` (comma-separated, or empty
+    to defer everything non-core) makes it an experiment a deployment can run
+    against real traffic instead of a guess shipped as a default.
+    """
+
+    raw = os.environ.get("HEADROOM_TOOL_SEARCH_CORE_TOOLS")
+    if raw is None:
+        return _TOOL_SEARCH_CORE_TOOLS
+    return frozenset(_tool_search_resident_key(part) for part in raw.split(",") if part.strip())
+
+
 _TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
 _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 # Below this many tools the ~search round-trip isn't worth it (Anthropic's own
@@ -3103,11 +3312,132 @@ _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 _TOOL_SEARCH_MIN_TOOLS = 12
 
 
+# Model-id shapes that name a Bedrock or Vertex deployment. The chat path
+# excludes those upstreams by base URL / backend (it knows where it forwards);
+# on the gateway contract the gateway routes, so the model id is the only
+# signal. Shared with the tool-search extension, which applies deferral on the
+# gateway path.
+_NON_FIRST_PARTY_MODEL_PREFIXES: tuple[str, ...] = (
+    "bedrock/",
+    "vertex_ai/",
+    "vertex/",
+    "anthropic.",  # bare Bedrock ids: anthropic.claude-3-5-sonnet-20241022-v2:0
+    "us.anthropic.",
+    "eu.anthropic.",
+    "apac.anthropic.",
+    "global.anthropic.",
+)
+_BEDROCK_VERSION_SUFFIX = re.compile(r"-v\d+(:\d+)?$")
+
+
+def anthropic_model_is_first_party(model_name: str) -> bool:
+    """Whether ``model_name`` is a first-party Claude API id (not Bedrock/Vertex).
+
+    First-party tool search (``tool_search_tool_*`` + ``defer_loading``) is
+    rejected by Bedrock and Vertex, which the chat path skips by upstream URL.
+    Gateway callers name those deployments in the model id instead:
+    ``bedrock/anthropic.claude-…``, ``anthropic.claude-…-v2:0``,
+    ``vertex_ai/claude-…``, ``claude-sonnet-4@20250514``. A LiteLLM-style
+    ``anthropic/claude-…`` prefix is first-party and stays eligible.
+    """
+    lowered = (model_name or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered.startswith(_NON_FIRST_PARTY_MODEL_PREFIXES):
+        return False
+    if "@" in lowered:  # Vertex dated ids
+        return False
+    return not _BEDROCK_VERSION_SUFFIX.search(lowered)
+
+
+def tools_are_anthropic_shaped(tools: Any) -> bool:
+    """Every dict tool is Anthropic-shaped (top-level ``name``/``input_schema``
+    or a typed server tool), and none carries the OpenAI ``function`` wrapper.
+
+    ``provider`` is inferred from the model name, and a LiteLLM-style caller
+    can pair a Claude model with chat-completions tools; deferral must not
+    touch those (Anthropic would never see this shape as-is anyway).
+    """
+    if not isinstance(tools, list) or not tools:
+        return False
+    saw_real_tool = False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            return False
+        if "function" in tool:
+            return False
+        if tool.get("type"):
+            continue  # typed server tool (web_search, computer, …)
+        if not tool.get("name") or "input_schema" not in tool:
+            return False
+        saw_real_tool = True
+    return saw_real_tool
+
+
 def _tool_search_resident_key(name: Any) -> str:
     """Normalize a client tool name for resident-tool membership checks."""
     # Oh My Pi prefixes every built-in with ``_``. Strip only leading namespace
     # markers so internal separators such as ``mcp__server__read`` stay intact.
     return str(name or "").lower().lstrip("_")
+
+
+# Deliberately EMPTY by default. A client-side tool named ``ToolSearch`` does
+# NOT imply the client is deferring: Claude Code carries it to resolve tools it
+# keeps in a local registry (TaskCreate, WebFetch, ...), and real traffic shows
+# it riding alongside a fully inline MCP catalog. Standing down on that name
+# would disable Headroom precisely when the client is sending everything
+# eagerly, which is the case we exist for.
+#
+# When Claude Code genuinely defers, it sends the SERVER-SIDE shape
+# (``tool_search_tool_regex_20251119``), which is unambiguous and is what
+# ``request_already_defers_tools`` keys on. ``HEADROOM_CLIENT_TOOL_SEARCH_NAMES``
+# stays as an escape hatch for a future harness that signals deferral by name.
+_CLIENT_TOOL_SEARCH_NAMES: frozenset[str] = frozenset()
+
+
+def _client_tool_search_names() -> frozenset[str]:
+    """Extra tool names that mean "the client is already deferring".
+
+    Empty by default; see ``_CLIENT_TOOL_SEARCH_NAMES``. Comma-separated in
+    ``HEADROOM_CLIENT_TOOL_SEARCH_NAMES``, normalized the same way tool names
+    are, so a harness we have not seen can be handled without a release.
+    """
+
+    extra = os.environ.get("HEADROOM_CLIENT_TOOL_SEARCH_NAMES", "")
+    if not extra.strip():
+        return _CLIENT_TOOL_SEARCH_NAMES
+    return _CLIENT_TOOL_SEARCH_NAMES | {
+        _tool_search_resident_key(part) for part in extra.split(",") if part.strip()
+    }
+
+
+def request_already_defers_tools(tools: Any) -> bool:
+    """Whether ``tools`` shows the CLIENT is already deferring tool schemas.
+
+    True for the Messages API server-side shape (``tool_search_tool_*`` as
+    either ``type`` or ``name``), which only appears when deferral is actually
+    on. NOT true for a bare client-side tool name such as ``ToolSearch``, which
+    a client may send whether or not it is deferring — see
+    ``_CLIENT_TOOL_SEARCH_NAMES``.
+
+    Upstream-independent on purpose: the question is what the client is doing,
+    not where the request is forwarded, so the same answer holds for first-party
+    Anthropic, Bedrock, Vertex and gateways. That matters because through Kong
+    or Bedrock the client usually is NOT deferring, and there Headroom's
+    deferral is the only one available.
+    """
+
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX):
+            return True
+        name = _tool_search_resident_key(tool.get("name"))
+        if name.startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX) or name in _client_tool_search_names():
+            return True
+    return False
 
 
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
@@ -3121,24 +3451,58 @@ def strip_first_party_tool_search_tools_for_third_party_upstream(
     tools: Any,
     api_base_url: str | None,
 ) -> Any:
-    """Remove first-party Anthropic tool-search tools when forwarding to a custom upstream."""
+    """Remove first-party Anthropic tool-search tools when forwarding to a custom upstream.
+
+    Custom upstreams reject the first-party shape: Bedrock needs a different
+    beta token (``tool-search-tool-2025-10-19``, in the body's ``anthropic_beta``
+    array) and a different API (InvokeModel, never Converse); Vertex and
+    gateways 400 on the tool type.
+
+    ``defer_loading`` is cleared at the same time, and that half is
+    load-bearing. Removing only the search tool leaves every other tool marked
+    deferred with nothing left that can resolve it: the model has no mechanism
+    to load them, and a ``tool_reference`` naming one is a documented 400
+    ("Tool reference 'X' not found in available tools"). A closed tool schema
+    also rejects the unknown field outright ("Extra inputs are not permitted").
+    Either way the half-stripped request is worse than both coherent options,
+    so strip both halves and forward a plain, valid tools array.
+
+    Reached in practice through the obvious workaround for Claude Code
+    disabling its own tool search behind a custom base URL: forcing
+    ``ENABLE_TOOL_SEARCH=true`` makes the client send the deferred shape.
+    """
+
     if not isinstance(tools, list) or anthropic_first_party_tool_search_supported(api_base_url):
         return tools
-    filtered = [
-        tool
-        for tool in tools
-        if not (
-            isinstance(tool, dict)
-            and str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
-        )
-    ]
-    return filtered if len(filtered) != len(tools) else tools
+    out: list[Any] = []
+    changed = False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            out.append(tool)
+            continue
+        if str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX):
+            changed = True
+            continue
+        if tool.get("defer_loading"):
+            stripped = {k: v for k, v in tool.items() if k != "defer_loading"}
+            out.append(stripped)
+            changed = True
+            continue
+        out.append(tool)
+    if not changed:
+        return tools
+    logger.info(
+        "event=tool_search_downgraded reason=third_party_upstream tools=%d hint=%s",
+        len(out),
+        "client-side tool deferral cannot be forwarded to this upstream; tools are sent eagerly",
+    )
+    return out
 
 
 def inject_tool_search_deferral(
     tools: Any,
     *,
-    core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
+    core_tools: frozenset[str] | None = None,
     search_type: str = _TOOL_SEARCH_DEFAULT_TYPE,
     search_name: str = _TOOL_SEARCH_DEFAULT_NAME,
 ) -> Any:
@@ -3154,14 +3518,15 @@ def inject_tool_search_deferral(
     tool, it is moved to the last non-deferred real tool so the (smaller) tools
     prefix still caches.
     """
+    if core_tools is None:
+        core_tools = resolved_core_tools()
     if not isinstance(tools, list) or len(tools) < _TOOL_SEARCH_MIN_TOOLS:
         return tools
-    for tool in tools:
-        if isinstance(tool, dict) and (
-            str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
-            or str(tool.get("name") or "").lower().startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
-        ):
-            return tools  # client already uses tool search — leave it alone
+    if request_already_defers_tools(tools):
+        # Client already defers (server-side tool_search_tool_*, or a client-side
+        # tool such as Claude Code's ToolSearch). Stand down entirely rather than
+        # deferring on top of it — see _CLIENT_TOOL_SEARCH_NAMES.
+        return tools
 
     search_tool = {"type": search_type, "name": search_name}
     out: list[Any] = [search_tool]
@@ -3258,17 +3623,38 @@ def _tool_search_reference_names(content: Any) -> list[str]:
     return names
 
 
+# Stand-in for a tool-search block the outbound tools array cannot support. Text
+# so it is inert to every validator, short so it costs ~10 tokens, and constant so
+# the repaired prefix stays byte-stable across turns (the provider cache needs the
+# same bytes every time).
+_TOOL_SEARCH_PLACEHOLDER_BLOCK: dict[str, Any] = {
+    "type": "text",
+    "text": "[tool search omitted: unavailable in this request]",
+}
+
+
 def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
-    """Drop tool-search blocks this request's ``tools`` array cannot support.
+    """Neutralize tool-search blocks this request's ``tools`` array cannot support.
 
     A block pair is unsupportable when the request carries no ``tool_search_tool_*``
     tool, or when a ``tool_reference`` names a tool absent from ``tools`` — the two
     shapes Anthropic rejects. Both the ``tool_search_tool_result`` and its paired
-    ``server_tool_use`` are removed (an orphan of either 400s on its own), and a
-    message left with no content blocks is dropped rather than sent empty.
+    ``server_tool_use`` are handled (an orphan of either 400s on its own).
 
-    Returns ``(messages, blocks_removed)``, and the ORIGINAL ``messages`` object
-    when nothing was removed — callers rely on identity to skip the write-back.
+    Replace in place rather than remove (#3456). The block indexes of a message
+    are load-bearing: ``thinking_block_fingerprint`` keys a signed thinking block
+    by ``(message_index, block_index)``, so deleting a block that sits BEFORE a
+    thinking block in the same message — or deleting a whole message ahead of one —
+    moves that block, ``thinking_blocks_survived_mutation`` reports False, and
+    ``select_outbound_body`` then forwards the client's ORIGINAL bytes and discards
+    every mutation, this repair included. The request that needed repairing is
+    exactly the one that loses it, and upstream 400s on the reference we had
+    already found. Swapping each block for a short text block keeps every thinking
+    block at its original coordinates, so the repair survives to the wire. Same
+    reasoning as the CCR sibling below.
+
+    Returns ``(messages, blocks_repaired)``, and the ORIGINAL ``messages`` object
+    when nothing changed — callers rely on identity to skip the write-back.
     """
     if not isinstance(messages, list):
         return messages, 0
@@ -3301,7 +3687,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             out.append(message)
             continue
 
-        drop_indexes: set[int] = set()
+        neutralize_indexes: set[int] = set()
         orphaned_ids: set[str] = set()
         for index, block in enumerate(content):
             if not isinstance(block, dict) or block.get("type") != _TOOL_SEARCH_RESULT_TYPE:
@@ -3309,7 +3695,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             names = _tool_search_reference_names(block.get("content"))
             if has_search_tool and all(name in available for name in names):
                 continue
-            drop_indexes.add(index)
+            neutralize_indexes.add(index)
             use_id = block.get("tool_use_id")
             if use_id:
                 orphaned_ids.add(str(use_id))
@@ -3321,19 +3707,19 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
                 continue
             is_search_call = str(block.get("name", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
             if str(block.get("id", "")) in orphaned_ids or (is_search_call and not has_search_tool):
-                drop_indexes.add(index)
+                neutralize_indexes.add(index)
 
-        if not drop_indexes:
+        if not neutralize_indexes:
             out.append(message)
             continue
 
         changed = True
-        removed += len(drop_indexes)
-        kept = [block for index, block in enumerate(content) if index not in drop_indexes]
-        if not kept:
-            continue  # the whole turn was tool-search bookkeeping
+        removed += len(neutralize_indexes)
         repaired = dict(message)
-        repaired["content"] = kept
+        repaired["content"] = [
+            dict(_TOOL_SEARCH_PLACEHOLDER_BLOCK) if index in neutralize_indexes else block
+            for index, block in enumerate(content)
+        ]
         out.append(repaired)
 
     return (out, removed) if changed else (messages, 0)
@@ -3530,7 +3916,7 @@ def inject_tool_search_deferral_openai(
     model: str | None,
     *,
     client: str | None = None,
-    core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
+    core_tools: frozenset[str] | None = None,
 ) -> Any:
     """Return a new Responses ``tools`` list with non-core function/MCP tools
     deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
@@ -3546,15 +3932,23 @@ def inject_tool_search_deferral_openai(
     so routine edit/read/run loops never pay a search round-trip and the request
     stays valid; the injected search tool is itself resident.
     """
+    if core_tools is None:
+        core_tools = resolved_core_tools()
     if not openai_tool_search_client_supported(client):
         return tools
     if not _model_supports_openai_tool_search(model):
         return tools
     if not isinstance(tools, list) or len(tools) < _OPENAI_TOOL_SEARCH_MIN_TOOLS:
         return tools
-    for tool in tools:
-        if isinstance(tool, dict) and tool.get("type") == _OPENAI_TOOL_SEARCH_TYPE:
-            return tools  # client already uses tool search — leave it alone
+    if any(
+        isinstance(tool, dict) and tool.get("type") == _OPENAI_TOOL_SEARCH_TYPE for tool in tools
+    ) or request_already_defers_tools(tools):
+        # Client already defers — its own Responses tool_search, or a
+        # client-side tool such as Claude Code's ToolSearch. Deferring on top of
+        # a client that is already deferring suppresses ITS mechanism and
+        # inlines the catalog we were trying to keep out. Shape-based, not a
+        # client allowlist, so it generalizes to harnesses we have not seen.
+        return tools
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0

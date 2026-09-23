@@ -34,7 +34,6 @@ def ensure_proxy_dependencies() -> None:
         "websockets",
         "onnxruntime",
         "transformers",
-        "watchdog",
     ]
     if sys.implementation.name != "pypy":
         required_modules.append("orjson")
@@ -1453,7 +1452,7 @@ def proxy(
         memory_neo4j_uri=os.environ.get("HEADROOM_NEO4J_URI", "neo4j://localhost:7687"),
         memory_neo4j_user=os.environ.get("HEADROOM_NEO4J_USER", "neo4j"),
         memory_neo4j_password=(
-            os.environ.get("HEADROOM_NEO4J_PASSWORD") or os.environ.get("NEO4J_PASSWORD", "")
+            os.environ.get("HEADROOM_NEO4J_PASSWORD") or os.environ.get("NEO4J_PASSWORD") or ""
         ),
         **qdrant_overrides,
         # Traffic Learning: only with --learn, never with --no-learn

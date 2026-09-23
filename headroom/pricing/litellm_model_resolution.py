@@ -27,13 +27,21 @@ class LiteLLMModelPrefixRule:
 
 # Aliases for models removed from LiteLLM's cost database (retired/renamed).
 # Maps old model name -> current LiteLLM key that has equivalent pricing.
+# Retired model ids, aliased to a CURRENTLY PRICED model of the same tier.
+#
+# An alias target must itself still be in litellm's table. These pointed at
+# claude-sonnet-4-20250514 until litellm pruned it on 2026-09-23, at which point
+# all three aliases resolved to nothing and every one of these models fell
+# through to the unknown-model default (the GPT-4o tier, $2.50/$10.00) -- the
+# same class of silent mispricing the Haiku note below warns about. The guard
+# test fails the build if a target is pruned again, so this cannot rot quietly.
+#
+# The undated target is deliberate: it survives a dated release being retired.
 MODEL_ALIASES: dict[str, str] = {
-    # Claude 3.5 Sonnet retired Feb 2026, pricing same as claude-sonnet-4-20250514
-    "claude-3-5-sonnet-20241022": "claude-sonnet-4-20250514",
-    "claude-3-5-sonnet-20240620": "claude-sonnet-4-20250514",
-    # Claude 3 Sonnet retired. It was a Sonnet-tier model ($3/$15 per 1M
-    # in/out), so keep it on equivalent Sonnet-tier pricing.
-    "claude-3-sonnet-20240229": "claude-sonnet-4-20250514",
+    # Retired Sonnet-tier models use a currently priced, undated model key.
+    "claude-3-5-sonnet-20241022": "claude-sonnet-4-5",
+    "claude-3-5-sonnet-20240620": "claude-sonnet-4-5",
+    "claude-3-sonnet-20240229": "claude-sonnet-4-5",
     # ChatGPT exposes subscription variants with zero-priced rows; use the
     # canonical Codex list price for savings estimates.
     "gpt-5.3-codex-spark": "gpt-5.3-codex",

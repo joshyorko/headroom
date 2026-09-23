@@ -15,9 +15,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, self-hosted]
   pull_request:
-    branches: [main]
+    branches: [main, self-hosted]
     paths-ignore:
       - 'docs/**'
       - 'wiki/**'

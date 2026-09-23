@@ -32,6 +32,15 @@ def test_docker_workflow_normalizes_repository_name_for_signing() -> None:
     assert "steps.image-name.outputs.image_name" in content
 
 
+def test_ci_covers_self_hosted_pushes_and_pull_requests() -> None:
+    workflow = yaml.load(
+        (ROOT / ".github" / "workflows" / "ci.yml").read_text(), Loader=yaml.BaseLoader
+    )
+
+    assert "self-hosted" in workflow["on"]["push"]["branches"]
+    assert "self-hosted" in workflow["on"]["pull_request"]["branches"]
+
+
 def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
     jobs = workflow["jobs"]

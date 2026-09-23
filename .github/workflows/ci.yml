@@ -1,4 +1,5 @@
 name: CI
+run-name: CI / ${{ github.ref_name }}
 
 # Intelligent + parallel pipeline (cutover from the old 4-version matrix):
 #   changes      — paths-filter; skips heavy work for docs-only changes

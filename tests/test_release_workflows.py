@@ -37,6 +37,7 @@ def test_ci_covers_self_hosted_pushes_and_pull_requests() -> None:
         (ROOT / ".github" / "workflows" / "ci.yml").read_text(), Loader=yaml.BaseLoader
     )
 
+    assert workflow["run-name"] == "CI / ${{ github.ref_name }}"
     assert "self-hosted" in workflow["on"]["push"]["branches"]
     assert "self-hosted" in workflow["on"]["pull_request"]["branches"]
 

@@ -275,6 +275,7 @@ from abc import ABC, abstractmethod
 from headroom.learn.base import ConversationScanner, ContextWriter
 from headroom.learn.models import ProjectInfo, SessionData
 
+
 class LearnPlugin(ConversationScanner):
     """A self-contained learn plugin for a single coding agent."""
 

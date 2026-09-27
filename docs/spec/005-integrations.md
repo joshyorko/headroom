@@ -220,8 +220,7 @@ class HeadroomMCPCompressor:
         config: HeadroomConfig | None = None,
         profiles: list[MCPToolProfile] | None = None,
         token_counter: Callable[[str], int] | None = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     def compress(
         self,
@@ -299,6 +298,7 @@ All learn plugins must implement the `LearnPlugin` interface:
 from abc import ABC, abstractmethod
 from headroom.learn.base import ConversationScanner, ContextWriter
 from headroom.learn.models import ProjectInfo, SessionData
+
 
 class LearnPlugin(ConversationScanner):
     """A self-contained learn plugin for a single coding agent."""

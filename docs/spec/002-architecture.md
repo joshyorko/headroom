@@ -84,9 +84,9 @@ class ProxyConfig:
 **`HeadroomMode` enum** (actual modes):
 ```python
 class HeadroomMode(str, Enum):
-    AUDIT = "audit"       # Observe only, no modifications
-    OPTIMIZE = "optimize" # Apply deterministic transforms
-    SIMULATE = "simulate" # Return transform plan without API call
+    AUDIT = "audit"  # Observe only, no modifications
+    OPTIMIZE = "optimize"  # Apply deterministic transforms
+    SIMULATE = "simulate"  # Return transform plan without API call
 ```
 
 **HTTP Endpoints (actual):**
@@ -278,6 +278,7 @@ CCR (Compress-Cache-Retrieve) makes compression reversible.
 class CompressionStore:
     def store(self, hash: str, original: str, metadata: dict) -> None: ...
     def retrieve(self, hash: str) -> str | None: ...
+
 
 class ContextTracker:
     def track(self, session_id: str, messages: list[dict]) -> CCRContext: ...

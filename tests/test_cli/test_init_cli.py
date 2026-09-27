@@ -718,7 +718,7 @@ def test_ensure_codex_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_pat
     path = tmp_path / "hooks.json"
     monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
 
-    init_cli._ensure_codex_hooks(path, "init-user")
+    init_cli._ensure_codex_hooks(path, "init-user", "http://127.0.0.1:8787")
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     for event in ("SessionStart", "PreToolUse"):

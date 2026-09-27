@@ -195,7 +195,7 @@ def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> 
     extras_lines = [
         line.strip() for line in bake.splitlines() if line.strip().startswith("HEADROOM_EXTRAS =")
     ]
-    assert len(extras_lines) == 9
+    assert len(extras_lines) == 10
     assert all("bedrock" in line for line in extras_lines), extras_lines
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -272,18 +272,18 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     build_variants = build["strategy"]["matrix"]["variant"]
     architectures = build["strategy"]["matrix"]["arch"]
     root = next(entry for entry in variants if entry["name"] == "")
-    nonroot = next(entry for entry in variants if entry["name"] == "nonroot")
     promotion = next(
         step for step in manifest["steps"] if step["name"] == "Re-tag root image as :latest"
     )
     command = promotion["run"]
 
-    assert len(variants) == 8
+    assert len(variants) == 1
     assert [entry["name"] for entry in build_variants] == [entry["name"] for entry in variants]
-    assert len(architectures) == 2
-    assert {entry["platform"] for entry in architectures} == {"linux/amd64", "linux/arm64"}
+    assert len(architectures) == 1
+    assert {entry["platform"] for entry in architectures} == {"linux/amd64"}
     assert root["name"] == ""
-    assert nonroot["name"] == "nonroot"
+    assert root["bake_target"] == "runtime-self-hosted"
+    assert architectures[0]["runs_on"] == "ubuntu-24.04"
     assert "matrix.variant.name == ''" in promotion["if"]
     assert "steps.manifest.outputs.index_digest != ''" in promotion["if"]
     assert "steps.version.outputs.version != ''" in promotion["if"]
@@ -304,11 +304,11 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
         step["run"] for step in manifest["steps"] if step["name"] == "Create multi-arch manifest"
     )
     assert 'digest_count="$(find "${DIGEST_DIR}" -maxdepth 1 -type f | wc -l)"' in manifest_script
-    assert '"${digest_count}" -ne 2' in manifest_script
-    assert manifest_script.index('"${digest_count}" -ne 2') < manifest_script.index(
+    assert '"${digest_count}" -ne 1' in manifest_script
+    assert manifest_script.index('"${digest_count}" -ne 1') < manifest_script.index(
         "docker buildx imagetools create"
     )
-    guard_start = manifest_script.index('"${digest_count}" -ne 2')
+    guard_start = manifest_script.index('"${digest_count}" -ne 1')
     create_start = manifest_script.index("docker buildx imagetools create")
     assert guard_start < manifest_script.index("exit 1", guard_start) < create_start
 
@@ -343,8 +343,12 @@ def test_only_the_root_cell_can_ever_publish_a_bare_latest_tag() -> None:
         "every variant cell publishes a bare :latest and the last one wins"
     )
 
-    # No tag rule may reintroduce it explicitly either.
-    assert "value=latest" not in meta["with"]["tags"]
+    # The self-hosted root lane intentionally emits :latest on self-hosted
+    # branch pushes; the matrix assertion above proves no nonroot cell exists.
+    assert (
+        "type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref_name == 'self-hosted' && matrix.variant.name == '' }}"
+        in meta["with"]["tags"]
+    )
 
     create = next(
         step for step in manifest["steps"] if step["name"] == "Create multi-arch manifest"
@@ -358,8 +362,8 @@ def test_only_the_root_cell_can_ever_publish_a_bare_latest_tag() -> None:
     )
 
 
-def test_docker_manifest_downloads_exactly_one_artifact_per_architecture() -> None:
-    """Each manifest cell must download exactly its two architecture digests.
+def test_docker_manifest_downloads_exactly_one_artifact_for_self_hosted_amd64() -> None:
+    """The self-hosted manifest must download its sole amd64 digest.
 
     Keeping the variant before a trailing wildcard makes prefix-related names
     overlap: ``digests-code-*`` also selects code-nonroot, code-slim, and
@@ -386,7 +390,6 @@ def test_docker_manifest_downloads_exactly_one_artifact_per_architecture() -> No
     )
     assert [step["with"]["name"] for step in downloads] == [
         "digests-${{ matrix.variant.name || 'root' }}-amd64",
-        "digests-${{ matrix.variant.name || 'root' }}-arm64",
     ]
     assert all("pattern" not in step["with"] for step in downloads)
     assert all(step["with"]["path"] == "${{ runner.temp }}/digests" for step in downloads)
@@ -795,31 +798,24 @@ def test_aarch64_wheel_uses_native_arm64_runner() -> None:
     )
 
 
-def test_docker_workflow_builds_on_native_arch_runners() -> None:
-    """STRUCTURAL INVARIANT: the docker variant build must fan out per
-    arch onto native runners — `linux/amd64` on `ubuntu-24.04`,
-    `linux/arm64` on `ubuntu-24.04-arm`. No QEMU.
+def test_docker_workflow_builds_self_hosted_image_on_amd64_runner() -> None:
+    """STRUCTURAL INVARIANT: the self-hosted image builds natively on amd64.
 
-    Pre-#377 each variant ran `docker bake` with
-    `platforms = ["linux/amd64","linux/arm64"]` on a single x64 runner
-    using QEMU for arm64 emulation — ~1h per variant. Splitting into
-    16 native single-arch builds (8 variants × 2 arches) + a manifest
-    merge job per variant cuts wall-clock to ~10 min and removes the
-    QEMU surface that contributed to transient build failures.
+    The upstream multi-variant workflow uses native amd64/arm64 runners.
+    This self-hosted fork deliberately narrows that matrix to the one
+    Kamal image and architecture it deploys.
     """
     content = (ROOT / ".github" / "workflows" / "docker.yml").read_text(encoding="utf-8")
 
-    # The fan-out job must exist with both runners in its arch matrix.
+    # The self-hosted lane intentionally has one amd64 runner and no ARM row.
     assert "docker-build:" in content, "docker-build fan-out job missing"
     assert "runs_on: ubuntu-24.04, platform: linux/amd64" in content, (
         "amd64 arch matrix entry must bind ubuntu-24.04 (native x86_64)"
     )
-    assert "runs_on: ubuntu-24.04-arm, platform: linux/arm64" in content, (
-        "arm64 arch matrix entry must bind ubuntu-24.04-arm (native aarch64)"
-    )
+    assert "runs_on: ubuntu-24.04-arm, platform: linux/arm64" not in content
 
-    # Per-arch builds must push by digest only — tags belong on the
-    # multi-arch manifest, applied later by docker-manifest.
+    # The amd64 build must push by digest only — tags belong on the
+    # manifest, applied later by docker-manifest.
     assert "push-by-digest=true,name-canonical=true,push=true" in content, (
         "per-arch builds must push by digest only; tags applied at manifest merge step"
     )

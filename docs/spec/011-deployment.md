@@ -65,10 +65,7 @@ headroom proxy --host 0.0.0.0 --port 8787
 ```python
 from headroom import HeadroomClient
 
-client = HeadroomClient(
-    api_key="your-api-key",
-    base_url="http://localhost:8787"
-)
+client = HeadroomClient(api_key="your-api-key", base_url="http://localhost:8787")
 
 result = await client.compress(messages)
 ```

@@ -453,6 +453,11 @@ def test_ci_commitlint_runs_only_for_pull_requests() -> None:
     content = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     assert "github.event_name == 'pull_request'" in content
+    assert "COMMITLINT_BASE_SHA: ${{ github.event.pull_request.base.sha }}" in content
+    assert "COMMITLINT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}" in content
+    assert "--git-log-args='--first-parent'" in content
+    assert "@commitlint/cli@19.2.1" in content
+    assert "@commitlint/config-conventional@19.1.0" in content
 
 
 def test_no_openssl_sys_in_wheel_build_tree() -> None:

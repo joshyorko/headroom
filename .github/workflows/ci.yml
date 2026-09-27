@@ -514,9 +514,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: wagoid/commitlint-github-action@v6
-        with:
-          configFile: .commitlintrc.json
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Lint first-parent PR commits
+        env:
+          COMMITLINT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          COMMITLINT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          npm install --prefix "$RUNNER_TEMP/commitlint" --no-save --no-audit --no-fund \
+            @commitlint/cli@19.2.1 @commitlint/config-conventional@19.1.0
+          config="$RUNNER_TEMP/commitlint/node_modules/.headroom-commitlintrc.json"
+          cp .commitlintrc.json "$config"
+          "$RUNNER_TEMP/commitlint/node_modules/.bin/commitlint" \
+            --from "$COMMITLINT_BASE_SHA" \
+            --to "$COMMITLINT_HEAD_SHA" \
+            --git-log-args='--first-parent' \
+            --config "$config"
 
   build:
     needs: changes

@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "headroom init hook ensure",
-            "timeout": 15
+            "timeout": 60
           }
         ]
       }
@@ -19,7 +19,7 @@
           {
             "type": "command",
             "command": "headroom init hook ensure",
-            "timeout": 15
+            "timeout": 60
           }
         ]
       }

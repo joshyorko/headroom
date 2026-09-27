@@ -124,15 +124,15 @@ For maximum compression, inject large retrieved context into `system`:
 ```python
 # Query results, search results, schema — these compress 60–99%
 system_context = {
-    "tables":         json.loads(show_tables_result),
+    "tables": json.loads(show_tables_result),
     "search_results": cortex_search_results,
-    "schema":         describe_table_result,
-    "dbt_results":    dbt_run_results_json,
+    "schema": describe_table_result,
+    "dbt_results": dbt_run_results_json,
 }
 messages = [
     {"role": "system", "content": json.dumps(system_context, indent=2)},
     {"role": "assistant", "content": "Context loaded."},
-    {"role": "user",      "content": user_question},
+    {"role": "user", "content": user_question},
 ]
 result = compress(messages, model="claude-sonnet-4-6")
 ```
@@ -150,7 +150,8 @@ while making API calls; closing it invalidates the OAuth session token:
 import snowflake.connector, sys, io
 
 # Suppress connector's browser-auth console output
-_s = sys.stdout; sys.stdout = io.StringIO()
+_s = sys.stdout
+sys.stdout = io.StringIO()
 conn = snowflake.connector.connect(connection_name="my_connection")
 token = conn.rest.token
 sys.stdout = _s

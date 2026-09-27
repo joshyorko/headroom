@@ -514,9 +514,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: wagoid/commitlint-github-action@v6
-        with:
-          configFile: .commitlintrc.json
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Lint first-parent PR commits
+        env:
+          COMMITLINT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          COMMITLINT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          npm install --prefix "$RUNNER_TEMP/commitlint" --no-save --no-audit --no-fund \
+            @commitlint/cli@19.2.1 @commitlint/config-conventional@19.1.0
+          config="$RUNNER_TEMP/commitlint/node_modules/.headroom-commitlintrc.json"
+          cp .commitlintrc.json "$config"
+          "$RUNNER_TEMP/commitlint/node_modules/.bin/commitlint" \
+            --from "$COMMITLINT_BASE_SHA" \
+            --to "$COMMITLINT_HEAD_SHA" \
+            --git-log-args='--first-parent' \
+            --config "$config"
 
   build:
     needs: changes
@@ -589,14 +601,16 @@ jobs:
     needs: changes
     if: needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - name: Build local Headroom image
-        run: docker build -t headroom-native-e2e:latest .
+      - name: Run Docker bind security proof
+        run: bash e2e/docker-bind-security.sh --base-image headroom-bind-base --head-image headroom-native-e2e:latest --fixture tests/fixtures/docker-bind-exposure.json --base-ref "${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}"
       - name: Run Docker-native installer e2e
         env:
           HEADROOM_DOCKER_IMAGE: headroom-native-e2e:latest

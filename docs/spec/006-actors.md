@@ -93,6 +93,7 @@ The developer creating a custom learn plugin for a specific agent.
 ```python
 from headroom.learn.base import LearnPlugin, ConversationScanner
 
+
 class MyAgentPlugin(LearnPlugin):
     @property
     def name(self) -> str:

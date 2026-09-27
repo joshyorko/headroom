@@ -2,26 +2,227 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
-import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
+    import tomli as tomllib  # type: ignore[no-redef]
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def test_release_please_automation_is_not_present() -> None:
-    obsolete_paths = (
-        ".github/workflows/release-please.yml",
-        ".github/workflows/release-metadata-sync.yml",
-        ".github/workflows/changelog-guard.yml",
-        ".release-please-config.json",
-        ".release-please-manifest.json",
+def test_homebrew_dispatch_skips_without_pat_and_runs_when_configured(tmp_path: Path) -> None:
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+    step = next(
+        step
+        for step in workflow["jobs"]["docker-manifest"]["steps"]
+        if step.get("name") == "Dispatch Homebrew tap update"
+    )
+    assert step["env"]["HOMEBREW_TOOLS_PAT"] == "${{ secrets.HOMEBREW_TOOLS_PAT }}"
+    assert "tap-auto-update.yml/dispatches" in step["run"]
+
+    call_log = tmp_path / "curl-args"
+    curl = tmp_path / "curl"
+    curl.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" > "$TEST_CURL_CALL_LOG"\nexit 0\n',
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+
+    env = os.environ.copy()
+    env.pop("HOMEBREW_TOOLS_PAT", None)
+    env["PATH"] = f"{tmp_path}:{env['PATH']}"
+    env["TEST_CURL_CALL_LOG"] = str(call_log)
+
+    skipped = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail", "-c", step["run"]],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert skipped.returncode == 0, skipped.stderr
+    assert "HOMEBREW_TOOLS_PAT is unset; skipping" in skipped.stdout
+    assert not call_log.exists(), "an unset token must not attempt the cross-repo dispatch"
+
+    env["HOMEBREW_TOOLS_PAT"] = "test-token"
+    dispatched = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail", "-c", step["run"]],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert dispatched.returncode == 0, dispatched.stderr
+    curl_args = call_log.read_text(encoding="utf-8")
+    assert "Bearer test-token" in curl_args
+    assert "tap-auto-update.yml/dispatches" in curl_args
+    assert "headroom-daily" in curl_args
+
+
+def test_release_slack_payload_reports_the_completed_github_release(tmp_path: Path) -> None:
+    """A release notification must identify the exact published artifact boundary."""
+    output = tmp_path / "payload.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github" / "actions" / "release-slack-notification" / "build_payload.py"),
+            "--release-name",
+            "Headroom 1.2.3",
+            "--tag",
+            "v1.2.3",
+            "--url",
+            "https://github.com/headroomlabs-ai/headroom/releases/tag/v1.2.3",
+            "--repository",
+            "headroomlabs-ai/headroom",
+            "--actor",
+            "release<bot>",
+            "--output",
+            str(output),
+        ],
+        check=True,
     )
 
-    assert not [path for path in obsolete_paths if (ROOT / path).exists()]
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["text"] == (
+        "Headroom 1.2.3 (v1.2.3) GitHub Release assets are ready: "
+        "https://github.com/headroomlabs-ai/headroom/releases/tag/v1.2.3"
+    )
+    assert payload["blocks"] == [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "Headroom 1.2.3 is ready", "emoji": True},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": "*Tag*\n`v1.2.3`"},
+                {"type": "mrkdwn", "text": "*Repository*\n`headroomlabs-ai/headroom`"},
+            ],
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "GitHub Release assets are ready. "
+                    "<https://github.com/headroomlabs-ai/headroom/releases/tag/v1.2.3|"
+                    "View release notes and downloads>"
+                ),
+            },
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "Published by `release&lt;bot&gt;` after the release asset job completed.",
+                }
+            ],
+        },
+    ]
+
+
+def test_release_workflow_notifies_slack_only_after_github_release_assets_are_ready() -> None:
+    """PR/manual runs and failed asset publication must never reach Slack delivery."""
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    )
+    job = workflow["jobs"]["notify-release"]
+
+    assert job["needs"] == "create-release"
+    condition = str(job["if"])
+    assert "github.event_name == 'release'" in condition
+    assert "github.event.action == 'published'" in condition
+    assert "needs.create-release.result == 'success'" in condition
+
+    notify_step = next(
+        step
+        for step in job["steps"]
+        if step.get("uses") == "./.github/actions/release-slack-notification"
+    )
+    assert notify_step["with"]["url"] == "${{ github.event.release.html_url }}"
+    assert notify_step["with"]["tag"] == "${{ github.event.release.tag_name }}"
+    assert notify_step["with"]["webhook-url"] == "${{ secrets.SLACK_RELEASES_WEBHOOK_URL }}"
+
+    action = yaml.safe_load(
+        (ROOT / ".github" / "actions" / "release-slack-notification" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    build_step = next(
+        step
+        for step in action["runs"]["steps"]
+        if step.get("name") == "Build Slack release payload"
+    )
+    assert "build_payload.py" in build_step["run"]
+    assert build_step["env"]["RELEASE_URL"] == "${{ inputs.url }}"
+
+    post_step = next(
+        step for step in action["runs"]["steps"] if step.get("name") == "Post release to Slack"
+    )
+    assert str(post_step["if"]) == "${{ !env.ACT }}"
+    assert post_step["env"] == {"SLACK_RELEASES_WEBHOOK_URL": "${{ inputs.webhook-url }}"}
+    assert '--data-binary @"$RUNNER_TEMP/slack-release-payload.json"' in post_step["run"]
+    assert "--fail-with-body" in post_step["run"]
+    assert "webhook-url" not in str(build_step)
+
+
+def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> None:
+    """Every image that advertises ``--backend bedrock`` must ship botocore.
+
+    Temporary AWS credentials take LiteLLM's botocore-backed authentication
+    path.  The default images previously installed only ``proxy``/``code``, so
+    the documented Docker Bedrock command failed at runtime with
+    ``No module named 'botocore'`` (#1551).  Keep the standalone Dockerfile and
+    every bake target on the existing ``bedrock`` package extra.
+    """
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "ARG HEADROOM_EXTRAS=proxy,code,bedrock" in dockerfile
+
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    extras_lines = [
+        line.strip() for line in bake.splitlines() if line.strip().startswith("HEADROOM_EXTRAS =")
+    ]
+    assert len(extras_lines) == 9
+    assert all("bedrock" in line for line in extras_lines), extras_lines
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    bedrock_names = {
+        Requirement(requirement).name
+        for requirement in project["project"]["optional-dependencies"]["bedrock"]
+    }
+    assert {"boto3", "botocore"} <= bedrock_names
+
+
+def test_public_docker_instructions_use_the_current_organization_package() -> None:
+    """Do not send users back to the personal GHCR package frozen at 0.27.0."""
+    public_docs = (
+        "README.md",
+        "llms.txt",
+        "docker-compose.yml",
+        "TESTING-copilot-subscription.md",
+        "wiki/cli.md",
+        "wiki/docker-install.md",
+    )
+    deprecated = "ghcr.io/chopratejas/headroom"
+    current = "ghcr.io/headroomlabs-ai/headroom"
+
+    for relative_path in public_docs:
+        content = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert deprecated not in content, relative_path
+        assert current in content, relative_path
 
 
 def test_docker_workflow_normalizes_repository_name_for_signing() -> None:
@@ -32,17 +233,34 @@ def test_docker_workflow_normalizes_repository_name_for_signing() -> None:
     assert "steps.image-name.outputs.image_name" in content
 
 
-def test_ci_covers_self_hosted_pushes_and_pull_requests() -> None:
-    workflow = yaml.load(
-        (ROOT / ".github" / "workflows" / "ci.yml").read_text(), Loader=yaml.BaseLoader
-    )
+def test_docker_bake_metadata_never_travels_through_env() -> None:
+    """Bake metadata must reach scripts through a file, never through ``env:``.
 
-    assert workflow["run-name"] == "CI / ${{ github.ref_name }}"
-    assert "self-hosted" in workflow["on"]["push"]["branches"]
-    assert "self-hosted" in workflow["on"]["pull_request"]["branches"]
-    native_filter = workflow["jobs"]["changes"]["steps"][1]["with"]["filters"]
-    assert "'config/deploy.yml'" in native_filter
-    assert "'docker-bake.hcl'" in native_filter
+    The runner exports every ``env:`` entry when it spawns bash, and bake
+    metadata for the larger targets exceeds the kernel's per-string limit, so
+    the step dies with "Argument list too long" before its script runs.
+    f3d5392c fixed this by piping the JSON through a heredoc file; the arm64
+    rework (ed36676c) reintroduced an unused ``env: BAKE_METADATA`` beside that
+    heredoc, and every build job of a Docker run can fail on it again.
+    """
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+
+    offenders = [
+        f"{job_name} / {step.get('name', step.get('id'))} / {key}"
+        for job_name, job in workflow["jobs"].items()
+        for step in job.get("steps", [])
+        for key, value in (step.get("env") or {}).items()
+        if "outputs.metadata" in str(value)
+    ]
+    assert not offenders, f"bake metadata passed via env (E2BIG risk): {offenders}"
+
+    export = next(
+        step
+        for step in workflow["jobs"]["docker-build"]["steps"]
+        if step.get("name") == "Export digest"
+    )
+    assert "<<'__HEADROOM_BAKE_META_EOF__'" in export["run"]
+    assert "${{ steps.bake.outputs.metadata }}" in export["run"]
 
 
 def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
@@ -54,16 +272,18 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     build_variants = build["strategy"]["matrix"]["variant"]
     architectures = build["strategy"]["matrix"]["arch"]
     root = next(entry for entry in variants if entry["name"] == "")
+    nonroot = next(entry for entry in variants if entry["name"] == "nonroot")
     promotion = next(
         step for step in manifest["steps"] if step["name"] == "Re-tag root image as :latest"
     )
     command = promotion["run"]
 
-    assert len(variants) == 1
+    assert len(variants) == 8
     assert [entry["name"] for entry in build_variants] == [entry["name"] for entry in variants]
-    assert len(architectures) == 1
-    assert {entry["platform"] for entry in architectures} == {"linux/amd64"}
+    assert len(architectures) == 2
+    assert {entry["platform"] for entry in architectures} == {"linux/amd64", "linux/arm64"}
     assert root["name"] == ""
+    assert nonroot["name"] == "nonroot"
     assert "matrix.variant.name == ''" in promotion["if"]
     assert "steps.manifest.outputs.index_digest != ''" in promotion["if"]
     assert "steps.version.outputs.version != ''" in promotion["if"]
@@ -84,19 +304,92 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
         step["run"] for step in manifest["steps"] if step["name"] == "Create multi-arch manifest"
     )
     assert 'digest_count="$(find "${DIGEST_DIR}" -maxdepth 1 -type f | wc -l)"' in manifest_script
-    assert '"${digest_count}" -ne 1' in manifest_script
-    assert manifest_script.index('"${digest_count}" -ne 1') < manifest_script.index(
+    assert '"${digest_count}" -ne 2' in manifest_script
+    assert manifest_script.index('"${digest_count}" -ne 2') < manifest_script.index(
         "docker buildx imagetools create"
     )
-    guard_start = manifest_script.index('"${digest_count}" -ne 1')
+    guard_start = manifest_script.index('"${digest_count}" -ne 2')
     create_start = manifest_script.index("docker buildx imagetools create")
     assert guard_start < manifest_script.index("exit 1", guard_start) < create_start
 
 
-def test_self_hosted_image_keeps_bedrock_and_memory_stack_dependencies() -> None:
-    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
-    target = bake.split('target "runtime-self-hosted"', 1)[1].split('\ntarget "', 1)[0]
-    assert 'HEADROOM_EXTRAS = "proxy,code,memory-stack,bedrock"' in target
+def test_only_the_root_cell_can_ever_publish_a_bare_latest_tag() -> None:
+    """`:latest` must have exactly one writer (#3150).
+
+    The sibling test above proves the *promotion step* is owned by the root
+    cell. That was never the whole contract: it checked the intended writer
+    and not the absence of unintended ones.
+
+    ``docker/metadata-action`` defaults to ``latest=auto``, which appends a
+    bare ``latest`` for any semver release. Its own log line reads
+    ``suffixLatest=false`` — the per-tag ``suffix=`` that keeps every other
+    tag variant-scoped does not reach it. So all eight variant cells emitted
+    ``ghcr.io/.../headroom:latest`` and the last to finish won the tag. At
+    0.36.0 that was ``code-slim``: ``:latest`` resolved to the distroless
+    build, whose ``import onnxruntime`` segfaults on arm64, and
+    ``headroom deploy`` crash-looped on Apple Silicon with SIGSEGV.
+
+    Two things hold the line, and both are asserted here: ``latest=false``
+    stops the tag being generated at all, and a runtime guard refuses to
+    publish if a suffixed variant ever carries one anyway.
+    """
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+    manifest = workflow["jobs"]["docker-manifest"]
+
+    meta = next(step for step in manifest["steps"] if step.get("id") == "meta")
+    flavor = meta["with"].get("flavor", "")
+    assert "latest=false" in flavor, (
+        "docker/metadata-action defaults to latest=auto; without latest=false "
+        "every variant cell publishes a bare :latest and the last one wins"
+    )
+
+    # No tag rule may reintroduce it explicitly either.
+    assert "value=latest" not in meta["with"]["tags"]
+
+    create = next(
+        step for step in manifest["steps"] if step["name"] == "Create multi-arch manifest"
+    )
+    script = create["run"]
+    # The guard reads the variant name from env, never spliced inline.
+    assert create["env"].get("VARIANT_NAME") == "${{ matrix.variant.name }}"
+    assert 'endswith(":latest")' in script
+    assert script.index('endswith(":latest")') < script.index("docker buildx imagetools create"), (
+        "the bare-latest guard must run before anything is pushed"
+    )
+
+
+def test_docker_manifest_downloads_exactly_one_artifact_per_architecture() -> None:
+    """Each manifest cell must download exactly its two architecture digests.
+
+    Keeping the variant before a trailing wildcard makes prefix-related names
+    overlap: ``digests-code-*`` also selects code-nonroot, code-slim, and
+    code-slim-nonroot. The 0.35.0 Docker release exposed this by downloading
+    eight markers into the code manifest job instead of two.
+    """
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+    jobs = workflow["jobs"]
+    build = jobs["docker-build"]
+    manifest = jobs["docker-manifest"]
+    upload = next(step for step in build["steps"] if step.get("name") == "Upload digest marker")
+    downloads = [
+        step
+        for step in manifest["steps"]
+        if step.get("name")
+        in {
+            "Download amd64 digest for this variant",
+            "Download arm64 digest for this variant",
+        }
+    ]
+
+    assert upload["with"]["name"] == (
+        "digests-${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}"
+    )
+    assert [step["with"]["name"] for step in downloads] == [
+        "digests-${{ matrix.variant.name || 'root' }}-amd64",
+        "digests-${{ matrix.variant.name || 'root' }}-arm64",
+    ]
+    assert all("pattern" not in step["with"] for step in downloads)
+    assert all(step["with"]["path"] == "${{ runner.temp }}/digests" for step in downloads)
 
 
 def test_release_workflow_publishes_both_node_packages_to_github_packages() -> None:
@@ -238,27 +531,36 @@ def test_no_native_tls_in_wheel_build_tree() -> None:
     """
     import subprocess
 
-    if shutil.which("cargo") is None:
-        pytest.skip("cargo is unavailable in this environment")
-
     for crate in ("headroom-py", "headroom-proxy", "headroom-core"):
-        result = subprocess.run(
-            [
-                "cargo",
-                "tree",
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "-p",
-                crate,
-                "-i",
-                "native-tls",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "cargo",
+                    "tree",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "-p",
+                    crate,
+                    "-i",
+                    "native-tls",
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            pytest.skip("cargo is unavailable in this environment")
+        # Same environment gates as the openssl-sys dual above: a cargo
+        # failure that is not "package did not match" means the Linux wheel
+        # target is unavailable here, not that native-tls came back.
         not_in_tree = result.returncode != 0 and "did not match any packages" in result.stderr
+        if result.returncode != 0 and "package ID specification `native-tls` did not match" not in (
+            result.stderr + result.stdout
+        ):
+            pytest.skip(
+                "cargo dependency tree for the Linux wheel target is unavailable in this environment"
+            )
         assert not_in_tree, (
             f"native-tls is back in {crate}'s build tree — likely some "
             f"crate's `default-features = true` re-enabled native-tls "
@@ -512,7 +814,9 @@ def test_docker_workflow_builds_on_native_arch_runners() -> None:
     assert "runs_on: ubuntu-24.04, platform: linux/amd64" in content, (
         "amd64 arch matrix entry must bind ubuntu-24.04 (native x86_64)"
     )
-    assert "runs_on: ubuntu-24.04-arm, platform: linux/arm64" not in content
+    assert "runs_on: ubuntu-24.04-arm, platform: linux/arm64" in content, (
+        "arm64 arch matrix entry must bind ubuntu-24.04-arm (native aarch64)"
+    )
 
     # Per-arch builds must push by digest only — tags belong on the
     # multi-arch manifest, applied later by docker-manifest.
@@ -1172,14 +1476,17 @@ def test_release_workflow_runs_dry_run_on_pull_request() -> None:
 
 
 def test_release_yml_triggers_on_release_published_not_every_push_to_main() -> None:
-    """release.yml fires for an explicitly published release, not per main push.
+    """release.yml fires when release-please publishes a release, not per main push.
 
     The prior trigger (`push: branches: [main]`) caused a fresh wheel
     matrix to be uploaded to PyPI for every merged `fix:`/`feat:` PR.
     PyPI enforces a 10 GiB per-project storage quota and the project
     breached it in May 2026 (publish-pypi failing on every main merge
-    from PR #482 forward). An explicit GitHub Release event is what
-    triggers this workflow.
+    from PR #482 forward). The fix routes releases through
+    release-please's release-PR pattern: bot opens/maintains a
+    `chore: release vX.Y.Z` PR aggregating conventional-commit traffic;
+    merging that PR creates the tag + GitHub Release; THAT release
+    event is what triggers this workflow.
 
     Reverting to a per-push trigger would re-create the quota
     blowup. This test fails any refactor that does so silently.
@@ -1189,12 +1496,14 @@ def test_release_yml_triggers_on_release_published_not_every_push_to_main() -> N
     on_block = content[:on_block_end]
 
     assert "\n  release:\n    types: [published]" in on_block, (
-        "release.yml must trigger on the explicit `release: published` event."
+        "release.yml must trigger on the `release: published` event so "
+        "release-please's release-PR merge is the only way to publish — "
+        "see .github/workflows/release-please.yml."
     )
     assert "\n  push:\n    branches: [main]" not in on_block, (
         "release.yml MUST NOT trigger on every push to main. That pattern "
         "burned PyPI's 10 GiB storage quota (one fresh wheel matrix per "
-        "merged PR). Keep releases explicit instead."
+        "merged PR). Route releases through release-please instead."
     )
 
 
@@ -1227,19 +1536,6 @@ def test_release_yml_resolves_manual_ver_from_release_tag() -> None:
     )
 
 
-def test_release_yml_preserves_existing_release_notes() -> None:
-    """create-release must not clobber an existing release's notes."""
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-    create_release_idx = content.index("\n  create-release:")
-    create_release_block = content[create_release_idx:]
-
-    assert 'gh release edit "$TAG" --title "$TITLE"\n' in create_release_block, (
-        "When the release already exists, the edit "
-        "must only sync title — NOT pass --notes-file, which would "
-        "clobber the bot's auto-generated changelog."
-    )
-
-
 def test_version_sync_covers_every_file_the_verifier_gates() -> None:
     """version-sync.py must write every version location verify-versions.py checks.
 
@@ -1269,3 +1565,47 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "server.json",
     ]:
         assert fragment in sync, f"version-sync.py no longer propagates a version to {fragment}"
+
+
+def test_release_please_automation_is_not_present() -> None:
+    obsolete_paths = (
+        ".github/workflows/release-please.yml",
+        ".github/workflows/release-metadata-sync.yml",
+        ".github/workflows/changelog-guard.yml",
+        ".release-please-config.json",
+        ".release-please-manifest.json",
+    )
+
+    assert not [path for path in obsolete_paths if (ROOT / path).exists()]
+
+
+def test_ci_covers_self_hosted_pushes_and_pull_requests() -> None:
+    workflow = yaml.load(
+        (ROOT / ".github" / "workflows" / "ci.yml").read_text(), Loader=yaml.BaseLoader
+    )
+
+    assert workflow["run-name"] == "CI / ${{ github.ref_name }}"
+    assert "self-hosted" in workflow["on"]["push"]["branches"]
+    assert "self-hosted" in workflow["on"]["pull_request"]["branches"]
+    native_filter = workflow["jobs"]["changes"]["steps"][1]["with"]["filters"]
+    assert "'config/deploy.yml'" in native_filter
+    assert "'docker-bake.hcl'" in native_filter
+
+
+def test_self_hosted_image_keeps_bedrock_and_memory_stack_dependencies() -> None:
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    target = bake.split('target "runtime-self-hosted"', 1)[1].split('\ntarget "', 1)[0]
+    assert 'HEADROOM_EXTRAS = "proxy,code,memory-stack,bedrock"' in target
+
+
+def test_release_yml_preserves_existing_release_notes() -> None:
+    """create-release must not clobber an existing release's notes."""
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    create_release_idx = content.index("\n  create-release:")
+    create_release_block = content[create_release_idx:]
+
+    assert 'gh release edit "$TAG" --title "$TITLE"\n' in create_release_block, (
+        "When the release already exists, the edit "
+        "must only sync title — NOT pass --notes-file, which would "
+        "clobber the bot's auto-generated changelog."
+    )

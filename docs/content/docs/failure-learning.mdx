@@ -24,7 +24,20 @@ headroom learn --all --apply
 headroom learn --apply --target CLAUDE.md
 ```
 
+## Codex instructions
+
+For Codex, run `headroom learn --agent codex --apply` on the machine with
+your session history. Both facts and preferences are saved to the global
+`~/.codex/AGENTS.md`, or its non-empty `AGENTS.override.md` when present.
+Generated rules from the legacy `~/.codex/instructions.md` are carried forward;
+the legacy file is left intact. Active instructions stay within Codex's default
+32 KiB limit; complete generated rules live in the adjacent
+`AGENTS.headroom.md` (or `AGENTS.override.headroom.md`) archive, linked from the
+active file. Start a new Codex session to load the changes.
+These instructions stay on the client and do not require a Kamal redeploy.
+
 ## Success Correlation
+
 
 The core innovation. Instead of cataloging failures ("Read failed 5 times"), Headroom finds what the model did to **fix** each failure:
 

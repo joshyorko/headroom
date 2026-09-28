@@ -346,7 +346,11 @@ class ClaudeCodeWriter(ContextWriter):
 
 
 class CodexWriter(ContextWriter):
-    """Writes learned patterns to AGENTS.md and instructions.md for Codex CLI."""
+    """Write facts and preferences to the active AGENTS file Codex loads."""
+
+    def __init__(self, max_bytes: int = 32 * 1024, max_managed_bytes: int = 16 * 1024) -> None:
+        self.max_bytes = max_bytes
+        self.max_managed_bytes = max_managed_bytes
 
     def write(
         self,
@@ -357,26 +361,123 @@ class CodexWriter(ContextWriter):
         result = WriteResult()
         result.dry_run = dry_run
 
-        context_recs = [r for r in recommendations if r.target == RecommendationTarget.CONTEXT_FILE]
-        memory_recs = [r for r in recommendations if r.target == RecommendationTarget.MEMORY_FILE]
+        if not recommendations:
+            return result
 
-        if context_recs:
-            agents_md = project.context_file or (project.project_path / "AGENTS.md")
-            full_content = _merge_into_file(agents_md, context_recs)
-            result.add(agents_md, full_content)
-            if not dry_run:
-                agents_md.parent.mkdir(parents=True, exist_ok=True)
-                agents_md.write_text(full_content, encoding="utf-8", newline="\n")
-
-        if memory_recs:
-            instructions_md = project.memory_file or (project.data_path.parent / "instructions.md")
-            full_content = _merge_into_file(instructions_md, memory_recs)
-            result.add(instructions_md, full_content)
-            if not dry_run:
-                instructions_md.parent.mkdir(parents=True, exist_ok=True)
-                instructions_md.write_text(full_content, encoding="utf-8", newline="\n")
+        agents_md = project.context_file or (project.project_path / "AGENTS.md")
+        archive_path = agents_md.with_name(f"{agents_md.stem}.headroom.md")
+        # The archive is authoritative after the first bounded write. This keeps
+        # a formerly-active stale heading from replacing its newer archived form.
+        archive_has_block = (
+            archive_path.exists()
+            and extract_marker_block(_read_text_tolerant(archive_path)) is not None
+        )
+        if archive_has_block:
+            merged = _merge_recommendations(archive_path, recommendations)
+        else:
+            merged = _merge_recommendations(agents_md, recommendations)
+            # Older versions stored preferences in instructions.md, which Codex
+            # does not load by default. Carry forward generated rules only.
+        if (
+            not archive_has_block
+            and project.memory_file
+            and project.memory_file
+            not in (
+                agents_md,
+                archive_path,
+            )
+        ):
+            merged = _merge_recommendations(project.memory_file, merged)
+        # Rebuild only the managed block, retaining any companion-file notes.
+        archive_content = _merge_codex_archive(archive_path, merged)
+        full_content = _bounded_codex_content(
+            agents_md, merged, archive_path.name, self.max_bytes, self.max_managed_bytes
+        )
+        # Preview both outputs, and write the archive before its active pointer.
+        result.add(agents_md, full_content)
+        result.add(archive_path, archive_content)
+        if not dry_run:
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            archive_path.write_text(archive_content, encoding="utf-8", newline="\n")
+            agents_md.parent.mkdir(parents=True, exist_ok=True)
+            agents_md.write_text(full_content, encoding="utf-8", newline="\n")
 
         return result
+
+
+def _merge_codex_archive(path: Path, recommendations: list[Recommendation]) -> str:
+    """Replace or append the archive block while preserving companion notes verbatim."""
+    existing = path.read_bytes().decode("utf-8") if path.exists() else ""
+    section = _build_section(recommendations)
+    match = _MARKER_PATTERN.search(existing)
+    if match:
+        return existing[: match.start()] + section + existing[match.end() :]
+    separator = "\n\n" if existing and not existing.endswith("\n\n") else ""
+    return existing + separator + section + "\n"
+
+
+def _bounded_codex_content(
+    path: Path,
+    recommendations: list[Recommendation],
+    archive_name: str,
+    max_bytes: int,
+    max_managed_bytes: int,
+) -> str:
+    """Render the largest priority-ordered complete section set within the byte limit."""
+    existing = path.read_bytes().decode("utf-8") if path.exists() else ""
+    match = _MARKER_PATTERN.search(existing)
+    if match:
+        prefix, suffix = existing[: match.start()], existing[match.end() :]
+        join = ""
+    else:
+        prefix, suffix = existing, ""
+        join = "\n\n" if existing and not existing.endswith("\n\n") else ""
+    fixed_bytes = len((prefix + suffix + join).encode("utf-8"))
+    if fixed_bytes > max_bytes:
+        raise ValueError(
+            f"handwritten content in {path} is {fixed_bytes} bytes and exceeds "
+            f"{max_bytes} bytes (Codex instruction limit); shorten it before applying learnings."
+        )
+
+    pointer = (
+        "## Headroom Learned Patterns\n"
+        "*Auto-generated by `headroom learn` — consult the complete archive "
+        f"`{archive_name}` as needed.*\n\n"
+    )
+    selected: list[Recommendation] = []
+
+    def render(items: list[Recommendation]) -> str:
+        lines = [_MARKER_START, pointer.rstrip("\n")]
+        for rec in items:
+            lines.append("")
+            lines.append(f"### {rec.section}")
+            if rec.estimated_tokens_saved > 0:
+                lines.append(f"*~{rec.estimated_tokens_saved:,} tokens/session saved*")
+            lines.append(rec.content)
+        lines.append(_MARKER_END)
+        return "\n".join(lines)
+
+    block = render(selected)
+    minimum = prefix + join + block + suffix
+    if len(block.encode("utf-8")) > max_managed_bytes:
+        raise ValueError(
+            f"The Codex archive pointer needs {len(block.encode('utf-8'))} managed bytes, "
+            f"exceeding the {max_managed_bytes}-byte Headroom block limit."
+        )
+    if len(minimum.encode("utf-8")) > max_bytes:
+        raise ValueError(
+            f"handwritten content in {path} leaves no room for the Headroom archive "
+            f"pointer within the {max_bytes}-byte Codex instruction limit."
+        )
+    for rec in recommendations:
+        candidate = render([*selected, rec])
+        content = prefix + join + candidate + suffix
+        if (
+            len(content.encode("utf-8")) <= max_bytes
+            and len(candidate.encode("utf-8")) <= max_managed_bytes
+        ):
+            selected.append(rec)
+    return prefix + join + render(selected) + suffix
 
 
 # =============================================================================

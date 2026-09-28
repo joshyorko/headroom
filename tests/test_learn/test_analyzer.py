@@ -265,6 +265,32 @@ class TestPriorPatternsInjection:
         assert "### Large Files" in digest
         assert "App.tsx" in digest
 
+    def test_codex_digest_prefers_full_archive_to_bounded_active_block(self, tmp_path):
+        project = _project_with_files(
+            tmp_path,
+            claude_md_text=(
+                "# Human instructions\n"
+                "<!-- headroom:learn:start -->\n### Selected\n- active subset\n"
+                "<!-- headroom:learn:end -->\n"
+            ),
+            memory_md_text=None,
+        )
+        project.context_file = project.project_path / "AGENTS.md"
+        project.context_file.write_text(
+            "<!-- headroom:learn:start -->\n### Selected\n- active subset\n"
+            "<!-- headroom:learn:end -->\n"
+        )
+        (project.project_path / "AGENTS.headroom.md").write_text(
+            "<!-- headroom:learn:start -->\n### Overflow heading\n- full archived rule\n"
+            "<!-- headroom:learn:end -->\n"
+        )
+
+        digest = _build_digest(project, [])
+
+        assert "Overflow heading" in digest
+        assert "full archived rule" in digest
+        assert "active subset" not in digest
+
     def test_digest_includes_prior_block_from_memory_md(self, tmp_path):
         project = _project_with_files(
             tmp_path, claude_md_text=None, memory_md_text=f"{_MARKER_BLOCK}\n"

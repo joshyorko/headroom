@@ -290,7 +290,7 @@ def test_verbosity_all_apply_aggregates_baselines_across_projects(
         str(proj_b.project_path): (_Profile(3), base_b),
     }
 
-    def fake_analyze(session_paths, project_path, llm_judge=None):  # noqa: ANN001, ANN201
+    def fake_analyze(session_paths, project_path, llm_judge=None, on_progress=None):  # noqa: ANN001, ANN201
         return results[project_path]
 
     monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
@@ -541,6 +541,11 @@ def test_learn_verbosity_codex_apply_writes_baseline(
     assert result.exit_code == 0, result.output
     assert plugin.verbosity_calls == [data_path]
     assert "Verbosity — codex" in result.output
+    assert "Discovering OpenAI Codex CLI sessions..." in result.output
+    assert "Reading responses (pass 1/2): 0/1 completed" in result.output
+    assert "Reading responses (pass 1/2): 1/1 completed" in result.output
+    assert "Checking reading times (pass 2/2): 1/1 completed" in result.output
+    assert "Saving verbosity preference and savings baseline..." in result.output
     assert "[WROTE]" in result.output
     assert expected_session.exists()
 

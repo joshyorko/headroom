@@ -476,6 +476,8 @@ def _run_verbosity(
     model: str | None,
 ) -> None:
     """Learn preferred output verbosity from session transcripts."""
+    from time import monotonic
+
     from ..learn.registry import auto_detect_plugins, get_plugin
     from ..learn.verbosity import analyze
     from ..paths import ensure_workspace_dir
@@ -498,6 +500,7 @@ def _run_verbosity(
             )
             return
 
+    click.echo(f"Discovering {plugin.display_name} sessions...", err=True)
     all_projects = plugin.discover_projects()
     if not all_projects:
         click.echo("No Claude Code project data found.")
@@ -531,11 +534,28 @@ def _run_verbosity(
     best_profile_samples = -1
     analyzed_count = 0
 
+    started = monotonic()
+    last_update = started
+    last_stage = ""
+
+    def report_progress(stage: str, completed: int, total: int) -> None:
+        nonlocal last_update, last_stage
+        now = monotonic()
+        if stage != last_stage or completed == total or now - last_update >= 2:
+            click.echo(
+                f"  {stage}: {completed}/{total} completed ({now - started:.0f}s elapsed)",
+                err=True,
+            )
+            last_update, last_stage = now, stage
+
     for proj in targets:
+        click.echo(f"Finding transcripts for {proj.name}...", err=True)
         session_paths = _verbosity_session_paths(plugin, proj.data_path)
         if not session_paths:
             continue
-        profile, baseline = analyze(session_paths, str(proj.project_path), llm_judge=judge)
+        profile, baseline = analyze(
+            session_paths, str(proj.project_path), llm_judge=judge, on_progress=report_progress
+        )
         sig = profile.signals
         analyzed_count += 1
         aggregated.merge(baseline)
@@ -573,6 +593,7 @@ def _run_verbosity(
         return
 
     if apply:
+        click.echo("Saving verbosity preference and savings baseline...", err=True)
         ws = ensure_workspace_dir()
         from datetime import datetime, timezone
 

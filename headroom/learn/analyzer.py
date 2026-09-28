@@ -269,9 +269,30 @@ def _build_prior_patterns_section(project: ProjectInfo) -> str:
     for label, path in candidates:
         if path is None or not path.exists():
             continue
-        block = extract_marker_block(path.read_text(encoding="utf-8", errors="replace"))
+        context_path = project.context_file
+        if (
+            label.startswith("MEMORY.md")
+            and path.name == "instructions.md"
+            and context_path is not None
+            and context_path.name in {"AGENTS.md", "AGENTS.override.md"}
+        ):
+            legacy_archive = context_path.with_name(f"{context_path.stem}.headroom.md")
+            if legacy_archive.exists() and extract_marker_block(
+                legacy_archive.read_text(encoding="utf-8", errors="replace")
+            ):
+                continue
+        source_path = path
+        source_label = label
+        if path.name in {"AGENTS.md", "AGENTS.override.md"}:
+            archive = path.with_name(f"{path.stem}.headroom.md")
+            if archive.exists():
+                archive_text = archive.read_text(encoding="utf-8", errors="replace")
+                if extract_marker_block(archive_text):
+                    source_path = archive
+                    source_label = f"{archive.name} (full Codex learnings archive)"
+        block = extract_marker_block(source_path.read_text(encoding="utf-8", errors="replace"))
         if block:
-            parts.append((label, block))
+            parts.append((source_label, block))
 
     if not parts:
         return ""

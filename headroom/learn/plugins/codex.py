@@ -89,6 +89,9 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
             return []
 
         agents_md = self.codex_dir / "AGENTS.md"
+        override_md = self.codex_dir / "AGENTS.override.md"
+        if override_md.is_file() and override_md.read_text(encoding="utf-8").strip():
+            agents_md = override_md
         instructions_md = self.codex_dir / "instructions.md"
 
         return [
@@ -96,7 +99,7 @@ class CodexPlugin(LearnPlugin, ConversationScanner):
                 name="codex",
                 project_path=Path.cwd(),
                 data_path=self.sessions_dir,
-                context_file=agents_md if agents_md.exists() else None,
+                context_file=agents_md,
                 memory_file=instructions_md if instructions_md.exists() else None,
             )
         ]

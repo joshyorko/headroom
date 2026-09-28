@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -449,6 +450,8 @@ def _ordered_events(path: Path) -> list[tuple[float | None, str, _Response | _Hu
 
 def extract_signals(
     session_paths: list[Path],
+    *,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> tuple[VerbositySignals, BaselineModel]:
     """Compute behavioral signals and the per-stratum output-token baseline."""
     sig = VerbositySignals()
@@ -458,8 +461,13 @@ def extract_signals(
     # First pass: collect every response word-count to derive the per-user
     # adaptive "long" threshold (median), so "long" scales to the user.
     parsed: list[tuple[list[_Response], list[_HumanMsg]]] = []
-    for p in session_paths:
+    total = len(session_paths)
+    if on_progress:
+        on_progress("Reading responses (pass 1/2)", 0, total)
+    for index, p in enumerate(session_paths, 1):
         responses, humans, _ = _parse_session(p)
+        if on_progress:
+            on_progress("Reading responses (pass 1/2)", index, total)
         if not responses and not humans:
             continue
         sig.sessions += 1
@@ -474,6 +482,8 @@ def extract_signals(
 
     echo_sum = 0.0
     echo_n = 0
+    if on_progress:
+        on_progress("Computing response statistics", 0, len(parsed))
     for responses, humans in parsed:
         for r in responses:
             sig.asst_responses += 1
@@ -498,7 +508,9 @@ def extract_signals(
                 sig.human_msgs += 1
 
     # Second pass: fast-skip pairing via interleaved order.
-    for p in session_paths:
+    if on_progress:
+        on_progress("Checking reading times (pass 2/2)", 0, total)
+    for index, p in enumerate(session_paths, 1):
         events = _ordered_events(p)
         last_resp: _Response | None = None
         for ts, kind, obj in events:
@@ -518,6 +530,8 @@ def extract_signals(
                     if (ts - last_resp.ts) < _SKIP_READ_FRACTION * read_secs:
                         sig.fast_skips += 1
                 last_resp = None
+        if on_progress:
+            on_progress("Checking reading times (pass 2/2)", index, total)
 
     sig.mean_echo_ratio = echo_sum / echo_n if echo_n else 0.0
     return sig, baseline
@@ -581,6 +595,7 @@ def analyze(
     project_path: str,
     *,
     llm_judge: Any | None = None,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> tuple[VerbosityProfile, BaselineModel]:
     """Full analysis: signals → recommendation → profile, plus the baseline.
 
@@ -588,10 +603,12 @@ def analyze(
     that overrides the heuristic. Kept injectable so the core stays LLM-free and
     testable; the CLI wires a real LLM call.
     """
-    sig, baseline = extract_signals(session_paths)
+    sig, baseline = extract_signals(session_paths, on_progress=on_progress)
     level, confidence, rationale = recommend_level(sig)
     source = "heuristic"
     if llm_judge is not None:
+        if on_progress:
+            on_progress("Consulting LLM judge", 0, 1)
         try:
             verdict = llm_judge(sig.to_dict())
             if verdict is not None:

@@ -5,7 +5,9 @@ import sys
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from headroom.providers.openai_realtime import relay_realtime_websocket
 from headroom.proxy.server import ProxyConfig, create_app
@@ -151,6 +153,74 @@ def test_realtime_websocket_routes_are_registered() -> None:
 
     assert "/v1/realtime" in websocket_paths
     assert "/v1/live/{call_id}" in websocket_paths
+
+
+@pytest.mark.parametrize("path", ["/v1/realtime", "/v1/live/rtc_123"])
+@pytest.mark.parametrize("bearer_proxy_token", [False, True])
+def test_authenticated_remote_realtime_route_relays_after_proxy_token_scrub(
+    monkeypatch, path, bearer_proxy_token
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "headroom-secret")
+    connect_calls = []
+
+    class FakeUpstream:
+        subprotocol = None
+        close_code = 1000
+        close_reason = "done"
+
+        def __aiter__(self):
+            self.frames = iter([b"opaque upstream frame"])
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.frames)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+        async def close(self, **kwargs):
+            pass
+
+    async def fake_connect(url, **kwargs):
+        connect_calls.append((url, kwargs))
+        return FakeUpstream()
+
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=fake_connect))
+    headers = {"authorization": "Bearer headroom-secret"}
+    if not bearer_proxy_token:
+        headers = {
+            "x-headroom-proxy-token": "headroom-secret",
+            "authorization": "Bearer provider-key",
+        }
+    client = TestClient(create_app(ProxyConfig()), client=("198.51.100.10", 12345))
+    with client.websocket_connect(path, headers=headers) as websocket:
+        assert websocket.receive_bytes() == b"opaque upstream frame"
+
+    assert len(connect_calls) == 1
+    forwarded = connect_calls[0][1]["additional_headers"]
+    assert "x-headroom-proxy-token" not in forwarded
+    assert "headroom-secret" not in str(forwarded)
+    if not bearer_proxy_token:
+        assert forwarded["authorization"] == "Bearer provider-key"
+
+
+@pytest.mark.parametrize("path", ["/v1/realtime", "/v1/live/rtc_123"])
+def test_remote_realtime_route_rejects_missing_or_invalid_proxy_token(monkeypatch, path) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "headroom-secret")
+    connect_calls = []
+
+    async def unexpected_connect(*args, **kwargs):
+        connect_calls.append((args, kwargs))
+        raise AssertionError("unauthorized websocket reached upstream")
+
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=unexpected_connect))
+    client = TestClient(create_app(ProxyConfig()), client=("198.51.100.10", 12345))
+    for headers in ({}, {"x-headroom-proxy-token": "invalid"}):
+        with pytest.raises(WebSocketDisconnect) as error:
+            with client.websocket_connect(path, headers=headers):
+                pass
+        assert error.value.code == 1008
+    assert connect_calls == []
 
 
 def test_realtime_websocket_route_honors_custom_upstream(monkeypatch) -> None:

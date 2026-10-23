@@ -6,9 +6,25 @@ used across all scanner plugins.
 
 from __future__ import annotations
 
+import os
 import re
+from pathlib import Path
 
 from .models import ErrorCategory
+
+
+def claude_config_dir() -> Path:
+    """Resolve the Claude Code config directory, honoring ``CLAUDE_CONFIG_DIR``.
+
+    Claude Code relocates its config (including ``projects/`` logs and the
+    global ``CLAUDE.md``) when ``CLAUDE_CONFIG_DIR`` is set. ``headroom learn``
+    must read and write the same directory, mirroring the override already
+    honored in ``subscription`` and ``mcp_registry``. Falls back to
+    ``~/.claude``.
+    """
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(base) if base else Path.home() / ".claude"
+
 
 # =============================================================================
 # Error Classification
@@ -53,7 +69,14 @@ _ERROR_PATTERNS: list[tuple[re.Pattern[str], ErrorCategory]] = [
         ErrorCategory.USER_REJECTED,
     ),
     (re.compile(r"[Ss]ibling tool call errored", re.I), ErrorCategory.SIBLING_ERROR),
-    (re.compile(r"exit code|non-zero|exited with", re.I), ErrorCategory.EXIT_CODE),
+    # A signal kill is the shell's exit status 128+N, so it shares EXIT_CODE.
+    (
+        re.compile(
+            r"exit code|non-zero|exited with|killed by signal|^\s*Killed(?::\s*\d+)?\s*$",
+            re.I | re.M,
+        ),
+        ErrorCategory.EXIT_CODE,
+    ),
     (
         re.compile(r"BUILD FAILED|compilation error|compile error", re.I),
         ErrorCategory.BUILD_FAILURE,

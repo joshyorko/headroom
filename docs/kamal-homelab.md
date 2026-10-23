@@ -12,6 +12,20 @@ $EDITOR .env.kamal.local
 Set `KAMAL_HOST` and `KAMAL_PUBLIC_HOST` to Harvester VM IP. Keep `KAMAL_PUBLIC_HOST`
 as IP unless DNS exists.
 
+Keep `HEADROOM_BEACON=off`, `HEADROOM_TELEMETRY=off`, and `DO_NOT_TRACK=1`
+in `.env.kamal.local`. Kamal forwards these values to the app, with the same
+defaults when unset. The Compose override uses these defaults too. Anonymous
+uploads and local telemetry collection stay disabled across upstream upgrades.
+Deploy the updated config to apply these settings to an existing container.
+
+Before deploying 0.41.0, configure a private `HEADROOM_PROXY_TOKEN` in
+`.env.kamal.local` and update each remote client to send it through
+`X-Headroom-Proxy-Token`. Keep provider credentials in their existing headers.
+Kamal passes the proxy token as a secret only when configured. The proxy refuses
+the existing network listener without authentication; this update does not
+enable the unauthenticated-bind override. Review client compatibility before
+deploying. Health probes remain accessible without the token.
+
 ## Prepare VM
 
 Kamal needs SSH access plus Docker on VM. From this repo:
@@ -81,7 +95,7 @@ bin/kamal logs
 
 ## Current caveat
 
-Kamal runs Qdrant and Neo4j as accessories now, and `config/deploy.yml` starts
-the app with `--memory-backend qdrant-neo4j`. Keep `.env.kamal.local` aligned
+Kamal runs Qdrant and Neo4j as accessories, and `config/deploy.yml` selects
+`HEADROOM_MEMORY_BACKEND=qdrant-neo4j`. Keep `.env.kamal.local` aligned
 with that backend and verify both accessories are booted before relying on graph
 memory.

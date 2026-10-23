@@ -4,6 +4,7 @@ import asyncio
 from typing import Any
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from headroom.memory.traffic_learner import TrafficLearner
@@ -117,7 +118,17 @@ def test_responses_input_does_not_promote_unknown_role_to_user() -> None:
     ]
 
 
-def test_responses_http_request_reaches_traffic_learner() -> None:
+@pytest.mark.parametrize(
+    ("client_headers", "expected_observations"),
+    [
+        ({}, 1),
+        ({"user-agent": "codex/1.0"}, 0),
+        ({"user-agent": "codex/1.0", "x-headroom-project-id": "isolated-project"}, 0),
+    ],
+)
+def test_responses_http_request_respects_traffic_learning_scope(
+    client_headers: dict[str, str], expected_observations: int
+) -> None:
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
@@ -138,22 +149,26 @@ def test_responses_http_request_reaches_traffic_learner() -> None:
 
     response = client.post(
         "/v1/responses",
-        headers={"authorization": "Bearer test-token"},
+        headers={"authorization": "Bearer test-token", **client_headers},
         json={"model": "gpt-5", "input": _responses_input(), "stream": False},
     )
 
     assert response.status_code == 200, response.text
-    assert len(learner.message_batches) == 1
-    assert learner.tool_results == [
-        {
-            "tool_name": "shell",
-            "tool_input": {"cmd": "missing-command"},
-            "tool_output": "command not found",
-            "is_error": True,
-            "user_id": None,
-            "backend": None,
-        }
-    ]
+    assert len(learner.message_batches) == expected_observations
+    assert learner.tool_results == (
+        [
+            {
+                "tool_name": "shell",
+                "tool_input": {"cmd": "missing-command"},
+                "tool_output": "command not found",
+                "is_error": True,
+                "user_id": None,
+                "backend": None,
+            }
+        ]
+        if expected_observations
+        else []
+    )
 
 
 def _ws_frame(call_ids: list[str]) -> dict[str, Any]:

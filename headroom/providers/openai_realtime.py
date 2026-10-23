@@ -143,7 +143,12 @@ async def relay_realtime_websocket(
     expected_token = proxy_token or os.environ.get("HEADROOM_PROXY_TOKEN") or None
     client = getattr(websocket, "client", None)
     client_host = getattr(client, "host", None) if client is not None else None
-    if expected_token and not is_loopback_host(client_host):
+    # The ASGI gate authenticates before scrubbing the proxy credential. This
+    # state is internal to the request, never accepted from client headers.
+    authenticated_by_gate = (
+        websocket.scope.get("state", {}).get("_headroom_proxy_token_authenticated") is True
+    )
+    if expected_token and not is_loopback_host(client_host) and not authenticated_by_gate:
         provided = inbound_headers.get("x-headroom-proxy-token")
         if not provided:
             auth = inbound_headers.get("authorization", "")

@@ -14,6 +14,7 @@ unchanged. Nothing here raises.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 
@@ -32,6 +33,12 @@ __all__ = [
     "compact_lossless",
 ]
 
+from ..log_safety import describe_exception, safe_id
+
+logger = logging.getLogger(__name__)
+
+# ANSI CSI SGR (color/style) escape sequences: ESC [ ... m. Color is
+# non-semantic, so stripping it is a safe (one-way) lossless-of-meaning op.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _RUN_MARKER_RE = re.compile(r"^\.\.\. \(repeated (\d+) times\)$")
 
@@ -495,6 +502,16 @@ def compact_lossless(content: str, kind: str) -> str:
             if expand_runs(unfold_repeated_blocks(candidate)) != content:
                 return content
             return candidate if _smaller(candidate, content) else content
-    except Exception:
+    except Exception as e:
+        # The exception text can quote the content, so no level logs it;
+        # describe_exception keeps only types and code locations.
+        logger.warning(
+            "Lossless compaction (%s) failed (%s) on %d chars; leaving content as-is",
+            kind,
+            safe_id(e),
+            len(content),
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Lossless compaction failure detail: %s", describe_exception(e))
         return content
     return content

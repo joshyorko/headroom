@@ -1,4 +1,23 @@
-"""Prompt-conditioned relevance split for KEEP/DROP compression decisions."""
+"""Prompt-conditioned relevance split for KEEP/DROP compression decisions.
+
+Segments tool output into coherent records, scores each against the request's
+*information need* (user prompt + the triggering tool call's args) using the
+existing :class:`~headroom.relevance.RelevanceScorer` (BM25 / bge-small
+embeddings / hybrid), and partitions the content into ordered KEEP/DROP runs.
+
+The split is **mode-agnostic**: this module decides *what* is worth keeping
+verbatim vs. what is a low-value tail; the caller applies the disposition. In
+lossless (no-CCR) mode the KEEP runs stay byte-verbatim and the DROP tail is
+Kompressed marker-free; in CCR mode the same DROP tail can be dropped with a
+retrieval marker. Nothing here emits markers or calls a compressor.
+
+Segmentation is boundary-aware, not line-based: blank lines delimit records,
+indented continuation lines stay attached to their parent (so short stack
+traces and pretty-printed blobs are scored as one unit), and dense blank-free
+streams (grep, tight logs) are packed into small fixed windows. The partition
+is lossless -- ``"".join(segment(content)) == content`` -- so KEEP runs
+reconstruct the original bytes exactly.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +30,14 @@ __all__ = ["adaptive_threshold", "build_relevance_query", "plan_relevance_split"
 
 
 def build_relevance_query(user_query: str, tool_name: str = "", tool_args: str = "") -> str:
-    """Compose the information-need query for relevance scoring."""
+    """Compose the information-need query for relevance scoring.
+
+    The user's prompt is the high-level intent; the triggering tool call's args
+    (a grep pattern, a read path, a search query) are the *precise*, per-output
+    ask and usually the sharpest signal. Both are included so the lexical (BM25)
+    half locks onto exact tokens (e.g. the grep pattern) while the semantic half
+    tracks the intent.
+    """
     parts: list[str] = []
     q = (user_query or "").strip()
     if q:
@@ -23,11 +49,22 @@ def build_relevance_query(user_query: str, tool_name: str = "", tool_args: str =
 
 
 def segment(content: str, *, window: int = 8, max_chars: int = 1200) -> list[str]:
-    """Partition ``content`` into coherent records."""
+    """Partition ``content`` into coherent records.
+
+    Lossless partition: ``"".join(segment(content)) == content``. Blank lines
+    delimit records; oversized or dense blank-free blocks are packed into
+    windows of at most ``window`` lines and ``max_chars`` chars, with indented
+    continuation lines held past the line window (still inside ``max_chars``) so
+    multi-line units aren't cut mid-run. One budget covers the whole segment, so
+    a long indented run is windowed rather than collapsed into one record. A
+    single line longer than ``max_chars`` is emitted whole, since splitting it
+    would break the partition.
+    """
     lines = content.splitlines(keepends=True)
     if len(lines) <= 1:
         return [content] if content else []
 
+    # Pass 1: blank-line-delimited blocks (paragraphs / record gaps).
     blocks: list[list[str]] = []
     cur: list[str] = []
     for ln in lines:
@@ -38,16 +75,26 @@ def segment(content: str, *, window: int = 8, max_chars: int = 1200) -> list[str
     if cur:
         blocks.append(cur)
 
+    # Pass 2: pack/window each block. Dense blank-free streams (grep, tight
+    # logs) become fixed windows; indented continuation lines stay attached to
+    # their window so stack traces / pretty JSON aren't split mid-unit.
     segments: list[str] = []
     for block in blocks:
-        if len(block) <= window and sum(len(x) for x in block) <= max_chars:
-            segments.append("".join(block))
-            continue
         i = 0
         n = len(block)
         while i < n:
-            j = min(i + window, n)
-            while j < n and block[j][:1] in (" ", "\t"):
+            # Always take at least one line (a single over-long line is atomic --
+            # splitting it would break the lossless partition), then grow while the
+            # line window or an indented continuation asks for it AND the char
+            # budget still fits. One budget covers the whole segment, so max_chars
+            # binds every multi-line record instead of only the continuation.
+            j, size = i + 1, len(block[i])
+            while (
+                j < n
+                and (j - i < window or block[j][:1] in (" ", "\t"))
+                and size + len(block[j]) <= max_chars
+            ):
+                size += len(block[j])
                 j += 1
             segments.append("".join(block[i:j]))
             i = j
@@ -55,7 +102,11 @@ def segment(content: str, *, window: int = 8, max_chars: int = 1200) -> list[str
 
 
 def _otsu_threshold(values: list[float]) -> float:
-    """Return Otsu's threshold for one score distribution."""
+    """Otsu's method: the cut between two classes that maximizes between-class
+    variance. Parameter-free — the candidate cuts are the data's own values, so
+    there's no bin size or magic constant. Returns the midpoint of the winning
+    adjacent pair.
+    """
     xs = sorted(values)
     n = len(xs)
     total = sum(xs)
@@ -77,7 +128,15 @@ def _otsu_threshold(values: list[float]) -> float:
 
 
 def adaptive_threshold(values: list[float], floor: float) -> float:
-    """Data-driven KEEP/DROP cut for one output's relevance scores."""
+    """Data-driven KEEP/DROP cut for one output's relevance scores.
+
+    The operative cut is the natural relevant/irrelevant break (Otsu) *for this
+    output and query* — so it moves with the score distribution instead of a
+    fixed constant. It's floored by ``floor`` so records below the absolute
+    minimum relevance are never kept verbatim (an all-irrelevant output drops
+    entirely). When every record scores the same there's no break to find, so
+    the floor decides (all-in or all-out).
+    """
     if len({round(v, 9) for v in values}) < 2:
         return floor
     return max(_otsu_threshold(values), floor)
@@ -94,7 +153,26 @@ def plan_relevance_split(
     max_chars: int = 1200,
     max_records: int | None = None,
 ) -> list[tuple[bool, str]]:
-    """Split ``content`` into ordered ``(keep, text)`` runs by relevance."""
+    """Split ``content`` into ordered ``(keep, text)`` runs by relevance to ``query``.
+
+    A record is KEEP when its relevance score clears the cut. With
+    ``adaptive`` (default), the cut is the natural relevant/irrelevant break in
+    *this* output's score distribution (Otsu), floored by ``threshold`` — so it
+    adapts to the content instead of being a fixed constant. With
+    ``adaptive=False`` the cut is ``threshold`` exactly. Either way *which*
+    records clear it is entirely prompt-driven, so the KEEP fraction ranges
+    from 0% to 100% with the content, not a fixed quota. Consecutive
+    same-disposition records are merged into runs (order preserved) so the
+    caller applies one disposition per run. Returns a single KEEP run -- i.e.
+    no split -- when the query is empty, the content is a single record, or it
+    segments into more than ``max_records`` records (a latency guard).
+
+    Note that bounding long runs makes uniformly-indented output (YAML,
+    container logs, indented JSON) segment into several records with no head
+    line, so a blob that previously stayed one whole KEEP record can now be
+    dropped in part or in full. Recoverability of a DROP run is the caller's
+    concern, not this module's.
+    """
     if not query.strip():
         return [(True, content)]
     segs = segment(content, window=window, max_chars=max_chars)

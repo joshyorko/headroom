@@ -201,9 +201,11 @@ def test_openai_responses_feeds_traffic_learner() -> None:
     assert learner.backend_set is backend
     assert learner.message_batches
     assert learner.tool_extract_messages
+    assert learner.message_user_ids == ["u1"]
+    assert learner.message_backends == [backend]
 
 
-def test_openai_responses_feeds_request_scoped_user_to_traffic_learner() -> None:
+def test_openai_responses_skips_project_scoped_traffic_learning() -> None:
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
@@ -270,8 +272,8 @@ def test_openai_responses_feeds_request_scoped_user_to_traffic_learner() -> None
         )
 
     assert response.status_code == 200
-    assert learner.message_user_ids == ["u1::proj-a"]
-    assert learner.message_backends == [backend]
+    assert learner.message_user_ids == []
+    assert learner.message_backends == []
 
 
 def test_openai_responses_memory_save_keeps_request_context() -> None:

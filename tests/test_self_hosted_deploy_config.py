@@ -43,6 +43,22 @@ def test_kamal_proxy_allows_long_running_generation_requests() -> None:
     )
 
 
+def test_self_hosted_configs_disable_telemetry_by_default() -> None:
+    root = Path(__file__).parents[1]
+    deploy_config = (root / "config" / "deploy.yml").read_text()
+    example_env = (root / ".env.kamal.local.example").read_text().splitlines()
+    compose_config = _render_compose()
+    for key, variable, default in (
+        ("HEADROOM_BEACON", "headroom_beacon", "off"),
+        ("HEADROOM_TELEMETRY", "headroom_telemetry", "off"),
+        ("DO_NOT_TRACK", "do_not_track", "1"),
+    ):
+        assert f'{variable} = ENV.fetch("{key}", "{default}")' in deploy_config
+        assert f'{key}: "<%= {variable} %>"' in deploy_config
+        assert f"{key}={default}" in example_env
+        assert f"{key}=${{{key}:-{default}}}" in compose_config
+
+
 def test_kamal_config_removes_unused_effort_settings() -> None:
     deploy_config = (Path(__file__).parents[1] / "config" / "deploy.yml").read_text()
 

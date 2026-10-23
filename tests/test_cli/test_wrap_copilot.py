@@ -7,7 +7,7 @@ import importlib
 import sys
 import types
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.parse import quote
 
 import click
@@ -71,6 +71,9 @@ def wrap_modules(monkeypatch: pytest.MonkeyPatch) -> tuple[types.ModuleType, cli
         name: sys.modules.get(name)
         for name in ("headroom.cli", "headroom.cli.main", "headroom.cli.wrap")
     }
+    saved_cli_main_attr = (
+        saved_modules["headroom.cli"].main if saved_modules["headroom.cli"] is not None else None
+    )
 
     fake_main_module = types.ModuleType("headroom.cli.main")
     fake_main_module.main = click.Group()
@@ -91,8 +94,7 @@ def wrap_modules(monkeypatch: pytest.MonkeyPatch) -> tuple[types.ModuleType, cli
                 sys.modules[name] = module
         if saved_modules["headroom.cli"] is not None:
             cli_pkg = saved_modules["headroom.cli"]
-            if saved_modules["headroom.cli.main"] is not None:
-                cli_pkg.main = saved_modules["headroom.cli.main"]
+            cli_pkg.main = saved_cli_main_attr
             if saved_modules["headroom.cli.wrap"] is not None:
                 cli_pkg.wrap = saved_modules["headroom.cli.wrap"]
         if headroom_pkg is not None:
@@ -1019,93 +1021,46 @@ def test_wrap_copilot_oauth_keeps_generic_endpoint_when_account_advertised(
     assert env["GITHUB_COPILOT_API_URL"] == DEFAULT_API_URL
 
 
-def test_wrap_copilot_oauth_proxy_url_encodes_generic_upstream(
+def test_wrap_copilot_implicit_oauth_stays_generic_and_does_no_account_lookup(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A reused remote proxy must receive the Copilot upstream in the URL."""
+    """The implicit OAuth lane performs no user-info or token-exchange lookup at
+    launch, so it cannot see a plan host and always routes to the generic host.
+    Pinned so the guide's split between the lanes stays true: an Enterprise seat
+    that needs its plan host must use --subscription or wrap vscode."""
     _wrap_cli, main = wrap_modules
     _clear_copilot_env(monkeypatch)
     captured: dict[str, object] = {}
 
     def fake_launch_tool(**kwargs):  # noqa: ANN003
         captured.update(kwargs)
+
+    enterprise = {"endpoints": {"api": "https://api.enterprise.githubcopilot.com"}}
+    user_info = MagicMock(return_value=enterprise)
+    exchange = MagicMock(return_value={"token": "copilot-api", **enterprise})
 
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
         patch("headroom.cli.wrap.resolve_client_bearer_token", return_value="gho-oauth"),
         patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
-        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
-    ):
-        result = runner.invoke(
-            main,
-            [
-                "wrap",
-                "copilot",
-                "--no-rtk",
-                "--proxy-url",
-                "http://10.10.10.89",
-                "--",
-                "--model",
-                "gpt-4o-mini",
-            ],
-        )
-
-    assert result.exit_code == 0, result.output
-    env = captured["env"]
-    assert isinstance(env, dict)
-    assert env["COPILOT_PROVIDER_BASE_URL"] == (
-        "http://10.10.10.89"
-        f"{_expected_copilot_prefix()}"
-        f"/_copilot/{_encoded_copilot_api_url(DEFAULT_API_URL)}/v1"
-    )
-
-
-def test_wrap_copilot_native_remote_proxy_encodes_upstream_and_preserves_prefixes(
-    runner: CliRunner,
-    wrap_modules: tuple[types.ModuleType, click.Group],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Native routing must not bypass a reused remote proxy or lose attribution."""
-    _wrap_cli, main = wrap_modules
-    _clear_copilot_env(monkeypatch)
-    captured: dict[str, object] = {}
-
-    def fake_launch_tool(**kwargs):  # noqa: ANN003
-        captured.update(kwargs)
-
-    with (
-        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.copilot_auth._fetch_copilot_user_info", user_info),
         patch(
-            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
-            return_value=_subscription_resolution("gho-native"),
+            "headroom.copilot_auth.CopilotTokenProvider._exchange_token_sync",
+            staticmethod(exchange),
         ),
-        patch("headroom.cli.wrap._native_api_url_supported", return_value=True),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
-        result = runner.invoke(
-            main,
-            [
-                "wrap",
-                "copilot",
-                "--native",
-                "--no-rtk",
-                "--proxy-url",
-                "http://10.10.10.89/dashboard/",
-            ],
-        )
+        result = runner.invoke(main, ["wrap", "copilot", "--", "--model", "gpt-5.4"])
 
     assert result.exit_code == 0, result.output
-    env = captured["env"]
-    assert isinstance(env, dict)
-    assert env["COPILOT_API_URL"] == (
-        "http://10.10.10.89"
-        f"{_expected_copilot_prefix()}"
-        f"/_copilot/{_encoded_copilot_api_url(DEFAULT_API_URL)}"
-    )
-    assert not any(key.startswith("COPILOT_PROVIDER_") for key in env)
-    assert captured["no_proxy"] is True
+    assert captured["openai_api_url"] == DEFAULT_API_URL
+    # The lane never asks GitHub which host the seat is on: neither the
+    # user-info lookup nor the token exchange that would advertise the
+    # Enterprise host is consulted.
+    assert user_info.call_count == 0
+    assert exchange.call_count == 0
 
 
 def test_wrap_copilot_oauth_honors_api_url_override(
@@ -1214,11 +1169,13 @@ def test_wrap_copilot_subscription_uses_resolved_subscription_endpoint(
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "copilot-api"
 
 
-def test_wrap_copilot_subscription_normalizes_enterprise_host(
+def test_wrap_copilot_subscription_honours_advertised_enterprise_host(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """An Enterprise seat routes to the host its token exchange advertised; a
+    firewall on GitHub's subscription-based routing allows only that host."""
     _wrap_cli, main = wrap_modules
     _clear_copilot_env(monkeypatch)
     captured: dict[str, object] = {}
@@ -1260,9 +1217,10 @@ def test_wrap_copilot_subscription_normalizes_enterprise_host(
     assert result.exit_code == 0, result.output
     env = captured["env"]
     assert isinstance(env, dict)
-    assert captured["openai_api_url"] == DEFAULT_API_URL
-    assert env["OPENAI_TARGET_API_URL"] == DEFAULT_API_URL
-    assert env["GITHUB_COPILOT_API_URL"] == DEFAULT_API_URL
+    enterprise_api = "https://api.enterprise.githubcopilot.com"
+    assert captured["openai_api_url"] == enterprise_api
+    assert env["OPENAI_TARGET_API_URL"] == enterprise_api
+    assert env["GITHUB_COPILOT_API_URL"] == enterprise_api
 
 
 def test_wrap_copilot_subscription_honors_api_url_override(
@@ -1320,3 +1278,92 @@ def test_resolve_copilot_api_url_ignores_user_info_and_never_calls_network(
     with patch.object(copilot_auth, "_fetch_copilot_user_info") as fetch:
         assert copilot_auth.resolve_copilot_api_url("gho-real") == "https://pin.example.com"
     fetch.assert_not_called()
+
+
+def test_wrap_copilot_oauth_proxy_url_encodes_generic_upstream(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reused remote proxy must receive the Copilot upstream in the URL."""
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_client_bearer_token", return_value="gho-oauth"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "copilot",
+                "--no-rtk",
+                "--proxy-url",
+                "http://10.10.10.89",
+                "--",
+                "--model",
+                "gpt-4o-mini",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_PROVIDER_BASE_URL"] == (
+        "http://10.10.10.89"
+        f"{_expected_copilot_prefix()}"
+        f"/_copilot/{_encoded_copilot_api_url(DEFAULT_API_URL)}/v1"
+    )
+
+
+def test_wrap_copilot_native_remote_proxy_encodes_upstream_and_preserves_prefixes(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native routing must not bypass a reused remote proxy or lose attribution."""
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution("gho-native"),
+        ),
+        patch("headroom.cli.wrap._native_api_url_supported", return_value=True),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "copilot",
+                "--native",
+                "--no-rtk",
+                "--proxy-url",
+                "http://10.10.10.89/dashboard/",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_API_URL"] == (
+        "http://10.10.10.89"
+        f"{_expected_copilot_prefix()}"
+        f"/_copilot/{_encoded_copilot_api_url(DEFAULT_API_URL)}"
+    )
+    assert not any(key.startswith("COPILOT_PROVIDER_") for key in env)
+    assert captured["no_proxy"] is True

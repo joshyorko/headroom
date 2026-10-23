@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import concurrent.futures
 import contextlib
 import contextvars
@@ -3009,14 +3011,54 @@ def read_proxy_token(headers: Mapping[str, str]) -> str | None:
 _PROXY_TOKEN_HEADER = b"x-headroom-proxy-token"
 
 
-def _is_proxy_token_bearer(value: bytes, token_bytes: bytes) -> bool:
-    """Whether a raw ``Authorization`` value is ``Bearer <proxy token>``.
+def _dashboard_basic_token(authorization: str) -> str | None:
+    """Read browser credentials without treating provider Basic auth as a token."""
+    scheme, _, encoded = authorization.partition(" ")
+    if scheme.lower() != "basic" or len(encoded) > 4096:
+        return None
+    try:
+        username, separator, password = (
+            base64.b64decode(encoded, validate=True).decode("utf-8").partition(":")
+        )
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+    return password if username == "headroom" and separator and password else None
+
+
+def _is_dashboard_browser_request(method: str, path: str) -> bool:
+    """Only registered UI routes accept ambient browser credentials."""
+    if method == "POST":
+        return path in {"/settings", "/settings/apply"}
+    return method == "GET" and (
+        path
+        in {
+            "/dashboard",
+            "/dashboard/",
+            "/dashboard/settings",
+            "/favicon.ico",
+            "/stats",
+            "/stats-history",
+            "/stats-lifetime",
+            "/subscription-window",
+            "/quota",
+            "/settings",
+            "/settings/schema",
+        }
+        or path.startswith("/dashboard/static/")
+    )
+
+
+def _is_proxy_token_authorization(value: bytes, token_bytes: bytes) -> bool:
+    """Whether Authorization contains the configured proxy credential.
 
     Parses exactly as :func:`read_proxy_token` does (case-insensitive scheme,
     stripped credential) and compares the way the gates do, so a value the gate
     accepted as the proxy credential is always recognised here.
     """
     auth = value.decode("latin-1")
+    browser_token = _dashboard_basic_token(auth)
+    if browser_token is not None:
+        return hmac.compare_digest(browser_token.encode("utf-8"), token_bytes)
     if not auth.lower().startswith("bearer "):
         return False
     credential = auth[7:].strip()
@@ -3038,8 +3080,8 @@ def scrub_proxy_token_headers(scope: Any, token_bytes: bytes) -> None:
 
     ``x-headroom-proxy-token`` is dropped unconditionally, so it cannot reach an
     upstream even with ``HEADROOM_STRIP_INTERNAL_HEADERS=disabled``. An
-    ``Authorization`` header is dropped only when it carries the configured
-    token; any other value is a provider credential and is left alone.
+    ``Authorization`` is dropped when its Bearer or dashboard Basic credential
+    carries the configured token. Other provider credentials are left alone.
     """
     headers = scope.get("headers")
     if not headers:
@@ -3052,7 +3094,7 @@ def scrub_proxy_token_headers(scope: Any, token_bytes: bytes) -> None:
             or (
                 token_bytes
                 and name.lower() == b"authorization"
-                and _is_proxy_token_bearer(value, token_bytes)
+                and _is_proxy_token_authorization(value, token_bytes)
             )
         )
     ]
@@ -4228,6 +4270,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             exempt = request.method == "GET" and path in _AUTH_EXEMPT_PATHS
             if not exempt and not is_loopback_host(client_host):
                 provided = _extract_proxy_token(request.headers)
+                browser_request = _is_dashboard_browser_request(request.method, path)
+                if (
+                    provided is None
+                    and browser_request
+                    and "x-headroom-proxy-token" not in request.headers
+                ):
+                    provided = _dashboard_basic_token(request.headers.get("authorization", ""))
                 if provided is None or not hmac.compare_digest(
                     provided.encode("utf-8", "replace"), _proxy_token_bytes
                 ):
@@ -4238,6 +4287,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         "missing_token" if provided is None else "bad_token",
                     )
                     rejection = JSONResponse(status_code=401, content={"error": "unauthorized"})
+                    if browser_request:
+                        rejection.headers["WWW-Authenticate"] = (
+                            'Basic realm="Headroom dashboard", charset="UTF-8"'
+                        )
                     _apply_security_headers(rejection)
                     return rejection
                 # The caller proved it holds the proxy token. The rate limiter

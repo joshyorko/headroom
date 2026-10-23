@@ -26,6 +26,24 @@ the existing network listener without authentication; this update does not
 enable the unauthenticated-bind override. Review client compatibility before
 deploying. Health probes remain accessible without the token.
 
+### Browser dashboard sign-in
+
+Open `/dashboard` and sign in through the browser prompt. Use `headroom` as
+the username and the configured `HEADROOM_PROXY_TOKEN` as the password.
+The browser reuses these credentials for dashboard assets and data requests.
+API and WebSocket clients must keep using `X-Headroom-Proxy-Token`.
+Settings retain their existing client-network and same-origin restrictions.
+
+The current LAN deployment uses HTTP, which does not encrypt credentials in
+transit. Use HTTPS when transport confidentiality is required. Never put the
+token in a URL, screenshot, or command argument.
+
+Chats created with Codex's built-in `openai` provider retain that selection.
+After updating the proxy and fully quitting Codex, resume a saved chat with
+`codex -c 'model_provider="headroom"' resume <thread-id>` to select the configured
+Headroom provider and its token header. Run `/compact` once after resuming.
+Keep the existing chat history.
+
 ## Prepare VM
 
 Kamal needs SSH access plus Docker on VM. From this repo:

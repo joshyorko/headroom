@@ -418,7 +418,7 @@ def _run_memory_eval(
         from headroom.memory import MemoryConfig
     except ImportError as e:
         click.echo("Error: Memory eval dependencies not installed.")
-        click.echo("Run: pip install headroom[memory,evals]")
+        click.echo('Run: pip install "headroom-ai[memory,evals]"')
         click.echo(f"Details: {e}")
         raise SystemExit(1) from None
 
@@ -592,7 +592,7 @@ def _run_memory_eval_v2(
         )
     except ImportError as e:
         click.echo("Error: Memory eval V2 dependencies not installed.")
-        click.echo("Run: pip install headroom[memory,evals]")
+        click.echo('Run: pip install "headroom-ai[memory,evals]"')
         click.echo(f"Details: {e}")
         raise SystemExit(1) from None
 

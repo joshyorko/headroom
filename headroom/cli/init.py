@@ -19,6 +19,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import click
 
+from headroom import fsutil
 from headroom._subprocess import run
 
 try:
@@ -26,32 +27,53 @@ try:
 except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
+from click.core import ParameterSource
+
+from headroom.cli.port_discovery import (
+    DEFAULT_PROXY_PORT,
+    env_port,
+    reconcile_default_port,
+    warn_codex_provider_port_change,
+)
 from headroom.copilot_auth import DEFAULT_API_URL as DEFAULT_COPILOT_API_URL
 from headroom.install.models import ConfigScope, InstallPreset, RuntimeKind, SupervisorKind
-from headroom.install.paths import claude_settings_path, codex_config_path, validate_profile_name
+from headroom.install.paths import (
+    claude_settings_path,
+    codex_config_path,
+    codex_home_dir,
+    codex_hooks_path,
+    codex_project_config_path,
+    validate_profile_name,
+)
 from headroom.install.planner import build_manifest
 from headroom.install.providers import _apply_unix_env_scope, _apply_windows_env_scope
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
     resolve_headroom_command,
     resolve_headroom_config_command,
+    runtime_ownership,
     runtime_status,
     start_detached_agent,
     start_persistent_docker,
     stop_runtime,
     wait_ready,
 )
-from headroom.install.state import load_manifest, save_manifest
+from headroom.install.state import ManifestError, load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
-from headroom.providers.codex.install import codex_uses_chatgpt_auth
+from headroom.providers.codex.install import (
+    CodexAuthConfigError,
+    build_codex_auth_config,
+    codex_uses_chatgpt_auth,
+)
 from headroom.providers.codex.threads import retag_to_headroom
 from headroom.proxy.project_context import with_client_prefix, with_copilot_upstream_prefix
 
 from .main import main
 
 logger = logging.getLogger(__name__)
+
 
 _VERBOSE_HANDLER_ATTR = "_headroom_init_verbose_handler"
 
@@ -178,7 +200,11 @@ def _copilot_config_path() -> Path:
 
 
 def _codex_hooks_path(global_scope: bool) -> Path:
-    return (Path.home() if global_scope else Path.cwd()) / ".codex" / "hooks.json"
+    # User scope follows Codex's own home resolution (CODEX_HOME, else ~/.codex)
+    # so `init -g codex` writes the hooks file Codex will actually load.
+    if global_scope:
+        return codex_hooks_path()
+    return Path.cwd() / ".codex" / "hooks.json"
 
 
 def _claude_scope_path(global_scope: bool) -> Path:
@@ -190,7 +216,7 @@ def _claude_scope_path(global_scope: bool) -> Path:
 def _codex_scope_path(global_scope: bool) -> Path:
     if global_scope:
         return codex_config_path()
-    return Path.cwd() / ".codex" / "config.toml"
+    return codex_project_config_path()
 
 
 def _json_file(path: Path) -> dict[str, Any]:
@@ -263,7 +289,7 @@ def _strip_json_comments(content: str) -> str:
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     logger.debug("write json: %s (keys=%s)", path, sorted(payload.keys()))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    fsutil.write_text(path, json.dumps(payload, indent=2) + "\n")
 
 
 def _ensure_claude_hooks(path: Path, profile: str, port: int) -> None:
@@ -364,6 +390,26 @@ def _replace_marker_block(
         lines = content.splitlines()
         for index, line in enumerate(lines):
             if _TOML_TABLE_HEADER_RE.search(line):
+                # A first table may belong to a marked MCP block. Keep its
+                # opening marker outside the root block being inserted.
+                comment_start = index
+                while comment_start and (
+                    not lines[comment_start - 1].strip()
+                    or lines[comment_start - 1].lstrip().startswith("#")
+                ):
+                    comment_start -= 1
+                open_mcp: tuple[int, str] | None = None
+                for marker_index in range(comment_start, index):
+                    marker = lines[marker_index].strip()
+                    if re.fullmatch(r"# --- Headroom MCP server(?:: [^\r\n]+)? ---", marker):
+                        open_mcp = (
+                            marker_index,
+                            marker.replace("# --- Headroom", "# --- end Headroom", 1),
+                        )
+                    elif open_mcp is not None and marker == open_mcp[1]:
+                        open_mcp = None
+                if open_mcp is not None:
+                    index = open_mcp[0]
                 head = "\n".join(lines[:index]).rstrip()
                 tail = "\n".join(lines[index:]).lstrip("\n")
                 prefix = f"{head}\n\n" if head else ""
@@ -396,27 +442,68 @@ def _strip_codex_provider_marker_spans(content: str) -> str:
     return content
 
 
-def _strip_codex_init_block(content: str) -> str:
+def _strip_codex_root_routing_orphans(content: str) -> str:
+    """Drop Headroom loopback routing keys left at the document root.
+
+    Only the root (everything before the first table header) is Headroom's to
+    clean: the same keys inside ``[profiles.*]`` tables are user-owned
+    per-profile overrides, even when they point at Headroom.
+    """
+    import re
+
+    first_table = re.search(r"(?m)^[ \t]*\[", content)
+    split = first_table.start() if first_table else len(content)
+    root, rest = content[:split], content[split:]
+    owns_route = bool(
+        re.search(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?$', root)
+        or re.search(
+            r'(?m)^[ \t]*name[ \t]*=[ \t]*"(?:Headroom init proxy|OpenAI via Headroom proxy)"[ \t]*\r?$',
+            rest,
+        )
+        or re.search(rf'(?m)^[ \t]*env_http_headers[ \t]*=.*"{_PROJECT_HEADER_NAME}"', rest)
+    )
+    root = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", root)
+    if owns_route:
+        root = re.sub(r"(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n", "", root)
+        root = re.sub(
+            r"(?m)^[ \t]*experimental_realtime_(?:webrtc_call|ws)_base_url[ \t]*=.*\r?\n",
+            "",
+            root,
+        )
+    else:
+        root = re.sub(
+            r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
+            "",
+            root,
+        )
+    return root + rest
+
+
+_CODEX_PROVIDER_SNAPSHOT_PREFIX = "# Headroom init previous provider: "
+
+
+def _codex_init_provider_snapshot(content: str) -> str | None:
+    match = re.search(r"(?m)^" + re.escape(_CODEX_PROVIDER_SNAPSHOT_PREFIX) + r"([^\n]*)", content)
+    if match is None:
+        return None
+    snapshot = json.loads(match.group(1))
+    if not isinstance(snapshot, str):
+        raise ValueError("Invalid Headroom init provider snapshot")
+    tomllib.loads(snapshot)
+    return snapshot
+
+
+def _strip_codex_init_block(content: str, *, restore_provider: bool = True) -> str:
     """Remove all Headroom init-managed blocks and orphan keys from a Codex config.toml string."""
     import re
+
+    provider_snapshot = _codex_init_provider_snapshot(content)
 
     content = _strip_codex_provider_marker_spans(content)
 
     # Strip any orphan top-level keys that a crashed or partial write may have
-    # left outside the marker block. Only remove openai_base_url when the same
-    # file still carries Headroom's model/provider marker, so uninstall-style
-    # cleanup does not erase an unrelated user-managed provider URL.
-    has_orphan_headroom_provider = bool(
-        re.search(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?$', content)
-        or re.search(
-            r'(?m)^[ \t]*name[ \t]*=[ \t]*"(?:Headroom init proxy|OpenAI via Headroom proxy)"[ \t]*\r?$',
-            content,
-        )
-        or re.search(rf'(?m)^[ \t]*env_http_headers[ \t]*=.*"{_PROJECT_HEADER_NAME}"', content)
-    )
-    content = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", content)
-    if has_orphan_headroom_provider:
-        content = re.sub(r"(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n", "", content)
+    # left outside the marker block.
+    content = _strip_codex_root_routing_orphans(content)
 
     # Strip any orphaned [model_providers.headroom] table that is recognisably ours.
     orphan_headroom_table = re.compile(
@@ -430,6 +517,8 @@ def _strip_codex_init_block(content: str) -> str:
         r"(?=^\[|\Z)"
     )
     content = orphan_headroom_table.sub("", content)
+    if restore_provider and provider_snapshot is not None:
+        content = content.rstrip() + "\n\n" + provider_snapshot
 
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
@@ -439,15 +528,33 @@ def _strip_all_codex_headroom_provider_tables(content: str) -> str:
 
     content = _strip_codex_provider_marker_spans(content)
 
-    # Also scrub unmarked blocks that this command owns. The name check keeps
-    # user-managed provider tables intact.
-    owned_table = re.compile(
-        r"(?ms)^\[model_providers\.headroom\]\r?\n"
-        r"(?:(?!^\[).)*?"
-        r'^[ \t]*name[ \t]*=[ \t]*"(?:Headroom (?:init )?proxy|OpenAI via Headroom proxy)"[ \t]*\r?\n'
-        r"(?:(?!^\[).)*?(?=^\[|\Z)"
+    # Inspect each bounded candidate before removing it. A name-like line in
+    # user text does not establish ownership, and indented headers still end
+    # the table. Ambiguous or malformed candidates survive for validation.
+    candidate_table = re.compile(
+        r"(?ms)^[ \t]*\[model_providers\.headroom\][ \t]*(?:#[^\r\n]*)?\r?\n"
+        r"(?:(?!^[ \t]*\[).)*(?=^[ \t]*\[|\Z)"
     )
-    content = owned_table.sub("", content)
+    owned_names = {"Headroom proxy", "Headroom init proxy", "OpenAI via Headroom proxy"}
+
+    def _remove_owned_table(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        try:
+            document = tomllib.loads(candidate)
+        except tomllib.TOMLDecodeError:
+            return candidate
+        provider = document.get("model_providers", {}).get("headroom", {})
+        if provider.get("name") not in owned_names:
+            return candidate
+        # Leading comments for the next table may include its MCP opener.
+        # Keep the trailing comment/blank run rather than claiming it as ours.
+        lines = candidate.splitlines(keepends=True)
+        tail = len(lines)
+        while tail and (not lines[tail - 1].strip() or lines[tail - 1].lstrip().startswith("#")):
+            tail -= 1
+        return "".join(lines[tail:])
+
+    content = candidate_table.sub(_remove_owned_table, content)
     return content.lstrip("\n").rstrip() + "\n"
 
 
@@ -479,7 +586,7 @@ def _codex_provider_matches(content: str, provider_url: str, *, requires_openai_
         return False
     if parsed.get("experimental_realtime_ws_base_url") != provider_url:
         return False
-    if provider.get("name") != "OpenAI via Headroom proxy":
+    if provider.get("name") != "OpenAI":
         return False
     if provider.get("base_url") != provider_url:
         return False
@@ -496,23 +603,25 @@ def _ensure_codex_provider(path: Path, provider_url: str | int) -> None:
     import re
 
     if isinstance(provider_url, int):
+        warn_codex_provider_port_change(path, provider_url)
         provider_url = _proxy_v1_url(_normalize_proxy_url(None, provider_url))
-
+    else:
+        parsed_url = urlsplit(provider_url)
+        if parsed_url.hostname == "127.0.0.1" and parsed_url.port:
+            warn_codex_provider_port_change(path, parsed_url.port)
     logger.debug("ensure codex provider block: %s (provider_url=%s)", path, provider_url)
-    # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
-    # account menu); omitting it for API-key users avoids forcing an OAuth
-    # login (#406).
-    uses_chatgpt_auth = codex_uses_chatgpt_auth(path.parent / "auth.json")
+    auth_path = codex_home_dir() / "auth.json"
+    uses_chatgpt_auth = codex_uses_chatgpt_auth(auth_path)
     requires_openai_auth = "requires_openai_auth = true\n" if uses_chatgpt_auth else ""
     realtime_call_url = (
         f"{provider_url.removesuffix('/v1')}/backend-api/codex"
         if uses_chatgpt_auth
         else provider_url
     )
-    content = path.read_text(encoding="utf-8") if path.exists() else ""
-    if _codex_provider_matches(content, provider_url, requires_openai_auth=uses_chatgpt_auth):
-        retag_to_headroom(path.parent)
-        return
+    try:
+        auth_config = build_codex_auth_config(auth_path, config_path=path)
+    except CodexAuthConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
     block = (
         f"{_CODEX_PROVIDER_MARKER_START}\n"
         'model_provider = "headroom"\n'
@@ -520,22 +629,73 @@ def _ensure_codex_provider(path: Path, provider_url: str | int) -> None:
         f"experimental_realtime_webrtc_call_base_url = {_toml_string(realtime_call_url)}\n"
         f"experimental_realtime_ws_base_url = {_toml_string(provider_url)}\n\n"
         "[model_providers.headroom]\n"
-        'name = "OpenAI via Headroom proxy"\n'
+        # Codex derives remote-compaction support from the provider display
+        # name. Keep the proxy's provider id as ``headroom`` for routing, but
+        # use the built-in OpenAI name so the capability is preserved.
+        'name = "OpenAI"\n'
         f"base_url = {_toml_string(provider_url)}\n"
         "supports_websockets = true\n"
+        f"{auth_config}"
         f"{requires_openai_auth}"
         f'env_http_headers = {{ "{_PROJECT_HEADER_NAME}" = "HEADROOM_PROJECT" }}\n'
         f"{_CODEX_PROVIDER_MARKER_END}"
     )
     content = path.read_text(encoding="utf-8") if path.exists() else ""
-    # Remove stale/unmanaged copies before writing the single init-owned table.
-    # Older init paths could leave a second [model_providers.headroom] block,
-    # which makes the entire Codex config invalid TOML.
-    content = re.sub(
-        r"(?ms)^[ \t]*\[model_providers\.headroom\][ \t]*\r?\n.*?(?=^[ \t]*\[|\Z)",
-        "",
-        content,
+    generated_provider = tomllib.loads(block)["model_providers"]["headroom"]
+    if _codex_provider_matches(content, provider_url, requires_openai_auth=uses_chatgpt_auth):
+        existing_provider = tomllib.loads(content)["model_providers"]["headroom"]
+        auth_keys = {"auth", "env_key", "experimental_bearer_token"}
+        if all(existing_provider.get(key) == generated_provider.get(key) for key in auth_keys):
+            retag_to_headroom(path.parent)
+            return
+    for old_start, old_end in _LEGACY_CODEX_PROVIDER_MARKERS:
+        content = content.replace(old_start, _CODEX_PROVIDER_MARKER_START)
+        content = content.replace(old_end, _CODEX_PROVIDER_MARKER_END)
+    # Adopt an existing unmarked provider table instead of declaring it twice.
+    # Keep user options that are not owned by the generated provider block.
+    provider_snapshot = _codex_init_provider_snapshot(content)
+    provider_table = re.search(
+        r"(?m)^[ \t]*\[model_providers\.headroom\][ \t]*(?:#[^\n]*)?\r?\n", content
     )
+    if provider_table:
+        next_table = re.search(r"(?m)^[ \t]*\[", content[provider_table.end() :])
+        table_end = provider_table.end() + next_table.start() if next_table else len(content)
+        if provider_snapshot is None and _CODEX_PROVIDER_MARKER_START not in content:
+            provider_snapshot = content[provider_table.start() : table_end]
+        existing_options = content[provider_table.end() : table_end]
+        existing_options = re.sub(
+            r"(?m)^" + re.escape(_CODEX_PROVIDER_SNAPSHOT_PREFIX) + r"[^\n]*(?:\n|$)",
+            "",
+            existing_options,
+        )
+        existing_options = existing_options.replace(_CODEX_PROVIDER_MARKER_END, "")
+        generated_keys = set(re.findall(r"(?m)^([A-Za-z_][A-Za-z_0-9]*)[ \t]*=", block))
+        generated_keys.update(
+            {"auth", "env_key", "requires_openai_auth", "experimental_bearer_token"}
+        )
+        for key in generated_keys:
+            existing_options = re.sub(
+                rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=[^\n]*(?:\n|$)",
+                "",
+                existing_options,
+            )
+        block = block.replace(
+            _CODEX_PROVIDER_MARKER_END,
+            existing_options + _CODEX_PROVIDER_MARKER_END,
+        )
+        if _CODEX_PROVIDER_MARKER_START not in content:
+            content = content[: provider_table.start()] + content[table_end:]
+    # Preserve the captured options/snapshot, then repair every stale managed
+    # copy. A duplicate user-owned provider is left intact and fails validation.
+    content = _strip_all_codex_headroom_provider_tables(content)
+    if provider_snapshot is not None:
+        block = block.replace(
+            _CODEX_PROVIDER_MARKER_END,
+            _CODEX_PROVIDER_SNAPSHOT_PREFIX
+            + json.dumps(provider_snapshot)
+            + "\n"
+            + _CODEX_PROVIDER_MARKER_END,
+        )
     # init owns the ROOT-level model_provider/openai_base_url: drop any prior
     # root assignment so we replace it instead of emitting a duplicate top-level
     # key (#260). Scope the strip to the document root (everything before the
@@ -559,7 +719,8 @@ def _ensure_codex_provider(path: Path, provider_url: str | int) -> None:
         content, _CODEX_PROVIDER_MARKER_START, _CODEX_PROVIDER_MARKER_END, block, at_root=True
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    tomllib.loads(content)
+    fsutil.write_text(path, content)
     # Codex filters its history menu by the active model_provider, so existing
     # native threads vanish once we switch to "headroom". Retag them to match the
     # active provider so the history stays whole (#961), mirroring the install
@@ -689,7 +850,7 @@ def _ensure_codex_feature_flag(path: Path) -> None:
                 content.rstrip() + "\n\n[features]\n\n" + _codex_feature_block() + "\n"
             ).lstrip()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    fsutil.write_text(path, content)
 
 
 def _ensure_codex_hooks(path: Path, profile: str, proxy_url: str) -> None:
@@ -819,7 +980,11 @@ def _ensure_runtime_manifest(
     memory: bool,
 ) -> str:
     profile = _runtime_profile(global_scope)
-    existing = load_manifest(profile)
+    try:
+        existing = load_manifest(profile)
+    except ManifestError as exc:
+        click.echo(f"Warning: {exc}; overwriting.")
+        existing = None
     merged_targets = sorted(set(existing.targets if existing else []).union(targets))
     manifest = build_manifest(
         profile=profile,
@@ -998,31 +1163,51 @@ def _suppress_hook_output() -> Iterator[None]:
 
 
 def _ensure_profile_running(profile: str) -> None:
-    manifest = load_manifest(profile)
+    try:
+        manifest = load_manifest(profile)
+    except ManifestError:
+        return
     if manifest is None:
         return
+    failure: str | None = None
     with _suppress_hook_output():
-        if wait_ready(manifest, timeout_seconds=1):
+        if wait_ready(manifest, timeout_seconds=1, require_identity=True):
             return
         try:
             with acquire_runtime_start_lock(manifest.profile) as acquired:
                 if not acquired:
                     return
-                if wait_ready(manifest, timeout_seconds=1):
+                if wait_ready(manifest, timeout_seconds=1, require_identity=True):
                     return
                 if runtime_status(manifest) == "running":
-                    if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+                    if wait_ready(
+                        manifest,
+                        timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS,
+                        require_identity=True,
+                    ):
                         return
                     stop_runtime(manifest)
-                if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+                if runtime_ownership(manifest) == "docker-supervisor":
                     start_persistent_docker(manifest)
                 elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
                     start_supervisor(manifest)
                 else:
                     start_detached_agent(manifest.profile)
-                wait_ready(manifest, timeout_seconds=45)
-        except Exception:
-            return
+                if not wait_ready(manifest, timeout_seconds=45, require_identity=True):
+                    failure = "it did not become ready within 45s"
+        except (click.ClickException, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            # Supervisor and runtime starts raise these; anything else is a bug
+            # and should surface. Report outside the suppressed block so the
+            # one line reaches stderr while stdout stays clean for the hook.
+            failure = str(exc)
+    if failure is not None:
+        logger.warning(
+            "headroom: could not start persistent proxy %r: %s. "
+            "Check it with `headroom install status --profile %s`.",
+            manifest.profile,
+            failure,
+            manifest.profile,
+        )
 
 
 def _probe_init_targets(global_scope: bool) -> list[tuple[str, str | None]]:
@@ -1207,6 +1392,12 @@ def _init_codex(
         click.echo(
             "Codex hooks are currently disabled upstream on Windows; provider routing was still installed."
         )
+        click.echo(
+            "Nothing starts the Headroom proxy for Codex on Windows, so Codex cannot connect "
+            "while it is down. Use `headroom install apply` for a supervised proxy. To remove "
+            "this routing, run `headroom unwrap codex` (user scope) or delete the Headroom init "
+            "provider block from the project's .codex/config.toml."
+        )
     click.echo("Restart Codex to activate Headroom configuration.")
 
 
@@ -1335,9 +1526,34 @@ def _install_headroom_mcp_for_targets(
             click.echo(line)
 
 
+def _resolve_init_port(ctx: click.Context, port: int) -> int:
+    """Honor ``--port``; otherwise ``HEADROOM_PORT``; otherwise reconcile with a live proxy.
+
+    Skipped for the internal ``init hook`` group: hooks run non-interactively
+    on every session start and must stay silent and fast.
+    """
+    if ctx.invoked_subcommand == "hook" or ctx.params.get("proxy_url"):
+        return port
+    if ctx.get_parameter_source("port") is not ParameterSource.DEFAULT:
+        return port
+    configured = env_port()
+    if configured is not None:
+        return configured
+    return reconcile_default_port(port)
+
+
 @main.group(invoke_without_command=True)
 @click.option("-g", "--global", "global_scope", is_flag=True, help="Install for the current user.")
-@click.option("--port", default=8787, type=int, show_default=True, help="Headroom proxy port.")
+@click.option(
+    "--port",
+    default=DEFAULT_PROXY_PORT,
+    type=click.IntRange(1, 65535),
+    show_default=True,
+    help=(
+        "Headroom proxy port. When omitted, HEADROOM_PORT is used if set; otherwise a "
+        "live Headroom proxy on another port is detected and offered."
+    ),
+)
 @click.option(
     "--proxy-url",
     default=None,
@@ -1369,6 +1585,7 @@ def init(
     """Install durable Headroom integrations for supported agents."""
     if verbose:
         _enable_verbose_logging()
+    port = _resolve_init_port(ctx, port)
     logger.debug(
         "init: global_scope=%s port=%s proxy_url=%s backend=%s anyllm_provider=%s region=%s "
         "memory=%s invoked_subcommand=%s",
@@ -1512,15 +1729,177 @@ def init_hook() -> None:
 @click.option("--marker", default=None, hidden=True)
 def init_hook_ensure(profile: str | None, marker: str | None) -> None:
     """Best-effort ensure used by installed agent hooks."""
-    del marker
+
+    def _has_manifest(name: str) -> bool:
+        # Best-effort: a corrupt manifest must not crash the session-start hook.
+        try:
+            return load_manifest(name) is not None
+        except ManifestError:
+            return False
+
     profiles: list[str] = []
     if profile:
         profiles.append(profile)
     else:
         local_profile = _local_profile()
-        if load_manifest(local_profile) is not None:
+        if _has_manifest(local_profile):
             profiles.append(local_profile)
-        elif load_manifest(_GLOBAL_PROFILE) is not None:
+        elif _has_manifest(_GLOBAL_PROFILE):
             profiles.append(_GLOBAL_PROFILE)
     for name in profiles:
         _ensure_profile_running(name)
+    _emit_alignment_warning(marker, profiles)
+
+
+_HOOK_AGENT_BY_MARKER = {_CLAUDE_HOOK_MARKER: "claude", _CODEX_HOOK_MARKER: "codex"}
+_HOOK_STDIN_WAIT_SECONDS = 0.5
+
+
+def _read_hook_event_name() -> str | None:
+    """``hook_event_name`` from the hook's stdin JSON, read with a hard time bound.
+
+    Claude Code and Codex pipe a JSON object into command hooks. A reader
+    thread keeps a host that never closes stdin from stalling the hook.
+    """
+    import threading
+
+    try:
+        stream = sys.stdin
+        if stream is None or stream.isatty():
+            return None
+    except (AttributeError, ValueError, OSError):
+        return None
+    box: dict[str, str] = {}
+
+    def _read() -> None:
+        try:
+            box["raw"] = stream.read(1 << 20)
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    reader.join(_HOOK_STDIN_WAIT_SECONDS)
+    raw = box.get("raw")
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return None
+    event = payload.get("hook_event_name") if isinstance(payload, dict) else None
+    return event if isinstance(event, str) else None
+
+
+def _claude_configured_base_url(cwd: Path) -> str | None:
+    """Effective ``ANTHROPIC_BASE_URL`` from Claude settings (local > project > user)."""
+    for path in (
+        cwd / ".claude" / "settings.local.json",
+        cwd / ".claude" / "settings.json",
+        claude_settings_path(),
+    ):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        except (OSError, ValueError):
+            continue
+        env_block = payload.get("env") if isinstance(payload, dict) else None
+        if isinstance(env_block, dict) and env_block.get("ANTHROPIC_BASE_URL"):
+            return str(env_block["ANTHROPIC_BASE_URL"])
+    return os.environ.get("ANTHROPIC_BASE_URL") or None
+
+
+def _codex_configured_base_url(cwd: Path) -> str | None:
+    """Active Codex provider ``base_url`` (project ``.codex`` first, then ``$CODEX_HOME``)."""
+    from .doctor import codex_active_base_url
+
+    for path in (codex_project_config_path(cwd), codex_config_path()):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        except OSError:
+            continue
+        if not text:
+            continue
+        _provider, base_url = codex_active_base_url(text)
+        if base_url:
+            return base_url
+    return None
+
+
+def alignment_warning(
+    agent: str,
+    profile: str,
+    *,
+    cwd: Path | None = None,
+    probe: Any = None,
+) -> str | None:
+    """Message when ``agent``'s configured proxy port differs from ``profile``'s.
+
+    Returns None when aligned, unconfigured, or anything cannot be read.
+    """
+    from .port_discovery import loopback_port, probe_headroom_proxy
+
+    try:
+        manifest = load_manifest(profile)
+    except ManifestError:
+        return None
+    if manifest is None:
+        return None
+    root = cwd or Path.cwd()
+    if agent == "claude":
+        base_url = _claude_configured_base_url(root)
+    elif agent == "codex":
+        base_url = _codex_configured_base_url(root)
+    else:
+        return None
+    configured = loopback_port(base_url or "")
+    expected = int(manifest.port)
+    if configured is None or configured == expected:
+        return None
+    check = probe or probe_headroom_proxy
+    configured_live = bool(check(configured))
+    scope_flag = " -g" if profile == _GLOBAL_PROFILE else ""
+    label = "Claude Code" if agent == "claude" else "Codex"
+    if configured_live:
+        state = f"a Headroom proxy is running on {configured}, not the managed one"
+        fix_port = configured
+    else:
+        state = f"nothing Headroom answers on {configured}, so requests may fail"
+        fix_port = expected
+    return (
+        f"Headroom: {label} is configured for http://127.0.0.1:{configured} but the Headroom "
+        f"proxy managed by `headroom init` ({profile}) uses port {expected}; {state}. "
+        f"Fix: headroom init{scope_flag} --port {fix_port} {agent}"
+    )
+
+
+def _emit_alignment_warning(marker: str | None, profiles: list[str]) -> None:
+    """Surface a base_url/proxy port mismatch through the SessionStart hook channel.
+
+    Emitted only for Claude/Codex SessionStart hooks, as hook JSON
+    (``systemMessage`` for the user, ``additionalContext`` for the agent).
+    Must never raise or block: any failure silently emits nothing.
+    """
+    try:
+        agent = _HOOK_AGENT_BY_MARKER.get(marker or "")
+        if agent is None or not profiles:
+            return
+        if _read_hook_event_name() != "SessionStart":
+            return
+        message = alignment_warning(agent, profiles[0])
+        if not message:
+            return
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "systemMessage": message,
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": message,
+                    },
+                }
+            )
+            + "\n"
+        )
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001 - a hook must never break the session
+        return

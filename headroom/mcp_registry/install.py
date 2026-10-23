@@ -7,6 +7,7 @@ from pathlib import Path
 
 from headroom.install.runtime import resolve_headroom_config_command
 
+from .antigravity import AntigravityRegistrar
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
 from .codex import CodexRegistrar
@@ -35,7 +36,7 @@ def get_all_registrars(
         CodexRegistrar(scope=scope, project_dir=project_dir),
     ]
     if scope == "user":
-        registrars.extend((GrokRegistrar(), OpencodeRegistrar()))
+        registrars.extend((AntigravityRegistrar(), GrokRegistrar(), OpencodeRegistrar()))
     return registrars
 
 

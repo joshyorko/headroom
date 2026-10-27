@@ -125,6 +125,8 @@ class HeadroomBuilder:
                     f'&& /tmp/headroom-smoke/bin/pip install "$wheel[{extras}]"',
                 ]
             )
+            # Import the installed wheel, not the source checkout at /work.
+            .with_workdir("/tmp")
             .with_exec(
                 [
                     "/tmp/headroom-smoke/bin/python",

@@ -466,8 +466,29 @@ class TestCCRStoreIntegration:
         assert len(mock_store.stored) == 1
         assert mock_store.stored[0]["original"] == LARGE_CONTENT
         assert mock_store.stored[0]["tool_name"] == "Read"
+        assert len(mock_store.stored[0]["explicit_hash"]) == 24
         assert "mock_hash_1234567890ab" in result.messages[1]["content"]
         assert result.ccr_hashes == ["mock_hash_1234567890ab"]
+
+    def test_store_failure_preserves_original(self):
+        class FailingStore:
+            def store(self, **kwargs):
+                raise RuntimeError("store unavailable")
+
+        mgr = ReadLifecycleManager(
+            ReadLifecycleConfig(enabled=True), compression_store=FailingStore()
+        )
+        messages = [
+            make_openai_read("r1", "/src/app.py"),
+            make_openai_tool_result("r1", LARGE_CONTENT),
+            make_openai_edit("e1", "/src/app.py"),
+            make_openai_tool_result("e1", "edit success"),
+        ]
+
+        result = mgr.apply(messages)
+        assert result.messages[1]["content"] == LARGE_CONTENT
+        assert result.ccr_hashes == []
+        assert result.transforms_applied == []
 
     def test_no_store_uses_content_hash(self):
         """Without CCR store, marker uses content-derived hash."""

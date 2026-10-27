@@ -5,8 +5,8 @@ description: Compress-Cache-Retrieve architecture that makes compression lossles
 
 Headroom's CCR (Compress-Cache-Retrieve) architecture makes compression **reversible**. When content is compressed, the original data is cached locally. If the LLM needs the full data, it retrieves it instantly.
 
-<Callout type="info" title="Nothing is ever thrown away">
-  Unlike traditional lossy compression, CCR guarantees that every piece of original data remains accessible in the compression store, even when the compressed content the LLM sees is much smaller. Actual token savings depend heavily on how redundant the source data is -- see [How Compression Works](/docs/how-compression-works#content-type-detection) for measured ranges per content type.
+<Callout type="info" title="Retrieval depends on the store">
+  CCR can retrieve original data while its compression-store entry remains available. Expiration, eviction, or a store outage can make a marker unavailable. Actual token savings depend on the input; see [How Compression Works](/docs/how-compression-works#content-type-detection) for measured ranges per content type.
 </Callout>
 
 ## The problem with traditional compression
@@ -38,7 +38,7 @@ LLM PROCESSING
 
 When SmartCrusher compresses tool output:
 
-1. The original content is stored, keyed by hash, with LRU-style eviction once the store hits capacity. In the proxy, this store defaults to a SQLite file (`ccr_store.db` in the workspace directory) rather than a pure in-process dict -- so it survives a proxy restart and is shared across worker processes. Set `HEADROOM_CCR_BACKEND=memory` to opt back into an in-process-only store. Other backend names are resolved via the `headroom.ccr_backend` setuptools entry-point group (e.g. a `redis` backend, if one is installed and registered) -- none besides `sqlite`/`memory` ship in this repo. See `headroom/cache/compression_store.py:1000-1017`.
+1. The original content is stored, keyed by hash. The proxy defaults to a SQLite file (`ccr_store.db` in the workspace directory), which survives restarts and is shared across local worker processes. Set `HEADROOM_CCR_BACKEND=memory` for an in-process store, or install the `redis` extra and configure Redis for sharing across replicas. SQLite and memory stores use capacity-based eviction; Redis uses a TTL and its own server's eviction policy. Other backend names are resolved through the `headroom.ccr_backend` entry-point group.
 2. A hash key is generated for retrieval
 3. A marker is added to the compressed output:
 
@@ -62,6 +62,19 @@ Headroom injects a `headroom_retrieve` tool into the LLM's available tools:
 
 The LLM sees this tool alongside your application's tools and can call it whenever the compressed data is insufficient.
 
+If your client already registers retrieval through MCP, Headroom keeps that
+client-owned tool instead of adding a second bare `headroom_retrieve`.
+Supported spellings include OpenCode's `headroom_headroom_retrieve` and MCP
+wrappers such as `mcp__headroom__headroom_retrieve` and
+`mcp_Headroom_headroom_retrieve`. The same rule applies to session-aware
+injection and the per-request fallback, so Headroom does not advertise an
+unavailable bare retrieval tool alongside the client's executable alias.
+
+These ownership aliases are limited to the default `headroom` MCP server
+name. An unrelated server such as `mcp__other__headroom_retrieve` does not
+replace the proxy's retrieval tool. Optional CCR system instructions use
+the executable name selected from the available tool definitions.
+
 ## Phase 3: Response Handler
 
 When the LLM calls `headroom_retrieve`:
@@ -71,7 +84,9 @@ When the LLM calls `headroom_retrieve`:
 3. The result is added to the conversation
 4. The API call continues automatically
 
-The client never sees CCR tool calls on the Anthropic and OpenAI proxy paths; Headroom resolves them transparently there.
+On the Anthropic and OpenAI proxy paths, only retrieval-only responses naming
+the proxy's bare `headroom_retrieve` are resolved server-side. Mixed responses
+and all MCP-registered retrieval aliases are forwarded for the client to execute.
 
 <Callout type="warning" title="Gemini CCR boundary">
   Buffered native Gemini requests resolve `headroom_retrieve` server-side and

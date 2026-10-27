@@ -203,3 +203,74 @@ def test_existing_archive_notes_survive_first_archive_creation(tmp_path: Path) -
     assert "keep from active" in content
     assert "carry forward" in content
     assert "current rule" in content
+
+
+def test_codex_preserves_quoted_and_fenced_markers_in_both_files(tmp_path: Path) -> None:
+    prefix = (
+        "Example: <!-- headroom:learn:start --> and <!-- headroom:learn:end -->\n"
+        "```markdown\n<!-- headroom:learn:start -->\nexample\n"
+        "<!-- headroom:learn:end -->\n```\n"
+        "<!-- headroom:learn:start -->\nunclosed example\n"
+    )
+    block = (
+        "<!-- headroom:learn:start -->\n### Prior\n- retain this rule\n<!-- headroom:learn:end -->"
+    )
+    suffix = "\nHuman notes after the block.\n"
+    agents = tmp_path / "AGENTS.md"
+    archive = tmp_path / "AGENTS.headroom.md"
+    for path in (agents, archive):
+        path.write_text(prefix + block + suffix)
+    project = ProjectInfo(name="codex", project_path=tmp_path, data_path=tmp_path / "sessions")
+    rules = [
+        Recommendation(
+            target=RecommendationTarget.CONTEXT_FILE, section="New", content="- new rule"
+        )
+    ]
+
+    CodexWriter().write(rules, project, dry_run=False)
+
+    for path in (agents, archive):
+        content = path.read_text()
+        assert content.startswith(prefix)
+        assert content.endswith(suffix)
+        assert "- retain this rule" in content
+        assert "- new rule" in content
+
+
+@pytest.mark.parametrize("fenced_file", ["AGENTS.md", "AGENTS.headroom.md"])
+def test_unclosed_handwritten_fence_prevents_all_codex_writes(
+    tmp_path: Path, fenced_file: str
+) -> None:
+    agents = tmp_path / "AGENTS.md"
+    archive = tmp_path / "AGENTS.headroom.md"
+    for path in (agents, archive):
+        path.write_text("# Human notes\n" + ("```\nexample\n" if path.name == fenced_file else ""))
+    before = {path: path.read_bytes() for path in (agents, archive)}
+    project = ProjectInfo(name="codex", project_path=tmp_path, data_path=tmp_path / "sessions")
+    rules = [
+        Recommendation(target=RecommendationTarget.CONTEXT_FILE, section="New", content="- rule")
+    ]
+
+    with pytest.raises(ValueError, match="managed block"):
+        CodexWriter().write(rules, project, dry_run=False)
+
+    assert {path: path.read_bytes() for path in before} == before
+
+
+def test_unclosed_generated_fence_prevents_all_codex_writes(tmp_path: Path) -> None:
+    agents = tmp_path / "AGENTS.md"
+    archive = tmp_path / "AGENTS.headroom.md"
+    for path in (agents, archive):
+        path.write_text("# Human notes\n")
+    before = {path: path.read_bytes() for path in (agents, archive)}
+    project = ProjectInfo(name="codex", project_path=tmp_path, data_path=tmp_path / "sessions")
+    rules = [
+        Recommendation(
+            target=RecommendationTarget.CONTEXT_FILE, section="New", content="```\nexample"
+        )
+    ]
+
+    with pytest.raises(ValueError, match="managed block"):
+        CodexWriter().write(rules, project, dry_run=False)
+
+    assert {path: path.read_bytes() for path in before} == before

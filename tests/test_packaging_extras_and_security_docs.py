@@ -60,6 +60,13 @@ def test_lean_profile_stays_torch_free() -> None:
     )
 
 
+def test_self_hosted_all_profile_keeps_ml_memory_evals_and_voice() -> None:
+    extras = _pyproject()["project"]["optional-dependencies"]
+    (spec,) = extras["all"]
+    selected = set(re.search(r"\[(.*)\]", spec).group(1).split(","))
+    assert {"ml", "memory", "evals", "voice"} <= selected
+
+
 def test_security_policy_supports_the_latest_release_without_a_version_number() -> None:
     """SECURITY.md's table sat at 0.27.x while the code shipped 0.38.0.
 

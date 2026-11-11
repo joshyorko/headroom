@@ -2203,6 +2203,43 @@ class OpenAIHandlerMixin:
             while len(cache) > _OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES:
                 cache.popitem(last=False)
 
+    async def _execute_responses_memory_tool(
+        self,
+        name: str,
+        args: dict[str, Any],
+        user_id: str,
+        request_context: Any = None,
+    ) -> str:
+        """Dispatch older adapters only when their backend can retain this scope."""
+        import inspect
+
+        handler = self.memory_handler
+        execute = handler._execute_memory_tool
+        if "request_context" in inspect.signature(execute).parameters:
+            return await execute(name, args, user_id, "openai", request_context=request_context)
+
+        unresolved = getattr(handler, "is_project_unresolved", None)
+        if callable(unresolved) and unresolved(request_context):
+            return json.dumps({"status": "skipped", "reason": "project_unresolved"})
+        await handler._ensure_initialized()
+        if handler._backend is None:
+            return json.dumps({"error": "Memory backend not initialized"})
+        effective_user_id = user_id
+        if request_context is not None:
+            resolve = getattr(handler, "_resolve_for_request", None)
+            if not callable(resolve):
+                return json.dumps(
+                    {"status": "skipped", "reason": "legacy_request_scope_unsupported"}
+                )
+            backend, _scope, effective_user_id = resolve(user_id, request_context)
+            if backend is None:
+                return json.dumps({"status": "skipped", "reason": "project_unresolved"})
+            if backend is not handler._backend:
+                return json.dumps(
+                    {"status": "skipped", "reason": "legacy_request_scope_unsupported"}
+                )
+        return await execute(name, args, effective_user_id, "openai")
+
     async def _observe_openai_responses_traffic(
         self,
         body: dict[str, Any],
@@ -7594,12 +7631,8 @@ class OpenAIHandlerMixin:
                                 except (json.JSONDecodeError, TypeError):
                                     args = {}
 
-                                result = await self.memory_handler._execute_memory_tool(
-                                    name,
-                                    args,
-                                    memory_user_id,
-                                    "openai",
-                                    request_context=memory_request_ctx,
+                                result = await self._execute_responses_memory_tool(
+                                    name, args, memory_user_id, memory_request_ctx
                                 )
 
                                 tool_outputs.append(

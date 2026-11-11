@@ -1,4 +1,4 @@
-"""Code-memory MCP is selectable via --code-memory (default none; Serena is opt-in).
+"""Code-memory MCP is selectable via --code-memory (default Serena).
 
 Covers the resolver precedence (selector > deprecated flags > default), the
 graceful retirement of the removed ``tokensave`` option, the orchestrator
@@ -31,9 +31,9 @@ def _clean_env() -> dict[str, str]:
     return env
 
 
-def test_default_is_none() -> None:
+def test_default_is_serena() -> None:
     with patch.dict(os.environ, _clean_env(), clear=True):
-        assert wrap._resolve_code_memory({}) == wrap._CODE_MEMORY_NONE
+        assert wrap._resolve_code_memory({}) == wrap._CODE_MEMORY_SERENA
 
 
 def test_selector_env_wins() -> None:
@@ -46,8 +46,8 @@ def test_selector_env_wins() -> None:
 def test_deprecated_flags_map_into_selector() -> None:
     with patch.dict(os.environ, _clean_env(), clear=True):
         assert wrap._resolve_code_memory({"serena": True}) == wrap._CODE_MEMORY_SERENA
-        # tokensave is retired: --no-tokensave is a no-op → default none
-        assert wrap._resolve_code_memory({"no_tokensave": True}) == wrap._CODE_MEMORY_NONE
+        # tokensave is retired: --no-tokensave is a no-op → default Serena
+        assert wrap._resolve_code_memory({"no_tokensave": True}) == wrap._CODE_MEMORY_SERENA
         # --no-serena means "no code memory" now that tokensave is gone
         assert wrap._resolve_code_memory({"no_serena": True}) == wrap._CODE_MEMORY_NONE
         # opt-out wins over opt-in when both legacy flags are given

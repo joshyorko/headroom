@@ -623,7 +623,10 @@ def test_handle_openai_responses_stream_skips_memory_tools(monkeypatch):
         pytest.param("not-a-list", id="non-list"),
     ],
 )
-def test_openai_responses_memory_continuation_is_zdr_safe(store, include, monkeypatch):
+@pytest.mark.parametrize("handler_signature", ["scoped", "legacy"])
+def test_openai_responses_memory_continuation_is_zdr_safe(
+    store, include, handler_signature, monkeypatch
+):
     body = {
         "model": "gpt-5.4",
         "previous_response_id": "resp-inherited",
@@ -659,6 +662,22 @@ def test_openai_responses_memory_continuation_is_zdr_safe(store, include, monkey
         },
     )
     handler = _ZdrResponsesHandler()
+    if handler_signature == "legacy":
+
+        async def execute_legacy_memory_tool(name, args, user_id, provider):
+            assert handler.memory_handler._backend
+            assert (name, args, user_id, provider) == ("memory_search", {}, "user-1", "openai")
+            return '{"memories": []}'
+
+        monkeypatch.setattr(
+            handler.memory_handler, "_execute_memory_tool", execute_legacy_memory_tool
+        )
+        monkeypatch.setattr(
+            handler.memory_handler,
+            "_resolve_for_request",
+            lambda user_id, context: (handler.memory_handler._backend, None, user_id),
+            raising=False,
+        )
 
     monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
 

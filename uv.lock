@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
@@ -1671,9 +1671,12 @@ agno = [
     { name = "agno" },
 ]
 all = [
+    { name = "anthropic" },
+    { name = "datasets" },
     { name = "fastapi" },
     { name = "fastembed", marker = "python_full_version < '3.14' or platform_machine != 'x86_64' or sys_platform != 'darwin'" },
     { name = "httpx", extra = ["http2"] },
+    { name = "huggingface-hub" },
     { name = "jinja2" },
     { name = "magika", marker = "python_full_version < '3.14' or platform_machine != 'x86_64' or sys_platform != 'darwin'" },
     { name = "mcp" },
@@ -1687,11 +1690,14 @@ all = [
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
     { name = "pillow" },
     { name = "python-socks" },
-    { name = "rapidocr", marker = "(python_full_version >= '3.13' and platform_machine != 'x86_64') or (python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin') or (python_full_version >= '3.13' and sys_platform != 'darwin')" },
+    { name = "rapidocr", marker = "python_full_version == '3.13.*' or (python_full_version >= '3.14' and platform_machine != 'x86_64') or (python_full_version >= '3.14' and sys_platform != 'darwin')" },
     { name = "rapidocr-onnxruntime", marker = "python_full_version < '3.13'" },
+    { name = "scikit-learn" },
+    { name = "sentence-transformers", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
     { name = "sentencepiece" },
     { name = "sqlite-vec" },
     { name = "starlette" },
+    { name = "torch", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
     { name = "trafilatura" },
     { name = "transformers" },
     { name = "tree-sitter" },
@@ -1760,7 +1766,7 @@ image = [
     { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple/" }, marker = "python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'" },
     { name = "onnxruntime", version = "1.26.0", source = { registry = "https://pypi.org/simple/" }, marker = "(python_full_version >= '3.13' and platform_machine != 'x86_64') or (python_full_version >= '3.13' and sys_platform != 'darwin')" },
     { name = "pillow" },
-    { name = "rapidocr", marker = "(python_full_version >= '3.13' and platform_machine != 'x86_64') or (python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin') or (python_full_version >= '3.13' and sys_platform != 'darwin')" },
+    { name = "rapidocr", marker = "python_full_version == '3.13.*' or (python_full_version >= '3.14' and platform_machine != 'x86_64') or (python_full_version >= '3.14' and sys_platform != 'darwin')" },
     { name = "rapidocr-onnxruntime", marker = "python_full_version < '3.13'" },
     { name = "sentencepiece" },
 ]
@@ -1954,7 +1960,7 @@ requires-dist = [
     { name = "gunicorn", marker = "sys_platform != 'win32' and extra == 'proxy-prod'", specifier = ">=21.0.0" },
     { name = "headroom-ai", extras = ["lean"], marker = "extra == 'sandbox'" },
     { name = "headroom-ai", extras = ["proxy"], marker = "extra == 'proxy-prod'" },
-    { name = "headroom-ai", extras = ["proxy", "code", "relevance", "image", "reports", "otel", "html", "mcp", "spreadsheet"], marker = "extra == 'all'" },
+    { name = "headroom-ai", extras = ["proxy", "code", "ml", "memory", "relevance", "image", "reports", "otel", "evals", "voice", "html", "mcp", "spreadsheet"], marker = "extra == 'all'" },
     { name = "headroom-ai", extras = ["proxy", "code", "relevance", "reports", "otel", "html", "mcp", "spreadsheet"], marker = "extra == 'lean'" },
     { name = "headroom-ai", extras = ["voice"], marker = "extra == 'voice-train'" },
     { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'", specifier = ">=1.6.0" },
@@ -1985,9 +1991,9 @@ requires-dist = [
     { name = "ollama", marker = "extra == 'dev'", specifier = ">=0.4.0" },
     { name = "onnxruntime", marker = "(python_full_version >= '3.11' and platform_machine != 'x86_64' and extra == 'proxy') or (python_full_version >= '3.11' and sys_platform != 'darwin' and extra == 'proxy')", specifier = ">=1.24.0" },
     { name = "onnxruntime", marker = "(python_full_version >= '3.11' and platform_machine != 'x86_64' and extra == 'voice') or (python_full_version >= '3.11' and sys_platform != 'darwin' and extra == 'voice')", specifier = ">=1.24.0" },
-    { name = "onnxruntime", marker = "(python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'proxy') or (python_full_version < '3.11' and platform_machine != 'x86_64' and extra == 'proxy') or (python_full_version < '3.11' and sys_platform != 'darwin' and extra == 'proxy')", specifier = ">=1.16.0,<1.24.0" },
-    { name = "onnxruntime", marker = "(python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'voice') or (python_full_version < '3.11' and platform_machine != 'x86_64' and extra == 'voice') or (python_full_version < '3.11' and sys_platform != 'darwin' and extra == 'voice')", specifier = ">=1.16.0,<1.24.0" },
-    { name = "onnxruntime", marker = "(python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'image') or (python_full_version >= '3.13' and platform_machine != 'x86_64' and extra == 'image') or (python_full_version >= '3.13' and sys_platform != 'darwin' and extra == 'image')", specifier = ">=1.7,<2" },
+    { name = "onnxruntime", marker = "(python_full_version >= '3.11' and python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'proxy') or (python_full_version < '3.11' and extra == 'proxy')", specifier = ">=1.16.0,<1.24.0" },
+    { name = "onnxruntime", marker = "(python_full_version >= '3.11' and python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'voice') or (python_full_version < '3.11' and extra == 'voice')", specifier = ">=1.16.0,<1.24.0" },
+    { name = "onnxruntime", marker = "(python_full_version >= '3.14' and platform_machine != 'x86_64' and extra == 'image') or (python_full_version >= '3.14' and sys_platform != 'darwin' and extra == 'image') or (python_full_version == '3.13.*' and extra == 'image')", specifier = ">=1.7,<2" },
     { name = "openai", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "openai", marker = "extra == 'evals'", specifier = ">=1.0.0" },
     { name = "openai", marker = "extra == 'proxy'", specifier = ">=2.14.0" },
@@ -2008,7 +2014,7 @@ requires-dist = [
     { name = "python-socks", extras = ["asyncio"], marker = "extra == 'proxy'", specifier = ">=2.7.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "qdrant-client", marker = "extra == 'memory-stack'", specifier = ">=1.9.0,<2.0" },
-    { name = "rapidocr", marker = "(python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'image') or (python_full_version >= '3.13' and platform_machine != 'x86_64' and extra == 'image') or (python_full_version >= '3.13' and sys_platform != 'darwin' and extra == 'image')", specifier = ">=3.0,<4" },
+    { name = "rapidocr", marker = "(python_full_version >= '3.14' and platform_machine != 'x86_64' and extra == 'image') or (python_full_version >= '3.14' and sys_platform != 'darwin' and extra == 'image') or (python_full_version == '3.13.*' and extra == 'image')", specifier = ">=3.0,<4" },
     { name = "rapidocr-onnxruntime", marker = "python_full_version < '3.13' and extra == 'image'", specifier = ">=1.4.0,<2" },
     { name = "redis", marker = "extra == 'redis'", specifier = ">=5.0.0" },
     { name = "respx", marker = "extra == 'dev'", specifier = ">=0.20.0" },
@@ -2126,8 +2132,8 @@ name = "httpcore2"
 version = "2.16.0"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
-    { name = "h11", marker = "sys_platform != 'emscripten'" },
-    { name = "truststore", marker = "sys_platform != 'emscripten'" },
+    { name = "h11" },
+    { name = "truststore" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c0/61/afa9d6b7452f9eca73f73d45324eb0bb52f098fd5e6049bf6b8263be9b4e/httpcore2-2.16.0.tar.gz", hash = "sha256:c72cd0413563b17e1cd8354677dff887466f8ec2551679759e93126534428643", size = 69886, upload-time = "2026-10-21T07:09:45.31Z" }
 wheels = [

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom import fsutil
+from headroom.providers.codex.config_toml import loads_codex_config, split_toml_lines
 
 from .base import (
     MCPRegistrar,
@@ -84,7 +85,7 @@ def _evict_foreign_tables(content: str, server_name: str, start: str, end: str) 
     move, so a header-like line inside a multi-line string can split a table
     wrongly; callers must check the final result with ``_only_server_changed``.
     """
-    lines = content.splitlines(keepends=True)
+    lines = split_toml_lines(content, keepends=True)
     try:
         i = next(n for n, line in enumerate(lines) if line.rstrip("\r\n") == start)
         j = next(n for n in range(i + 1, len(lines)) if lines[n].rstrip("\r\n") == end)
@@ -121,7 +122,7 @@ def _only_server_changed(old: str, new: str, server_name: str) -> bool:
     makes this False and the rewrite is refused instead of written.
     """
     try:
-        before, after = tomllib.loads(old), tomllib.loads(new)
+        before, after = loads_codex_config(old), loads_codex_config(new)
     except tomllib.TOMLDecodeError:
         return False
     return _without_server(before, server_name) == _without_server(after, server_name)
@@ -252,8 +253,10 @@ class _TomlMarkerRegistrar(MCPRegistrar):
         if not self._config_file.exists():
             return {}
         try:
-            with open(self._config_file, "rb") as f:
-                data = tomllib.load(f)
+            # Read via fsutil (UTF-8 with locale fallback) so a config that a
+            # tool wrote in the system locale (e.g. GBK) still parses instead
+            # of failing tomllib's UTF-8 requirement. See #733.
+            data = loads_codex_config(fsutil.read_text(self._config_file))
         except (tomllib.TOMLDecodeError, OSError):
             return {}
         return data if isinstance(data, dict) else {}
@@ -274,7 +277,7 @@ class _TomlMarkerRegistrar(MCPRegistrar):
         if not raw.strip():
             return None
         try:
-            data = tomllib.loads(raw)
+            data = loads_codex_config(raw)
         except (tomllib.TOMLDecodeError, OSError) as exc:
             return f"{self._config_file} is not valid TOML ({exc})"
         if not isinstance(data, dict):
@@ -289,10 +292,7 @@ class _TomlMarkerRegistrar(MCPRegistrar):
         return None
 
     def _read_text(self) -> str:
-        try:
-            return self._config_file.read_text()
-        except OSError:
-            return ""
+        return fsutil.read_text(self._config_file, default="")
 
     def _write_block(self, spec: ServerSpec) -> RegisterResult:
         block = _render_block(spec)

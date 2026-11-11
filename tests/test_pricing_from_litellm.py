@@ -41,12 +41,6 @@ def test_unwrapped_model_forms_drops_leading_segments() -> None:
         ("bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0", 3.00, 15.00),
         ("bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0", 3.00, 15.00),
         ("vertex_ai/claude-sonnet-4-5", 3.00, 15.00),
-        # Any gateway-prefixed name here must be one litellm still prices:
-        # when it prunes a model the unwrap finds nothing and _get_pricing
-        # silently returns the $2.50/$10.00 GPT-4o default, which is what
-        # this test exists to catch. litellm dropped
-        # groq/llama-3.3-70b-versatile on 2026-09-23; see issue #3732.
-        ("groq/llama-guard-3-8b", 0.20, 0.20),
         # Non-OpenAI models reachable through the OpenAI-compatible passthrough.
         ("gemini-2.5-flash", 0.30, 2.50),
     ],
@@ -69,6 +63,25 @@ def test_deepseek_compatibility_names_use_v4_flash_pricing(
     monkeypatch.setitem(litellm.model_cost, "deepseek/deepseek-v4-flash", target)
 
     assert OpenAIProvider()._get_pricing(model) == (0.31, 1.23)
+
+
+def test_gateway_pricing_uses_unwrapped_catalog_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retiring a vendor model must not break the gateway-resolution regression."""
+    bare_model = "headroom-pricing-fixture"
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {
+            bare_model: {
+                "input_cost_per_token": 0.20 / 1_000_000,
+                "output_cost_per_token": 0.20 / 1_000_000,
+            }
+        },
+    )
+
+    # Only the unwrapped key exists. Returning the unknown-model default instead
+    # of looking through the gateway prefix must still fail this assertion.
+    assert OpenAIProvider()._get_pricing(f"groq/{bare_model}") == pytest.approx((0.20, 0.20))
 
 
 def test_explicit_config_outranks_litellm() -> None:

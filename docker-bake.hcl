@@ -10,7 +10,7 @@ target "runtime-default" {
   inherits = ["_common", "docker-metadata-action"]
   target   = "runtime"
   args = {
-    HEADROOM_EXTRAS = "proxy,bedrock"
+    HEADROOM_EXTRAS = "proxy,bedrock,redis"
     RUNTIME_USER    = "nonroot"
   }
 }
@@ -19,8 +19,9 @@ target "runtime" {
   inherits = ["_common", "docker-metadata-action"]
   target   = "runtime"
   args = {
-    HEADROOM_EXTRAS = "proxy,bedrock"
+    HEADROOM_EXTRAS = "proxy,bedrock,redis"
     RUNTIME_USER    = "root"
+    RUNTIME_HOME    = "/root"
   }
 }
 
@@ -28,7 +29,7 @@ target "runtime-self-hosted" {
   inherits = ["_common", "docker-metadata-action"]
   target   = "runtime"
   args = {
-    HEADROOM_EXTRAS = "proxy,code,memory-stack,bedrock"
+    HEADROOM_EXTRAS = "proxy,code,memory-stack,bedrock,redis"
     RUNTIME_USER    = "nonroot"
   }
 }
@@ -37,7 +38,7 @@ target "runtime-nonroot" {
   inherits = ["_common", "docker-metadata-action"]
   target   = "runtime"
   args = {
-    HEADROOM_EXTRAS = "proxy,bedrock"
+    HEADROOM_EXTRAS = "proxy,bedrock,redis"
     RUNTIME_USER    = "nonroot"
   }
 }
@@ -46,8 +47,9 @@ target "runtime-code" {
   inherits = ["_common", "docker-metadata-action"]
   target   = "runtime"
   args = {
-    HEADROOM_EXTRAS = "proxy,code,bedrock"
+    HEADROOM_EXTRAS = "proxy,code,bedrock,redis"
     RUNTIME_USER    = "root"
+    RUNTIME_HOME    = "/root"
   }
 }
 
@@ -55,7 +57,7 @@ target "runtime-code-nonroot" {
   inherits = ["_common", "docker-metadata-action"]
   target   = "runtime"
   args = {
-    HEADROOM_EXTRAS = "proxy,code,bedrock"
+    HEADROOM_EXTRAS = "proxy,code,bedrock,redis"
     RUNTIME_USER    = "nonroot"
   }
 }
@@ -64,8 +66,9 @@ target "runtime-slim" {
   inherits = ["_common", "docker-metadata-action"]
   target   = "runtime-slim"
   args = {
-    HEADROOM_EXTRAS = "proxy,bedrock"
+    HEADROOM_EXTRAS = "proxy,bedrock,redis"
     RUNTIME_USER    = "root"
+    RUNTIME_HOME    = "/root"
   }
 }
 
@@ -73,7 +76,7 @@ target "runtime-slim-nonroot" {
   inherits = ["_common", "docker-metadata-action"]
   target   = "runtime-slim"
   args = {
-    HEADROOM_EXTRAS = "proxy,bedrock"
+    HEADROOM_EXTRAS = "proxy,bedrock,redis"
     RUNTIME_USER    = "nonroot"
   }
 }
@@ -82,8 +85,9 @@ target "runtime-code-slim" {
   inherits = ["_common", "docker-metadata-action"]
   target   = "runtime-slim"
   args = {
-    HEADROOM_EXTRAS = "proxy,code,bedrock"
+    HEADROOM_EXTRAS = "proxy,code,bedrock,redis"
     RUNTIME_USER    = "root"
+    RUNTIME_HOME    = "/root"
   }
 }
 
@@ -91,7 +95,7 @@ target "runtime-code-slim-nonroot" {
   inherits = ["_common", "docker-metadata-action"]
   target   = "runtime-slim"
   args = {
-    HEADROOM_EXTRAS = "proxy,code,bedrock"
+    HEADROOM_EXTRAS = "proxy,code,bedrock,redis"
     RUNTIME_USER    = "nonroot"
   }
 }

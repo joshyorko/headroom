@@ -206,6 +206,92 @@ def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> 
     assert {"boto3", "botocore"} <= bedrock_names
 
 
+def _dockerfile_stages() -> dict[str, list[str]]:
+    """Map each Dockerfile stage to its instruction lines, parent stages first.
+
+    A stage that is ``FROM <earlier stage>`` inherits that stage's filesystem
+    and metadata (VOLUME, WORKDIR, ARG-derived values), so the parent's lines
+    are part of what the child ships.
+    """
+    own: dict[str, list[str]] = {}
+    parent: dict[str, str] = {}
+    current: list[str] | None = None
+    for raw in (ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        from_match = re.match(r"FROM\s+(\S+)\s+AS\s+(\S+)$", line, re.IGNORECASE)
+        if from_match:
+            base, name = from_match.groups()
+            current = own.setdefault(name, [])
+            if base in own:
+                parent[name] = base
+        elif current is not None and line and not line.startswith("#"):
+            current.append(line)
+    stages: dict[str, list[str]] = {}
+    for name in own:
+        chain, node = [], name
+        while node:
+            chain.insert(0, node)
+            node = parent.get(node, "")
+        stages[name] = [line for stage in chain for line in own[stage]]
+    return stages
+
+
+def test_docker_bake_runtime_args_are_declared_by_the_selected_stage() -> None:
+    """Each bake target's runtime args must reach the stage it builds (#4443).
+
+    Build args are scoped to one Dockerfile stage, so passing ``RUNTIME_HOME``
+    to a target whose ``target =`` stage has no ``ARG RUNTIME_HOME`` is a
+    silent no-op. The distroless ``runtime-slim`` stage once ignored it, so the
+    slim root variants shipped without the state volume.
+    """
+    stages = _dockerfile_stages()
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    blocks = re.findall(r'^target "([^"]+)" \{\n(.*?)^\}', bake, flags=re.S | re.M)
+    checked = {}
+    for name, body in blocks:
+        stage_match = re.search(r'^\s*target\s*=\s*"([^"]+)"', body, re.M)
+        if not stage_match:
+            continue
+        stage = stage_match.group(1)
+        assert stage in stages, f"{name} selects unknown Dockerfile stage {stage}"
+        declared = {m.group(1) for line in stages[stage] if (m := re.match(r"ARG\s+(\w+)", line))}
+        passed = set(re.findall(r"^\s*(RUNTIME_\w+)\s*=", body, re.M))
+        assert passed <= declared, f"{name}: stage {stage} does not declare {passed - declared}"
+        home = re.search(r'RUNTIME_HOME\s*=\s*"([^"]+)"', body)
+        user = re.search(r'RUNTIME_USER\s*=\s*"([^"]+)"', body)
+        if user and user.group(1) == "root":
+            assert home and home.group(1) == "/root", f"{name}: root target needs /root"
+        if home:
+            # The stage must put its state volume under the home it was given.
+            assert "VOLUME ${RUNTIME_HOME}/.headroom" in stages[stage], f"{name}: {stage}"
+        checked[name] = stage
+    assert {"runtime", "runtime-code", "runtime-slim", "runtime-code-slim"} <= set(checked)
+    assert {checked[n] for n in ("runtime-slim", "runtime-code-slim")} == {"runtime-slim"}
+
+
+def test_every_docker_variant_includes_the_redis_extra() -> None:
+    """Without the client, HEADROOM_COMPRESS_SESSION_STORE=redis:// stops
+    startup and HEADROOM_CCR_BACKEND=redis falls back to a per-process store,
+    so the 0.42 image could use neither. Keep the Dockerfile default and every
+    bake target on [redis]."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    defaults = re.findall(r"^ARG HEADROOM_EXTRAS=(\S+)$", dockerfile, re.MULTILINE)
+    assert len(defaults) == 1, defaults
+    assert "redis" in defaults[0].split(",")
+
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    targets = re.findall(r'^\s*HEADROOM_EXTRAS = "([^"]*)"$', bake, re.MULTILINE)
+    assert len(targets) == 10
+    assert all("redis" in extras.split(",") for extras in targets), targets
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    redis_names = {
+        Requirement(requirement).name
+        for requirement in project["project"]["optional-dependencies"]["redis"]
+    }
+    assert "redis" in redis_names
+
+
 def test_public_docker_instructions_use_the_current_organization_package() -> None:
     """Do not send users back to the personal GHCR package frozen at 0.27.0."""
     public_docs = (
@@ -282,7 +368,7 @@ def test_docker_build_cache_failures_are_best_effort() -> None:
     assert cached["continue-on-error"] is True
     assert "ignore-error=true" in cache_to
     assert fallback_builder["if"] == "steps.bake.outcome == 'failure'"
-    assert fallback_builder["uses"] == "docker/setup-buildx-action@v4"
+    assert fallback_builder["uses"].startswith("docker/setup-buildx-action@")
     assert fallback["if"] == "steps.bake.outcome == 'failure'"
     assert fallback["uses"] == cached["uses"]
     assert fallback["with"]["builder"] == "${{ steps.fallback-buildx.outputs.name }}"
@@ -1079,8 +1165,8 @@ def test_publish_npm_regenerates_openclaw_dist_metadata_after_version_and_depend
     """The direct npm publish path must not ship stale OpenClaw dist metadata."""
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
-    start = content.index("name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org")
-    end = content.index("continue-on-error: true", start)
+    start = content.index("name: Prepare ${{ env.NPM_OPENCLAW_PACKAGE }} for npmjs.org")
+    end = content.index("name: Prepare ${{ env.NPM_OPENCODE_PACKAGE }}", start)
     block = content[start:end]
 
     version = block.index('npm version "$version"')
@@ -1095,8 +1181,8 @@ def test_publish_npm_rewrites_opencode_dependency_after_version_and_before_publi
     """The direct npm publish path must version and retarget the Opencode dependency."""
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
-    start = content.index("name: Publish ${{ env.NPM_OPENCODE_PACKAGE }} to npmjs.org")
-    end = content.index("continue-on-error: true", start)
+    start = content.index("name: Prepare ${{ env.NPM_OPENCODE_PACKAGE }} for npmjs.org")
+    end = content.index("\n  publish-github-packages:", start)
     block = content[start:end]
 
     version = block.index('npm version "$version"')
@@ -1104,6 +1190,56 @@ def test_publish_npm_rewrites_opencode_dependency_after_version_and_before_publi
     publish = block.index("npm publish --access public")
 
     assert version < dependency < publish
+
+
+def test_publish_npm_authenticates_before_any_publish_and_fails_closed() -> None:
+    """An opted-in npm release must not silently succeed with stale packages."""
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    start = content.index("\n  publish-npm:")
+    end = content.index("\n  publish-github-packages:", start)
+    block = content[start:end]
+
+    auth = block.index("name: Verify npm publishing authentication")
+    first_publish = block.index("npm publish --access public")
+    assert auth < first_publish
+    assert 'npm whoami --registry "${NPM_REGISTRY_URL}"' in block
+    assert "NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}" in block
+    assert "continue-on-error: true" not in block
+    assert "npm publish notice" not in block
+
+
+def test_publish_npm_is_rerunnable_after_a_partial_release() -> None:
+    """Immutable versions already published by an earlier attempt must be skipped."""
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    start = content.index("\n  publish-npm:")
+    end = content.index("\n  publish-github-packages:", start)
+    block = content[start:end]
+
+    for package_var in ("NPM_SDK_PACKAGE", "NPM_OPENCLAW_PACKAGE", "NPM_OPENCODE_PACKAGE"):
+        lookup = (
+            f'npm view "${{{package_var}}}@${{version}}" version --registry "${{NPM_REGISTRY_URL}}"'
+        )
+        assert lookup in block
+        lookup_index = block.index(lookup)
+        publish_index = block.index("npm publish --access public", lookup_index)
+        assert lookup_index < publish_index
+
+
+def test_publish_npm_token_is_only_in_whoami_and_publish_steps() -> None:
+    """Install and build scripts must never see the npm publish token."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release.yml").read_text())
+    job = workflow["jobs"]["publish-npm"]
+
+    assert "NODE_AUTH_TOKEN" not in job.get("env", {})
+    with_token = [step for step in job["steps"] if "NODE_AUTH_TOKEN" in step.get("env", {})]
+    assert len(with_token) == 4  # whoami + one publish per package
+    for step in with_token:
+        run = step["run"]
+        assert "npm whoami" in run or run.strip().endswith("npm publish --access public"), step
+        assert "npm ci" not in run and "npm run build" not in run, step
+    for step in job["steps"]:
+        if "npm ci" in step.get("run", ""):
+            assert "env" not in step or "NODE_AUTH_TOKEN" not in step["env"], step
 
 
 def test_sdist_license_is_packaged_and_verified_before_upload() -> None:
@@ -1157,7 +1293,7 @@ def test_pypi_publish_failure_blocks_github_release() -> None:
     npm_job_start = content.index("publish-npm:", pypi_job_start)
     pypi_job = content[pypi_job_start:npm_job_start]
 
-    assert re.search(r"uses: pypa/gh-action-pypi-publish@v\d+\.\d+\.\d+", pypi_job)
+    assert re.search(r"uses: pypa/gh-action-pypi-publish@[0-9a-f]{40} # v\d+\.\d+\.\d+", pypi_job)
     assert "continue-on-error: true" not in pypi_job
     assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
 
@@ -1570,6 +1706,28 @@ def test_release_yml_resolves_manual_ver_from_release_tag() -> None:
     )
 
 
+def test_release_yml_preserves_release_please_notes_when_release_exists() -> None:
+    """create-release must not clobber release-please's auto-generated notes.
+
+    release-please creates the GitHub Release with an auto-generated
+    changelog body when its release PR merges. If create-release then
+    runs `gh release edit --notes-file .changelog.md`, the bot's
+    changelog gets overwritten with this workflow's full-history
+    fallback (which has no `--since` bound when MANUAL_VER is set
+    and previous_tag comes back empty). Keep the bot's notes intact;
+    only update title.
+    """
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    create_release_idx = content.index("\n  create-release:")
+    create_release_block = content[create_release_idx:]
+
+    assert 'gh release edit "$TAG" --title "$TITLE"\n' in create_release_block, (
+        "When the release already exists (release-please case), the edit "
+        "must only sync title — NOT pass --notes-file, which would "
+        "clobber the bot's auto-generated changelog."
+    )
+
+
 def test_version_sync_covers_every_file_the_verifier_gates() -> None:
     """version-sync.py must write every version location verify-versions.py checks.
 
@@ -1585,6 +1743,8 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "sdk/typescript/package.json",
         "plugins/headroom-agent-hooks/.claude-plugin/plugin.json",
         "plugins/headroom-agent-hooks/.github/plugin/plugin.json",
+        "plugins/headroom-skill/.claude-plugin/plugin.json",
+        "plugins/headroom-skill/.github/plugin/plugin.json",
         "marketplace.json",
     ]
     for path in gated:
@@ -1595,6 +1755,7 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "openclaw",
         "typescript",
         "headroom-agent-hooks",
+        "headroom-skill",
         "marketplace.json",
         "server.json",
     ]:
@@ -1629,7 +1790,7 @@ def test_ci_covers_self_hosted_pushes_and_pull_requests() -> None:
 def test_self_hosted_image_keeps_bedrock_and_memory_stack_dependencies() -> None:
     bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
     target = bake.split('target "runtime-self-hosted"', 1)[1].split('\ntarget "', 1)[0]
-    assert 'HEADROOM_EXTRAS = "proxy,code,memory-stack,bedrock"' in target
+    assert 'HEADROOM_EXTRAS = "proxy,code,memory-stack,bedrock,redis"' in target
 
 
 def test_release_yml_preserves_existing_release_notes() -> None:

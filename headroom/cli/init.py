@@ -62,6 +62,11 @@ from headroom.install.state import ManifestError, load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
+from headroom.providers.codex.config_toml import (
+    loads_codex_config,
+    root_assignment_lines,
+    split_toml_lines,
+)
 from headroom.providers.codex.install import (
     CodexAuthConfigError,
     build_codex_auth_config,
@@ -101,6 +106,10 @@ _STARTUP_READY_TIMEOUT_SECONDS = 15
 # report ready, and every session is permanently cold.
 _HOOK_ENSURE_TIMEOUT_SECONDS = 60
 _TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
+_ROOT_PROVIDER_KEY_RE = re.compile(
+    r"[ \t]*(?:model_provider|openai_base_url|experimental_realtime_(?:webrtc_call|ws)_base_url)"
+    r"[ \t]*="
+)
 _TOML_FEATURES_NAME_RE = r"(?:features|\"features\"|'features')"
 _TOML_CODEX_HOOKS_NAME_RE = r"(?:codex_hooks|\"codex_hooks\"|'codex_hooks')"
 _CODEX_FEATURES_TABLE_RE = re.compile(
@@ -154,7 +163,13 @@ def _local_profile(cwd: Path | None = None) -> str:
     slug = "".join(
         ch if (ch.isascii() and ch.isalnum()) or ch in "-._" else "-" for ch in root.name.lower()
     ).strip("-")
-    digest = sha1(str(root).encode("utf-8")).hexdigest()[:8]
+    try:
+        raw = str(root).encode("utf-8")
+    except UnicodeEncodeError:
+        # A POSIX directory name that is not valid UTF-8 is carried by pathlib as
+        # surrogate escapes. Hash the native bytes; valid paths keep their IDs.
+        raw = os.fsencode(root)
+    digest = sha1(raw).hexdigest()[:8]
     return validate_profile_name(f"init-{slug or 'repo'}-{digest}")
 
 
@@ -387,7 +402,7 @@ def _replace_marker_block(
         # The block carries top-level keys, so it must sit above the first table
         # header; appended after a table (e.g. [features]) TOML scopes those keys
         # into that table and Codex rejects the config (#260).
-        lines = content.splitlines()
+        lines = split_toml_lines(content)
         for index, line in enumerate(lines):
             if _TOML_TABLE_HEADER_RE.search(line):
                 # A first table may belong to a marked MCP block. Keep its
@@ -489,7 +504,7 @@ def _codex_init_provider_snapshot(content: str) -> str | None:
     snapshot = json.loads(match.group(1))
     if not isinstance(snapshot, str):
         raise ValueError("Invalid Headroom init provider snapshot")
-    tomllib.loads(snapshot)
+    loads_codex_config(snapshot)
     return snapshot
 
 
@@ -702,24 +717,21 @@ def _ensure_codex_provider(path: Path, provider_url: str | int) -> None:
     # first table header) -- these keys also appear legitimately inside
     # [profiles.*] tables as per-profile overrides, and stripping them there
     # silently reroutes the user's profiles to the injected "headroom" default.
-    _first_table = re.search(r"(?m)^[ \t]*\[", content)
-    _split = _first_table.start() if _first_table else len(content)
-    root, rest = content[:_split], content[_split:]
-    root = re.sub(r"(?m)^[ \t]*model_provider[ \t]*=.*\r?\n", "", root)
-    root = re.sub(r"(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n", "", root)
-    root = re.sub(
-        r"(?m)^[ \t]*experimental_realtime_(?:webrtc_call|ws)_base_url[ \t]*=.*\r?\n",
-        "",
-        root,
+    # Lines nested in a multi-line inline table (e.g. ``profiles = {``) are
+    # profile overrides too, so only true root assignments are dropped.
+    _root_lines = root_assignment_lines(content)
+    content = "".join(
+        line
+        for index, line in enumerate(split_toml_lines(content, keepends=True))
+        if index not in _root_lines or not _ROOT_PROVIDER_KEY_RE.match(line)
     )
-    content = root + rest
     # The provider block carries top-level keys (model_provider, openai_base_url),
     # so it must land at the document root rather than after a trailing table (#260).
     content = _replace_marker_block(
         content, _CODEX_PROVIDER_MARKER_START, _CODEX_PROVIDER_MARKER_END, block, at_root=True
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    tomllib.loads(content)
+    loads_codex_config(content)
     fsutil.write_text(path, content)
     # Codex filters its history menu by the active model_provider, so existing
     # native threads vanish once we switch to "headroom". Retag them to match the
@@ -748,7 +760,7 @@ def _codex_features(content: str) -> dict[str, Any] | None:
     if not content.strip():
         return None
     try:
-        parsed = tomllib.loads(content)
+        parsed = loads_codex_config(content)
     except tomllib.TOMLDecodeError:
         return None
     features = parsed.get("features")
@@ -760,7 +772,7 @@ def _codex_features_has_hooks(content: str) -> bool:
     if features is None:
         # Keep init resilient for already-invalid user configs; this fallback
         # only needs to avoid adding a second obvious hooks line.
-        lines = content.splitlines()
+        lines = split_toml_lines(content)
         features_index = _codex_features_table_index(lines)
         if features_index is None:
             return False
@@ -775,7 +787,7 @@ def _codex_features_has_hooks(content: str) -> bool:
 
 
 def _strip_codex_legacy_feature_flag(content: str) -> str:
-    lines = content.splitlines(keepends=True)
+    lines = split_toml_lines(content, keepends=True)
     retained: list[str] = []
     in_features = False
     in_root = True
@@ -825,7 +837,7 @@ def _ensure_codex_feature_flag(path: Path) -> None:
         # the only work.
         pass
     else:
-        lines = content.splitlines()
+        lines = split_toml_lines(content)
         features_index = _codex_features_table_index(lines)
         if features_index is not None:
             # Leading blank line matches the normalisation _replace_marker_block

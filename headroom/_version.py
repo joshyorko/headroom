@@ -106,7 +106,7 @@ def _project_version(root: Path) -> str | None:
     try:
         import tomllib
     except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
-        import tomli as tomllib
+        import tomli as tomllib  # type: ignore[no-redef]
 
     try:
         with open(root / "pyproject.toml", "rb") as file:

@@ -32,7 +32,7 @@ Josh clarified that this branch should follow upstream's supported Python versio
 
 Upstream still supports Serena, but `2649835a` makes it opt-in. Josh clarified not to remove Serena unless upstream removed it. The candidate therefore retains Serena registration/cleanup and explicit selectors, while using upstream's default of no code-memory MCP. The earlier forced-Serena restoration is reverted.
 
-The self-hosted `[all]` profile still retains its existing ML, memory, evals and voice extras, with `uv lock --check` passing. This is an explicit remaining fork profile difference; the individual upstream optional features remain supported. Deployment uses the narrower `proxy,code,memory-stack,bedrock,redis` image profile. Current-container package/MCP qualification is recorded below.
+The `[all]` profile also follows upstream's leaner default. ML, memory, evals and voice remain supported as explicit extras; they are not automatically selected by `[all]`. The initial blanket preservation of that old aggregate profile was unnecessary and has been reverted. Deployment retains its explicit `proxy,code,memory-stack,bedrock,redis` image profile.
 
 ## Conflict decisions requiring explicit preservation
 
@@ -103,3 +103,8 @@ At Josh’s request, the actual installed `t3 triage --agent codex` workflow was
 This separate issue is in the fork's remote-proxy init path. Remote mode deliberately has no local server to auto-start, but `_ensure_codex_hooks` serialized an empty hook map anyway. The repair avoids creating that no-op artifact and removes an existing empty artifact during explicit re-init only if it has no hooks and no other settings. Local startup hooks, user hooks and additional top-level settings are preserved. Init explains that a remote proxy needs no local startup hooks. No global Codex configuration was modified by this repair session.
 
 The three new fresh/empty-file regressions failed before the repair. The init/cleanup/code-memory suites passed 149 tests with one skip, and two additional real writer checks passed for preserving other settings and switching local-managed hooks to remote. Upstream-aligned code-memory/Codex wrap/init tests passed 261 with one skip. These runs overlap and are not a unique total. Tests use temporary Codex directories.
+
+
+## Publication verification follow-up
+
+Josh authorized pushing this integration to self-hosted, keeping upstream support/default policies and retaining downstream integrations. Rust formatting and Clippy passed in the container before `cargo test --workspace` began. The shared Dagger engine was subsequently removed; the interrupted Rust and Python publication runs have no usable final result. They must not be described as passing. The earlier package smoke succeeded with the self-hosted extras, while the final init repair is covered by the focused writer/wrapper tests. Exact-head hosted CI and Docker image qualification are the remaining publication gates before advising a Kamal redeploy. No host Rust installation, deployment, service restart, or global routing change was performed.

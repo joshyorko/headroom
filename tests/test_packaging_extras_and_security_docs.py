@@ -60,11 +60,13 @@ def test_lean_profile_stays_torch_free() -> None:
     )
 
 
-def test_self_hosted_all_profile_keeps_ml_memory_evals_and_voice() -> None:
+def test_heavy_features_remain_available_as_explicit_extras() -> None:
     extras = _pyproject()["project"]["optional-dependencies"]
     (spec,) = extras["all"]
     selected = set(re.search(r"\[(.*)\]", spec).group(1).split(","))
-    assert {"ml", "memory", "evals", "voice"} <= selected
+    heavy_features = {"ml", "memory", "evals", "voice"}
+    assert not selected & heavy_features
+    assert all(extras[feature] for feature in heavy_features)
 
 
 def test_security_policy_supports_the_latest_release_without_a_version_number() -> None:

@@ -939,6 +939,11 @@ def _ensure_codex_hooks(path: Path, profile: str, proxy_url: str) -> None:
         else:
             hooks.pop(event, None)
     payload["hooks"] = hooks
+    if payload == {"hooks": {}}:
+        if path.exists():
+            path.unlink()
+            _prune_codex_hook_trust(path)
+        return
     _write_json(path, payload)
     _prune_codex_hook_trust(path)
 
@@ -1400,6 +1405,8 @@ def _init_codex(
         verbose=verbose,
     )
     click.echo(f"Configured Codex ({'user' if global_scope else 'local'} scope).")
+    if proxy_url and not _proxy_url_uses_local_runtime(proxy_url):
+        click.echo("Remote proxy selected; local proxy startup hooks are not required.")
     if os.name == "nt":
         click.echo(
             "Codex hooks are currently disabled upstream on Windows; provider routing was still installed."

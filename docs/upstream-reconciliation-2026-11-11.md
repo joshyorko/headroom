@@ -26,11 +26,13 @@ The primary checkout's unrelated `.serena/project.yml`, `config/deploy.yml`, and
 
 Detailed behavior reviews are in [provider/wrapper preservation](upstream-reconciliation-2026-11-11-provider.md), [runtime preservation](upstream-reconciliation-2026-11-11-fork-runtime.md), and [fork deletion review](upstream-reconciliation-2026-11-11-fork-runtime-deletions-review.md). All 42 fork-only deleted paths remain absent; [the deletion inventory](upstream-reconciliation-2026-11-11-deletions.tsv) complements the added/modified inventory. These source audits do not replace native startup, dependency-matrix, or live-service acceptance.
 
-## Unresolved preservation gate: Python 3.10
+## Upstream parity decision
 
-Upstream `3c6f82b06091206379106f8fe1a54f2400ed7a93` raises `requires-python` from `>=3.10` to `>=3.11`, removes the `tomli` backport, and makes the patched `filelock>=4.2.1` floor unconditional. The starting fork advertised Python 3.10 support. Adopting the new minimum would remove that packaging capability; merely reverting the metadata would falsely advertise compatibility and conflict with dependencies requiring 3.11. This remains **unresolved**. The local candidate must not be published or called preservation-accepted until an explicit support decision or independently verified compatibility backport resolves it. A Python 3.11 wheel build cannot close this gate.
+Josh clarified that this branch should follow upstream's supported Python versions. Keep upstream `3c6f82b06091206379106f8fe1a54f2400ed7a93`'s Python 3.11 minimum and patched dependency floors. No Python 3.10 backport or metadata downgrade is needed; the former publication blocker is resolved by that explicit scope decision.
 
-The packaging audit also caught upstream `a8905214d949cdc42b1d76fbc83146f51e0c4f19` removing ML, memory, evals and voice from `[all]`. Those four baseline extras are restored in this fork, and `uv lock --check` passes after resolving the matching lockfile without installing an environment; the separate lean profile remains torch-free. `test_self_hosted_all_profile_keeps_ml_memory_evals_and_voice` records this contract. Updated MCP SDK 2 dependency/runtime interoperability remains a separate dependency qualification gate; the prepared environment has no MCP distribution installed, so these checks cannot prove it.
+Upstream still supports Serena, but `2649835a` makes it opt-in. Josh clarified not to remove Serena unless upstream removed it. The candidate therefore retains Serena registration/cleanup and explicit selectors, while using upstream's default of no code-memory MCP. The earlier forced-Serena restoration is reverted.
+
+The self-hosted `[all]` profile still retains its existing ML, memory, evals and voice extras, with `uv lock --check` passing. This is an explicit remaining fork profile difference; the individual upstream optional features remain supported. Deployment uses the narrower `proxy,code,memory-stack,bedrock,redis` image profile. Current-container package/MCP qualification is recorded below.
 
 ## Conflict decisions requiring explicit preservation
 
@@ -39,7 +41,7 @@ The packaging audit also caught upstream `a8905214d949cdc42b1d76fbc83146f51e0c4f
 - Traffic learning combines upstream retry/idempotency with fork per-user/backend isolation; project-scoped requests remain fail-closed.
 - Memory tools retain both request-context-aware and legacy handler signatures.
 - Canonical MemoryHandler receives its actual request context. A legacy adapter can run scoped traffic only when its resolver selects the same backend and provides the effective composite user identity; otherwise dispatch explicitly returns `legacy_request_scope_unsupported`. No canonical legacy-signature implementation was found in the sampled history. The compatibility adapter is therefore tested as an adapter contract, not claimed to be a historical production implementation. This fail-closed limitation is explicit and requires review; silently dropping project scope is not accepted.
-- Code-memory defaults remain Serena, as on self-hosted, while explicit opt-out continues to work. Upstream's switch to an opt-in default is not adopted.
+- Serena support is retained with upstream's opt-in default. Explicit `--code-memory serena` and legacy selectors remain supported.
 - Rust auth classification retains previously accepted OAuth tokens and adds upstream's case-insensitive scheme/real token format fixes; the `lru` dependency retains upstream's soundness update.
 - Release workflow tests retain fork publication contracts; assertions requiring already-retired upstream release bots are not reintroduced.
 
@@ -88,9 +90,16 @@ Other focused receipts: 364 Codex/provider/init/install tests passed; the broade
 
 The restored Serena defaults failed two baseline expectations before restoration and passed afterward. The `[all]` metadata before restoration lacked all four baseline optional features; restored metadata contains them. Actual MemoryHandler/router/SQLite tests pass for canonical and explicitly representative legacy-adapter cases, and a process-only negative mutation of the prior raw-user fallback fails the isolation assertion. No tests were removed to bypass native coverage.
 
-Remaining gates: Python 3.10 compatibility decision/backport; final wheel/dependency install using MCP SDK 2 and the restored `[all]` profile; plugin Node suites; full Rust test matrix; hosted exact-head CI; installed/runtime/deployment and UI acceptance. No push, remote self-hosted update, PR, deployment, restart or global routing/auth change was performed. Temporary build exports and diagnostics are removed at handoff; the source checklists and regression tests remain in this worktree.
+Remaining gates at the earlier handoff: final wheel/dependency install using MCP SDK 2 and the restored `[all]` profile; plugin Node suites; full Rust test matrix; hosted exact-head CI; installed/runtime/deployment and UI acceptance. No push, remote self-hosted update, PR, deployment, restart or global routing/auth change was performed. Temporary build exports and diagnostics are removed at handoff; the source checklists and regression tests remain in this worktree.
 
 
 Additional native-backed qualification passed 29 tests across memory-tool project scope, OpenAI backend routing and compression admission. One subprocess admission check initially imported the prepared environment’s old checkout because the parent runner set sys.path but not inherited PYTHONPATH; after correcting only the runner’s child source path, that check passed. No production/test assertion was changed for this harness failure. Thus the native-backed affected suites total 291 passing tests across the two disjoint runs and the corrected single case.
 
 At Josh’s request, the actual installed `t3 triage --agent codex` workflow was launched for an independent read-only review of the existing report. The installed workflow completed its bounded independent read-only review (default GPT-6-Luna). It confirmed the causal source transition, current ready/unsupported cache, actual Headroom-upstream setup and report wording; no correction was needed beyond updating the now-stale triage attribution. It did not repeat the app-server probe, test an unmodified upstream runtime, or perform UI acceptance. Its conclusion is retained in [the triage record](upstream-reconciliation-2026-11-11-triage.md). The existing issue covers the related duplicate-quota problem; triage found no exact separate Headroom-route report in its bounded search. No new issue or PR was created.
+
+
+## Remote Codex init empty-hook repair
+
+This separate issue is in the fork's remote-proxy init path. Remote mode deliberately has no local server to auto-start, but `_ensure_codex_hooks` serialized an empty hook map anyway. The repair avoids creating that no-op artifact and removes an existing empty artifact during explicit re-init only if it has no hooks and no other settings. Local startup hooks, user hooks and additional top-level settings are preserved. Init explains that a remote proxy needs no local startup hooks. No global Codex configuration was modified by this repair session.
+
+The three new fresh/empty-file regressions failed before the repair. The init/cleanup/code-memory suites passed 149 tests with one skip, and two additional real writer checks passed for preserving other settings and switching local-managed hooks to remote. Upstream-aligned code-memory/Codex wrap/init tests passed 261 with one skip. These runs overlap and are not a unique total. Tests use temporary Codex directories.

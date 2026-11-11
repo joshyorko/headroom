@@ -233,9 +233,7 @@ def test_init_codex_merges_feature_flag_into_existing_table(monkeypatch, tmp_pat
     provider = tomllib.loads(user_config_path.read_text(encoding="utf-8"))
     assert provider["model_provider"] == "headroom"
     assert provider["model_providers"]["headroom"]["base_url"] == "http://headroom.example.test/v1"
-    hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    assert "SessionStart" not in hooks["hooks"]
-    assert "PreToolUse" not in hooks["hooks"]
+    assert not (tmp_path / ".codex" / "hooks.json").exists()
 
 
 def test_init_codex_local_proxy_keeps_runtime_ensure_hook(
@@ -280,10 +278,7 @@ def test_init_codex_remote_proxy_does_not_install_retired_rtk_hook(
     )
 
     hooks_path = tmp_path / ".codex" / "hooks.json"
-    first = hooks_path.read_text(encoding="utf-8")
-    hooks = json.loads(first)
-    assert "SessionStart" not in hooks["hooks"]
-    assert "PreToolUse" not in hooks["hooks"]
+    assert not hooks_path.exists()
 
     init_cli._init_codex(
         global_scope=False,
@@ -291,7 +286,45 @@ def test_init_codex_remote_proxy_does_not_install_retired_rtk_hook(
         port=9000,
         proxy_url="http://10.10.10.89",
     )
-    assert hooks_path.read_text(encoding="utf-8") == first
+    assert not hooks_path.exists()
+
+
+@pytest.mark.parametrize("existing", [None, {}, {"hooks": {}}])
+def test_remote_codex_does_not_leave_an_empty_hooks_file(monkeypatch, tmp_path, existing):
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setattr(init_cli, "codex_config_path", lambda: tmp_path / "config.toml")
+    path = tmp_path / ".codex" / "hooks.json"
+    if existing is not None:
+        path.parent.mkdir()
+        path.write_text(json.dumps(existing), encoding="utf-8", newline="\n")
+
+    init_cli._ensure_codex_hooks(path, "init-user", "http://headroom.example.test")
+
+    assert not path.exists()
+
+
+def test_remote_codex_preserves_other_settings_without_hooks(monkeypatch, tmp_path):
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setattr(init_cli, "codex_config_path", lambda: tmp_path / "config.toml")
+    path = tmp_path / "hooks.json"
+    payload = {"notify": True, "hooks": {}}
+    path.write_text(json.dumps(payload), encoding="utf-8", newline="\n")
+
+    init_cli._ensure_codex_hooks(path, "init-user", "http://headroom.example.test")
+
+    assert json.loads(path.read_text(encoding="utf-8")) == payload
+
+
+def test_switching_codex_to_remote_removes_only_empty_managed_hooks(monkeypatch, tmp_path):
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setattr(init_cli, "codex_config_path", lambda: tmp_path / "config.toml")
+    path = tmp_path / "hooks.json"
+    init_cli._ensure_codex_hooks(path, "init-user", "http://127.0.0.1:8787")
+    assert json.loads(path.read_text(encoding="utf-8"))["hooks"]["SessionStart"]
+
+    init_cli._ensure_codex_hooks(path, "init-user", "http://headroom.example.test")
+
+    assert not path.exists()
 
 
 def test_remote_codex_removes_retired_rtk_hook_and_preserves_unrelated_hooks(
@@ -398,7 +431,7 @@ def test_init_codex_full_setup_skips_code_intelligence_by_default(
     )
     assert "tokensave" not in project_config["mcp_servers"]
     assert "serena" not in project_config["mcp_servers"]
-    assert (tmp_path / ".codex" / "hooks.json").exists()
+    assert not (tmp_path / ".codex" / "hooks.json").exists()
 
 
 def test_init_codex_full_setup_registers_serena_when_explicit(

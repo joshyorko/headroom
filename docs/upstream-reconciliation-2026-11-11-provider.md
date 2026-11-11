@@ -6,7 +6,7 @@ Baseline: `e634a371`; downstream comparison root: `17d38e56`; imported upstream:
 
 ## Result
 
-One behavioral regression was found beyond textual conflict resolution: upstream changed the shared code-memory default from Serena to none. Restored baseline default, explicit opt-out precedence, and `--no-tokensave` no-op behavior. The two baseline-default assertions failed before restoration and passed afterward. Tokensave was already retired in `e634a371`; `HEADROOM_CODE_MEMORY=tokensave` still selects Serena, and no working baseline tokensave engine was removed.
+Upstream deliberately changed the shared code-memory default from Serena to none. The initial preservation pass restored the old default, but Josh subsequently clarified upstream parity: the final candidate keeps upstream's opt-in default while retaining Serena support, explicit selectors, migration cleanup and the retired TokenSave alias. This supersedes the initial default-restoration receipts below.
 
 No additional downstream behavior loss was identified in the scoped source audit. This is not full installed/runtime acceptance: native extension, plugin Node suites, real provider transports, browser/device clients and container E2E remain separate gates.
 

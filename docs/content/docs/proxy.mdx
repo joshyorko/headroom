@@ -38,6 +38,27 @@ The install id is a random UUID generated on first run and stored in your config
 
 Disable it with `HEADROOM_BEACON=off`, `HEADROOM_TELEMETRY=off` (or `--no-telemetry`), the `DO_NOT_TRACK=1` convention, or `HEADROOM_OFFLINE=1` (which also disables update checks and license reporting). `HEADROOM_BEACON=on` keeps the beacon on even with local stats off. `headroom telemetry` names the setting that turned it off.
 
+## T3 Code hub usage reporting
+
+This self-hosted build supports T3 Code's existing hub usage reader. In T3's
+hub settings, enter the Headroom **base URL**, such as `http://10.10.10.89`,
+and use `HEADROOM_PROXY_TOKEN` as the management key/password. Do not append
+`/v1` or a management endpoint. An existing hub can be refreshed after the
+updated Headroom image is deployed; no T3 build update is needed.
+
+Headroom implements `GET /v0/management/auth-files` and
+`POST /v0/management/api-call` for reporting cached Claude and Codex quota
+windows. The records represent Headroom's provider trackers, not an inventory
+of separate signed-in accounts. Polling and credential acquisition continue
+to follow Headroom's existing subscription-tracking policy; adding a hub does
+not sign in to a provider or start polling with the management key.
+
+Missing or expired quota is reported as unavailable until the tracker receives
+usable data. Copilot is not listed because T3's current hub reader has no
+Copilot provider. Reset-credit actions and other management operations are
+unsupported. Reporting requests never forward their supplied URL or headers
+to another server, and use the same operator-read access checks as `/quota`.
+
 ## CLI options
 
 ### Core

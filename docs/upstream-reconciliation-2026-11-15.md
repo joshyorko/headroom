@@ -40,3 +40,27 @@ the remaining management namespace is refused locally.
 After publishing and redeploying, use the Headroom base URL in T3's hub form and
 the existing proxy token as its management key. No T3 build update is required.
 Providers without a T3 hub reader are not relabeled as another provider.
+
+## Reporting validation
+
+- The new tests first reproduced the missing management route, then passed.
+- Final hub/auth/loopback batch: 213 passed, including 32 new reporting tests.
+- Final hub/prefix-cache batch after a type-only variable rename: 144 passed.
+- Broader upstream/fork batch: 575 passed and four skipped initially; three
+  failures were missing newly required development packages. After installing
+  the declared `cryptography` and SOCKS dependencies in the existing project
+  environment, all five selected TLS/proxy cases passed. No production code
+  change was needed for those failures.
+- Ruff and targeted mypy passed. Two upstream typing incompatibilities were
+  corrected without changing runtime behavior: annotate the HTTPX raw host
+  as bytes, and avoid reusing a tuple variable for its mutable intermediate.
+- A Luna contract check executed the installed T3 bundle's actual account,
+  Claude usage, Codex usage and response-envelope decoders against synthetic
+  responses from the new HTTP routes. All accepted the responses. This did
+  not execute T3's full provider effect or render the T3 UI.
+- Independent Luna reviews found no actionable issue in the reviewed merge
+  controls and reporting adapter/routes.
+
+These checks use the existing native extension; hosted image publication must
+build and smoke-test the new native code before redeployment. Live provider
+polling and T3 UI acceptance remain post-deployment gates.

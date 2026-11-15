@@ -6261,6 +6261,56 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """Unified quota/rate-limit stats for all registered providers (Anthropic, Codex, Copilot)."""
         return JSONResponse(content=get_quota_registry().get_all_stats())
 
+    @app.get("/v0/management/auth-files", dependencies=_dashboard_gate)
+    async def hub_auth_files():
+        """Credential-free provider records for T3's hub usage reader."""
+        from headroom.proxy.hub_reporting import list_auth_files
+
+        return JSONResponse(
+            content=list_auth_files(get_quota_registry()), headers={"Cache-Control": "no-store"}
+        )
+
+    @app.post("/v0/management/api-call", dependencies=_dashboard_gate)
+    async def hub_api_call(request: Request):
+        """Translate cached usage only; supplied URLs and credentials are never relayed."""
+        from headroom.proxy.hub_reporting import report_api_call
+
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeError):
+            body = None
+        if not isinstance(body, dict) or any(
+            not isinstance(body.get(key), str) or len(body[key]) > limit
+            for key, limit in (("auth_index", 200), ("method", 16), ("url", 2048))
+        ):
+            return JSONResponse(status_code=400, content={"error": "invalid usage request"})
+        return JSONResponse(
+            content=report_api_call(
+                get_quota_registry(),
+                auth_index=body["auth_index"],
+                method=body["method"],
+                url=body["url"],
+            ),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.api_route(
+        "/v0/management",
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        dependencies=_dashboard_gate,
+        include_in_schema=False,
+    )
+    @app.api_route(
+        "/v0/management/{management_path:path}",
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        dependencies=_dashboard_gate,
+        include_in_schema=False,
+    )
+    async def unsupported_hub_management():
+        # Reserve this namespace before the provider catch-all: management
+        # mutations must never fall through to an upstream provider.
+        raise HTTPException(status_code=404)
+
     @app.get("/metrics", dependencies=[Depends(_require_metrics_scrape_client)])
     async def metrics():
         """Prometheus metrics endpoint (loopback, trusted CIDR, or token-authenticated)."""

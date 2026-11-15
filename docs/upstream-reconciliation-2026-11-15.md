@@ -79,3 +79,21 @@ fixture must use the fork's scoped provider route; and the retired Release
 Please workflow must remain absent. These test-only corrections retain the
 existing production behavior. The affected CLI/shell suite passed 139 tests,
 and the release-normalization script suite passed 17 tests locally.
+
+## Operator quota collection follow-up
+
+The deployed reporting adapter exposed a missing collection path: a remote
+Codex session did not qualify as the local operator, so no usage snapshot was
+available after restart. The opt-in `HEADROOM_CODEX_QUOTA_OPERATOR` fingerprint
+now selects one issuer/user/workspace without copying a refresh token to the
+server. Provider authorization must succeed before its access token is retained
+in memory. Other identities, expired tokens and rejected credentials cannot
+replace the operator snapshot. The default local-only policy remains unchanged.
+
+Both HTTP and WebSocket operator sessions can collect quota. Hub reads can
+refresh it through the fixed provider usage endpoint, subject to the existing
+one-minute floor and ten-second request timeout. The candidate's actual HTTP
+hub route returned a usable primary window from a real OpenAI usage response;
+inference was stubbed and no inference request was sent. This is candidate
+API/provider proof, not deployed T3 UI acceptance. The configured operator must
+send a Codex turn after redeployment to supply the current access token.

@@ -6550,6 +6550,13 @@ class OpenAIHandlerMixin:
             request_id=request_id,
         )
         headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
+        if is_chatgpt_auth:
+            from headroom.subscription.credential_policy import is_configured_codex_operator
+
+            if is_configured_codex_operator(headers):
+                from headroom.subscription.codex_rate_limits import maybe_schedule_usage_poll
+
+                maybe_schedule_usage_poll(headers)
         # Apply the ChatGPT backend workaround before reading input, using the
         # same resolved headers that select the upstream endpoint below.
         if (

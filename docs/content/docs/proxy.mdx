@@ -53,6 +53,26 @@ of separate signed-in accounts. Polling and credential acquisition continue
 to follow Headroom's existing subscription-tracking policy; adding a hub does
 not sign in to a provider or start polling with the management key.
 
+For a self-hosted proxy serving your remote Codex sessions, opt in to quota
+collection for your own account. On the workstation where Codex is signed in,
+run `python -m headroom.subscription.credential_policy` using your Headroom
+environment. Put the printed fingerprint in `HEADROOM_CODEX_QUOTA_OPERATOR` in
+`.env.kamal.local`, then redeploy. The fingerprint selects the token issuer,
+user, and workspace, so it survives ordinary access-token rotation. It is not
+an access token or refresh token.
+
+After redeployment, send one Codex turn through Headroom to establish the
+operator session. Matching HTTP and WebSocket sessions can refresh the quota;
+T3 hub reads can then request a bounded refresh at most once per minute.
+OpenAI validates the bearer on the fixed usage endpoint before Headroom stores
+its response. Forwarded access tokens are held only in process memory. No
+refresh token is copied to the server. After a restart or an expired token,
+a new matching Codex session supplies the current token.
+
+Without this opt-in, remote callers remain unable to drive background usage
+polling. Other users and workspaces cannot replace the pinned operator's
+snapshot. Claude still requires its existing operator credential setup.
+
 Missing or expired quota is reported as unavailable until the tracker receives
 usable data. Copilot is not listed because T3's current hub reader has no
 Copilot provider. Reset-credit actions and other management operations are

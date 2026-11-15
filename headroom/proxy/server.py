@@ -6272,7 +6272,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.post("/v0/management/api-call", dependencies=_dashboard_gate)
     async def hub_api_call(request: Request):
-        """Translate cached usage only; supplied URLs and credentials are never relayed."""
+        """Refresh pinned operator quota; supplied URLs and credentials are never relayed."""
         from headroom.proxy.hub_reporting import report_api_call
 
         try:
@@ -6284,6 +6284,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             for key, limit in (("auth_index", 200), ("method", 16), ("url", 2048))
         ):
             return JSONResponse(status_code=400, content={"error": "invalid usage request"})
+        if (
+            body["auth_index"] == "headroom-codex"
+            and body["method"].upper() == "GET"
+            and body["url"] == "https://chatgpt.com/backend-api/wham/usage"
+        ):
+            from headroom.subscription.codex_rate_limits import refresh_operator_usage
+
+            await refresh_operator_usage()
         return JSONResponse(
             content=report_api_call(
                 get_quota_registry(),

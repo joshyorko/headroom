@@ -12,7 +12,15 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from headroom.proxy.helpers import _reset_session_tool_tracker_for_test
 from headroom.proxy.server import ProxyConfig, create_app
+
+
+@pytest.fixture(autouse=True)
+def fresh_memory_tool_tracker():
+    _reset_session_tool_tracker_for_test()
+    yield
+    _reset_session_tool_tracker_for_test()
 
 
 class _FakeTrafficLearner:
@@ -76,7 +84,7 @@ class _FakeTrafficLearner:
 
 class _FakeMemoryHandler:
     def __init__(self) -> None:
-        self.config = SimpleNamespace(inject_context=False, inject_tools=False)
+        self.config = SimpleNamespace(inject_context=False, inject_tools=True)
         self.initialized = True
         self.backend = object()
         self._backend = object()
@@ -84,6 +92,21 @@ class _FakeMemoryHandler:
 
     async def _ensure_initialized(self) -> None:
         return None
+
+    def compute_memory_tool_definitions(self, provider: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_save",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                        "required": ["content"],
+                    },
+                },
+            }
+        ]
 
     def has_memory_tool_calls(self, response: dict[str, Any], provider: str) -> bool:
         return any(
@@ -154,6 +177,7 @@ def test_openai_responses_feeds_traffic_learner() -> None:
             initialized=True,
             backend=backend,
             config=SimpleNamespace(inject_context=False, inject_tools=False),
+            is_project_unresolved=lambda request_context: False,
             has_memory_tool_calls=lambda response, provider: False,
         )
         learner = _FakeTrafficLearner()
@@ -352,10 +376,19 @@ def test_openai_responses_memory_save_keeps_request_context() -> None:
             json={
                 "model": "gpt-5.4",
                 "input": "Save this preference.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "read_file",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
             },
         )
 
     assert response.status_code == 200
+    assert len(calls) == 2
+    assert {tool["name"] for tool in calls[0]["tools"]} == {"read_file", "memory_save"}
     assert memory_handler.executed_request_context is not None
     assert memory_handler.executed_request_context.base_user_id == "u1"
     assert (

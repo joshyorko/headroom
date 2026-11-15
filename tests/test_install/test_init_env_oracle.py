@@ -18,7 +18,9 @@ pytestmark = pytest.mark.skipif(
 
 EXPECTED = {
     "COPILOT_PROVIDER_TYPE": "openai",
-    "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:9005/v1",
+    "COPILOT_PROVIDER_BASE_URL": (
+        "http://127.0.0.1:9005/c/copilot/_copilot/aHR0cHM6Ly9hcGkuZ2l0aHViY29waWxvdC5jb20/v1"
+    ),
     "COPILOT_PROVIDER_WIRE_API": "completions",
 }
 

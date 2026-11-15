@@ -73,13 +73,9 @@ def test_api_write_uses_json_stdin_without_windows_text_file_roundtrip(monkeypat
     assert module.json.loads(kwargs["input"])["body"] == BODY
 
 
-def test_workflow_repairs_before_release_detection():
+def test_self_hosted_keeps_release_please_automation_disabled():
     workflow = SCRIPT.parents[1] / ".github" / "workflows" / "release-please.yml"
-    source = workflow.read_text(encoding="utf-8")
-    assert source.index("python scripts/normalize_release_pr_bodies.py") < source.index(
-        "uses: googleapis/release-please-action"
-    )
-    assert '--repo "${{ github.repository }}" --apply' in source
+    assert not workflow.exists()
 
 
 def test_repairs_only_merged_pending_release_prs(monkeypatch):

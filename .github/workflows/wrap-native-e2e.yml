@@ -2,7 +2,7 @@ name: Wrap Native E2E
 
 # Cross-platform smoke tests for the hidden ``headroom wrap ... --prepare-only``
 # flows. These reuse the existing pytest bridge cases so we exercise the real
-# CLI on linux / macos without depending on agent binaries or long-lived proxy
+# CLI on Linux without depending on agent binaries or long-lived proxy
 # processes. Windows will be added once the upstream CRT conflict is resolved
 # (see matrix comment below).
 #
@@ -40,7 +40,7 @@ jobs:
         # CRT conflict is resolved. Re-add `windows-latest` once the wheel
         # builds cleanly there. Match init-native-e2e.yml so this workflow
         # doesn't fail during setup before the wrap smoke tests run.
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

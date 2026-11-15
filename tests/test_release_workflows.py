@@ -541,7 +541,7 @@ def test_create_release_requires_successful_build_and_pypi_publish() -> None:
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
     # Single-wheel maturin refactor (PR #360) added `build-wheels` (the
-    # cross-platform matrix that produces the linux/macos/aarch64 wheels)
+    # cross-platform matrix that produces the Linux amd64/arm64 wheels)
     # and `collect-dist` (aggregator that merges wheel artifacts + npm
     # release-assets) between `build` and the publish jobs. create-release
     # must wait for all of them.
@@ -560,12 +560,6 @@ def test_create_release_requires_successful_build_and_pypi_publish() -> None:
     assert "needs.collect-dist.result == 'success'" in content
     assert "needs.smoke-import-wheels.result == 'success'" in content
     assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
-
-
-def test_macos_native_wrapper_dependency_install_retries_pypi_downloads() -> None:
-    content = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-
-    assert "python -m pip install --retries 10 --timeout 60 pytest" in content
 
 
 def test_ci_commitlint_runs_only_for_pull_requests() -> None:
@@ -799,65 +793,34 @@ def test_release_yml_does_not_install_openssl_or_perl_for_wheels() -> None:
         )
 
 
-def test_build_wheels_matrix_includes_intel_macos_with_dynamic_ort() -> None:
-    """Intel macOS wheels use `ort-load-dynamic` because `ort-sys 2.0.0-rc.12`
-    has no prebuilt ONNX Runtime binaries for `x86_64-apple-darwin`.
-
-    We assert against the actual matrix entry shape (`target: <triple>`
-    on a non-comment line) so explanatory comments mentioning other
-    triples don't false-positive.
-    """
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-
-    bw_start = content.index("\n  build-wheels:")
-    bw_end = content.index("\n  collect-dist:")
-    body = content[bw_start:bw_end]
-
-    matrix_targets: list[str] = []
-    for raw in body.splitlines():
-        stripped = raw.lstrip()
-        # Skip YAML comments — only look at real matrix-entry lines.
-        if stripped.startswith("#"):
-            continue
-        if stripped.startswith("target:"):
-            # `target: x86_64-apple-darwin` → `x86_64-apple-darwin`
-            matrix_targets.append(stripped.split(":", 1)[1].strip())
-
-    assert "aarch64-apple-darwin" in matrix_targets, "Apple Silicon must stay in the matrix"
-    assert "x86_64-unknown-linux-gnu" in matrix_targets
-    assert "aarch64-unknown-linux-gnu" in matrix_targets
-    assert "x86_64-apple-darwin" in matrix_targets, (
-        f"x86_64-apple-darwin must be a wheel-matrix target; got {matrix_targets}"
+def test_release_and_rust_workflows_keep_linux_and_windows_without_macos() -> None:
+    """Self-hosted fork CI retains Linux/Windows coverage without macOS runners."""
+    for path in (ROOT / ".github" / "workflows").glob("*.yml"):
+        executable = "\n".join(
+            line
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "macos-" not in executable.lower(), f"macOS runner restored in {path.name}"
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    rust = (ROOT / ".github" / "workflows" / "rust.yml").read_text(encoding="utf-8")
+    non_comment_lines = "\n".join(
+        line
+        for text in (release, rust)
+        for line in text.splitlines()
+        if not line.lstrip().startswith("#")
     )
 
-    matrix_os: list[str] = []
-    for raw in body.splitlines():
-        stripped = raw.lstrip()
-        if stripped.startswith("#"):
-            continue
-        if stripped.startswith("os:"):
-            matrix_os.append(stripped.split(":", 1)[1].strip())
-        elif stripped.startswith("- os:"):
-            matrix_os.append(stripped.split(":", 1)[1].strip())
-    assert "macos-15-intel" in matrix_os
-
-
-def test_smoke_import_macos_selects_wheel_arch_from_target() -> None:
-    """The macOS smoke-import step must pick the wheel tag from the matrix
-    target (arm64 for Apple Silicon, x86_64 for Intel) instead of
-    hardcoding `_arm64` for every macOS row."""
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-
-    step_start = content.index("- name: Smoke-import wheel on macOS host")
-    step_end = content.index("- name: Smoke-import wheel on Windows host", step_start)
-    macos_block = content[step_start:step_end]
-
-    assert "WHEEL_TARGET: ${{ matrix.wheel_target }}" in macos_block
-    assert "aarch64-apple-darwin) mac_arch=arm64" in macos_block
-    assert "x86_64-apple-darwin) mac_arch=x86_64" in macos_block
-    assert "macosx_*_${mac_arch}.whl" in macos_block
-    assert "headroom_ai-*-${py_tag}-${py_tag}-macosx_*_arm64.whl" not in macos_block
-    assert "headroom_ai-*-abi3-macosx_*_arm64.whl" not in macos_block
+    assert "macos-" not in non_comment_lines
+    assert "macos-latest" not in non_comment_lines
+    assert "apple-darwin" not in non_comment_lines
+    assert "Smoke-import wheel on macOS host" not in non_comment_lines
+    assert "Smoke-import wheel on Windows host" in non_comment_lines
+    assert "windows-latest" in non_comment_lines
+    assert "x86_64-unknown-linux-gnu" in non_comment_lines
+    assert "aarch64-unknown-linux-gnu" in non_comment_lines
+    assert "ubuntu-24.04-arm" in non_comment_lines
+    assert "os: [ubuntu-latest, windows-latest]" in non_comment_lines
 
 
 def test_aarch64_wheel_uses_native_arm64_runner() -> None:
@@ -1397,7 +1360,7 @@ def test_release_workflow_has_smoke_import_wheel_gate() -> None:
       is a lie.
     - At least one customer-representative glibc per arch (Ubuntu
       LTS, the issue #355 reporter's environment).
-    - macOS native (Apple Silicon).
+    - Linux manylinux floor and customer environments for both architectures.
 
     Required gating: `publish-pypi`, `publish-docker`, AND
     `create-release` must all `needs:` smoke-import-wheels. A
@@ -1429,14 +1392,12 @@ def test_release_workflow_has_smoke_import_wheel_gate() -> None:
         # At least one Ubuntu LTS — issue #355's environment was
         # ubuntu:22.04 + Python 3.12.
         'image: "ubuntu:22.04"',
-        # macOS native (no container) — Apple Silicon wheel.
-        "runner: macos-26",
     ]
     for sub in required_matrix_substrings:
         assert sub in content, (
             f"smoke matrix missing required entry: {sub!r}. The matrix "
             f"must cover the manylinux floor + at least one customer-"
-            f"representative environment per arch + macOS native."
+            f"representative environment per arch."
         )
 
     # Gating: publish-pypi must wait for the smoke job.

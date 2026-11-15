@@ -2221,7 +2221,8 @@ def test_init_and_wrap_prepare_only_are_idempotent_full_setup(
     assert parsed["mcp_servers"]["headroom"]["env"]["HEADROOM_PROXY_URL"] == "http://10.10.10.89"
     assert "tokensave" not in parsed["mcp_servers"]
     assert "serena" in parsed["mcp_servers"]
-    assert (project_dir / ".codex" / "hooks.json").exists()
+    # Remote setup must not leave an empty hooks file that Codex rejects.
+    assert not (project_dir / ".codex" / "hooks.json").exists()
 
 
 def test_unwrap_codex_restores_prior_config_end_to_end(

@@ -36,7 +36,7 @@ jobs:
         # CRT conflict is resolved. Re-add `windows-latest` once the wheel
         # builds cleanly there. Match init-native-e2e.yml so this workflow
         # doesn't fail during setup before the install smoke tests run.
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

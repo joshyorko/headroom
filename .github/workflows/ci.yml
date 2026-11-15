@@ -68,8 +68,8 @@ jobs:
               - '.github/workflows/**'
               - '.github/actions/**'
             # native = anything that can change the compiled wrapper, the native
-            # install flow, or the docker image (drives the scarce macOS/Windows
-            # runners + docker E2E). A pure-Python logic change hits none of these.
+            # install flow, or the docker image (drives the Windows runner +
+            # docker E2E). A pure-Python logic change hits none of these.
             native:
               - 'headroom/cli/**'
               - 'headroom/install/**'
@@ -275,7 +275,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -289,19 +289,6 @@ jobs:
         with:
           name: headroom-wheel
           path: dist
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        if: runner.os == 'macOS'
-        with:
-          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        if: runner.os == 'macOS'
-        with:
-          workspaces: ". -> target"
-      - name: Build macOS wheel
-        if: runner.os == 'macOS'
-        run: |
-          python -m pip install --upgrade pip maturin
-          maturin build --profile ci --out dist --interpreter python3.14
       - name: Install headroom-ai[lean] from prebuilt wheels only
         run: |
           python -m pip install --upgrade pip
@@ -471,40 +458,6 @@ jobs:
           # whose tests pass — so this stays non-blocking.
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
-
-  # Keep a small but real pytest lane on Darwin. The full four-shard suite is
-  # intentionally Linux-only for cost, but platform-gated CLI/proxy code must
-  # execute somewhere on macOS; otherwise Darwin regressions can merge green
-  # while being unreachable in every pytest job (#3065).
-  test-macos:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: ${{ env.PY_VERSION }}
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
-          components: rustfmt, clippy
-      - name: Verify native build toolchain
-        run: |
-          cargo --version
-          rustc --version
-      - name: Install package and focused test dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e '.[proxy]' pytest pytest-asyncio numpy
-      - name: Run macOS CLI and install tests
-        run: |
-          pytest \
-            tests/test_cli \
-            tests/test_cli_*.py \
-            tests/test_install \
-            --tb=short -q
 
   test-extras:
     needs: [changes, build-wheel]
@@ -867,24 +820,3 @@ jobs:
         shell: bash
         run: |
           pytest tests/test_cache_breakpoint_diagnostics.py tests/test_private_state_files.py -v
-
-  macos-native-wrapper:
-    needs: changes
-    if: needs.changes.outputs.native == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.11"
-      - name: Install bash and test dependencies
-        run: |
-          brew install bash
-          python -m pip install --upgrade pip
-          python -m pip install --retries 10 --timeout 60 pytest 'opentelemetry-api>=1.24.0'
-      - name: Run native installer wrapper tests
-        run: |
-          BASH_PREFIX="$(brew --prefix bash)"
-          export PATH="$BASH_PREFIX/bin:$PATH"
-          pytest tests/test_install/test_native_installers.py -q

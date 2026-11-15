@@ -64,3 +64,18 @@ Providers without a T3 hub reader are not relabeled as another provider.
 These checks use the existing native extension; hosted image publication must
 build and smoke-test the new native code before redeployment. Live provider
 polling and T3 UI acceptance remain post-deployment gates.
+
+## Self-hosted CI scope
+
+Josh explicitly requested removing macOS from this fork after the first hosted
+run. macOS runners, wheel targets and dedicated steps are removed from the
+CI, Rust, release and native E2E workflows. Existing Linux and Windows checks
+remain; runtime platform-specific source code is not removed. The workflow
+contract test prevents macOS runners from being restored by a later merge.
+
+The initial hosted run exposed stale test expectations, also reproduced on
+Linux: remote Codex setup must not write empty hook files; Copilot's real-shell
+fixture must use the fork's scoped provider route; and the retired Release
+Please workflow must remain absent. These test-only corrections retain the
+existing production behavior. The affected CLI/shell suite passed 139 tests,
+and the release-normalization script suite passed 17 tests locally.

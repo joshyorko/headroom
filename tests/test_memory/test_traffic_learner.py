@@ -790,6 +790,7 @@ class TestLoadPersistedPatterns:
         conn.execute(
             "CREATE TABLE memories ("
             "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+            "user_id TEXT NOT NULL DEFAULT 'default', "
             "metadata TEXT NOT NULL DEFAULT '{}', "
             "entity_refs TEXT NOT NULL DEFAULT '[]', "
             "importance REAL NOT NULL DEFAULT 0.5, "
@@ -835,7 +836,7 @@ class TestLoadPersistedPatterns:
                 },
             ],
         )
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         assert patterns[0].evidence_count == 5
         assert patterns[0].category == PatternCategory.ERROR_RECOVERY
@@ -857,7 +858,7 @@ class TestLoadPersistedPatterns:
                 },
             ],
         )
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         assert patterns[0].content == "From traffic"
 
@@ -875,7 +876,7 @@ class TestLoadPersistedPatterns:
                 },
             ],
         )
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         assert patterns[0].importance == 0.85
 
@@ -889,7 +890,7 @@ class TestLoadPersistedPatterns:
                 },
             ],
         )
-        assert _load_persisted_patterns_from_sqlite(db) == []
+        assert _load_persisted_patterns_from_sqlite(db, "default") == []
 
 
 # =============================================================================
@@ -1588,6 +1589,74 @@ class TestSaveRecovery:
         assert rows[0][2]["evidence_count"] == 6
 
 
+class TestUserScopedPersistence:
+    """Learners sharing one memory.db only read their own user's rows."""
+
+    @pytest.mark.asyncio
+    async def test_hydration_ignores_other_users_rows(self, tmp_path, monkeypatch):
+        import json
+        import sqlite3
+
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        (tmp_path / "home").mkdir()
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+        content = "Use uv for Python packages."
+        await backend.save_memory(
+            content=content,
+            user_id="alice",
+            importance=0.7,
+            metadata={
+                "source": "traffic_learner",
+                "category": "preference",
+                "evidence_count": 3,
+                "last_seen_at": "2026-02-01T00:00:00+00:00",
+            },
+        )
+        learner = TrafficLearner(backend=backend, user_id="bob", min_evidence=3, dedup_window=1)
+        await learner.start()
+        try:
+            for _ in range(3):
+                await learner._accumulate(
+                    ExtractedPattern(
+                        category=PatternCategory.PREFERENCE, content=content, importance=0.7
+                    )
+                )
+            await _wait_for_saved(learner, 2, db)
+        finally:
+            await learner.stop()
+
+        with sqlite3.connect(db) as conn:
+            rows = conn.execute("SELECT user_id, metadata FROM memories").fetchall()
+        evidence = {user_id: json.loads(meta)["evidence_count"] for user_id, meta in rows}
+        assert evidence == {"alice": 3, "bob": 3}
+
+    @pytest.mark.asyncio
+    async def test_collected_patterns_exclude_other_users(self, tmp_path):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+        for user_id, content in (
+            ("alice", "Alice-only deployment procedure."),
+            ("bob", "Bob's package workflow."),
+        ):
+            await backend.save_memory(
+                content=content,
+                user_id=user_id,
+                importance=0.7,
+                metadata={
+                    "source": "traffic_learner",
+                    "category": "preference",
+                    "evidence_count": 5,
+                },
+            )
+
+        learner = TrafficLearner(backend=backend, user_id="bob")
+        contents = [p.content for p in learner._collect_all_patterns()]
+        assert contents == ["Bob's package workflow."]
+
+
 class TestEvidencePersistence:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("min_evidence", [1, 2, 5])
@@ -2121,7 +2190,7 @@ class TestCollectAllPatterns:
             },
         )
 
-        learner = TrafficLearner(backend=backend, min_evidence=1)
+        learner = TrafficLearner(backend=backend, user_id="t", min_evidence=1)
         # Same content in accumulator with count=2; hash matches.
         p = ExtractedPattern(
             category=PatternCategory.ENVIRONMENT,
@@ -2694,6 +2763,7 @@ class TestLoadPersistedPatternsTimestamps:
         conn.execute(
             "CREATE TABLE memories ("
             "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+            "user_id TEXT NOT NULL DEFAULT 'default', "
             "metadata TEXT NOT NULL DEFAULT '{}', "
             "entity_refs TEXT NOT NULL DEFAULT '[]', "
             "importance REAL NOT NULL DEFAULT 0.5, "
@@ -2733,7 +2803,7 @@ class TestLoadPersistedPatternsTimestamps:
                 }
             ],
         )
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         p = patterns[0]
         assert p.first_seen_at is not None
@@ -2757,7 +2827,7 @@ class TestLoadPersistedPatternsTimestamps:
                 }
             ],
         )
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         assert patterns[0].first_seen_at is not None
         assert patterns[0].first_seen_at.month == 3
@@ -2793,7 +2863,7 @@ class TestLoadPersistedPatternsTimestamps:
                 },
             ],
         )
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         p = patterns[0]
         assert p.evidence_count == 5
@@ -2812,6 +2882,7 @@ class TestLoadPersistedPatternsTimestamps:
         conn.execute(
             "CREATE TABLE memories ("
             "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+            "user_id TEXT NOT NULL DEFAULT 'default', "
             "metadata TEXT NOT NULL DEFAULT '{}', "
             "entity_refs TEXT NOT NULL DEFAULT '[]', "
             "importance TEXT, "
@@ -2834,7 +2905,7 @@ class TestLoadPersistedPatternsTimestamps:
         )
         conn.commit()
         conn.close()
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert len(patterns) == 1
         assert patterns[0].importance == 0.5
 
@@ -2847,6 +2918,7 @@ class TestLoadPersistedPatternsTimestamps:
         conn.execute(
             "CREATE TABLE memories ("
             "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+            "user_id TEXT NOT NULL DEFAULT 'default', "
             "metadata TEXT NOT NULL DEFAULT '{}', "
             "entity_refs TEXT NOT NULL DEFAULT '[]', "
             "importance REAL NOT NULL DEFAULT 0.5, "
@@ -2854,13 +2926,14 @@ class TestLoadPersistedPatternsTimestamps:
         )
         # Invalid JSON in metadata
         conn.execute(
-            "INSERT INTO memories VALUES (?,?,?,?,?,?)",
+            "INSERT INTO memories (id, content, metadata, entity_refs, importance, created_at) "
+            "VALUES (?,?,?,?,?,?)",
             ("0", "bullet", "{not json", "[]", 0.5, None),
         )
         conn.commit()
         conn.close()
         # Should not raise — the row is simply skipped (no recognizable category).
-        patterns = _load_persisted_patterns_from_sqlite(db)
+        patterns = _load_persisted_patterns_from_sqlite(db, "default")
         assert patterns == []
 
 

@@ -129,6 +129,7 @@ def test_claude_report_uses_real_subscription_snapshot_without_token_prefix(hub,
 
 def test_real_startup_registers_trackers_for_the_hub(monkeypatch):
     monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.setattr("headroom.subscription.tracker._tracker_instance", None)
     app = server.create_app(
         ProxyConfig(
             proxy_token=TOKEN,

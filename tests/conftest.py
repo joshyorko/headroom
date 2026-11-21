@@ -90,6 +90,16 @@ def gemini_request():
 
 
 @pytest.fixture(autouse=True)
+def _restore_process_stateless():
+    """A stateless test proxy must not disable later tests' persistence."""
+    from headroom import paths
+
+    previous = paths._PROCESS_STATELESS
+    yield
+    paths.set_process_stateless(previous)
+
+
+@pytest.fixture(autouse=True)
 def _undo_process_trust_injection():
     """Undo ``truststore.inject_into_ssl()`` after any test that triggered it.
 

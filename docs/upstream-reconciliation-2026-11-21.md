@@ -38,5 +38,36 @@ the new compaction encoding. Do not treat that stale extension as native proof.
 The preservation batch initially passed 389 tests and failed the Copilot fixture
 above, which subsequently passed after its fixture repair.
 
-Fresh native build, final affected-suite results, hosted CI, image publication and
-deployment acceptance are pending. This document does not authorize deployment.
+The fresh native wheel built successfully in the repository's Dagger environment
+(Linux, Python 3.11, Rust 1.95.0). Its SHA256 is
+`6ca51bd3ce05aa93728cdfad6d09f00dac119506ea60ed2241c1c8d9c2c5f104`.
+Using that extension, all eight stale-native failures disappeared: the complete
+codec/router selection passed 219 tests with one skip. A clean install with all
+advertised runtime extras imported native SmartCrusher and ran the CLI successfully.
+
+The combined 2,373-case run then exposed ten order-dependent failures: a hub test
+left the process-wide stateless flag enabled, disabling persistence in the new
+restart/hash tests. Running a single hub test before those ten cases reproduced
+all failures. The shared test fixture now restores the flag after each test;
+all 74 hub/operator/restart cases passed together. No runtime flag semantics change.
+The combined suite is being rerun with that test-isolation repair.
+
+## Real behavior commands
+
+From the worktree, using the existing Python 3.12 project interpreter as `python`:
+
+```bash
+dagger --progress plain call build-wheel export --path /tmp/headroom-wheel
+dagger --progress plain call smoke-wheel --extras proxy,code,memory-stack,bedrock
+HEADROOM_OFFLINE=1 PYTHONPATH="$PWD" python -m pytest -q tests/test_transforms/test_compaction_codec.py tests/test_transforms/test_content_router.py tests/test_transforms_content_router.py
+HEADROOM_OFFLINE=1 PYTHONPATH="$PWD" python -m pytest -q tests/test_hub_reporting_routes.py tests/test_codex_operator_quota.py tests/test_prefix_tracker_restart.py
+```
+
+The Python tests used the freshly built wheel's extension, rather than the
+pre-existing source-checkout extension. The example export directory is disposable;
+the task's actual export directory is removed at handoff.
+
+Hosted CI, image publication and deployment acceptance remain separate pending
+gates. No live provider inference or deployment was performed. Ruby/dotenv tests
+were skipped locally; both compatibility versions passed in the initial hosted run.
+This document does not authorize deployment.

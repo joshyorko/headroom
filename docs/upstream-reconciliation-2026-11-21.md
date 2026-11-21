@@ -15,6 +15,9 @@ upstream's destination-aware resolver, preserving Copilot's own upstream when
 cross-provider route advice is present. The OpenCode conflict retains upstream's
 extra-model support alongside the fork's configuration handling.
 
+Upstream's removal of obsolete RTK agent instructions is retained in `AGENTS.md`
+and `.github/copilot-instructions.md`; this removes no runtime capability.
+
 Two test fixtures required repair: the Copilot streaming request now uses a real
 HTTPX request with trace extensions, and the cache-only savings history test uses
 the documented fallback pricing path rather than an installed model-price table.

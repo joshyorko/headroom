@@ -50,7 +50,10 @@ left the process-wide stateless flag enabled, disabling persistence in the new
 restart/hash tests. Running a single hub test before those ten cases reproduced
 all failures. The shared test fixture now restores the flag after each test;
 all 74 hub/operator/restart cases passed together. No runtime flag semantics change.
-The combined suite is being rerun with that test-isolation repair.
+The final combined suite passed: **2,364 passed, nine skipped**, with the fresh
+native extension and test-isolation repair. This selection combines all changed
+upstream test modules with the focused fork preservation, deployment, reporting,
+quota, CLI, authentication, realtime and routing suites.
 
 ## Real behavior commands
 

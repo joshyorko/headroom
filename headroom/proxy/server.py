@@ -37,6 +37,7 @@ import logging
 import math
 import os
 import signal
+import ssl
 import sys
 import tempfile
 import threading
@@ -126,6 +127,7 @@ from headroom.providers.registry import (
 from headroom.proxy import runtime_env
 from headroom.proxy.audit import is_auditable_path, record_admin_action
 from headroom.proxy.auth_mode import CLIENT_UA_MAP, should_stamp_codex_client
+from headroom.proxy.auth_policy import client_version_from_user_agent
 from headroom.proxy.background_compression import BackgroundCompressor
 from headroom.proxy.budget_basis_policy import resolve_estimated_basis_policy
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
@@ -147,6 +149,7 @@ from headroom.proxy.helpers import (
     EAGER_PRELOAD_TIMEOUT_SECONDS,
     MAX_COMPRESSION_CACHE_SESSIONS,
     RETRYABLE_OVERLOAD_STATUSES,
+    RequestWriteTrace,
     _setup_file_logging,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
@@ -227,6 +230,7 @@ from headroom.subscription.tracker import (
 )
 from headroom.telemetry import get_telemetry_collector
 from headroom.telemetry.beacon import beacon_off_reason, is_beacon_enabled, is_telemetry_enabled
+from headroom.telemetry.session import record_client_version
 from headroom.telemetry.toin import get_toin
 from headroom.transforms import (
     CacheAligner,
@@ -2909,6 +2913,8 @@ class HeadroomProxy(
         )
 
         for attempt in range(self.config.retry_max_attempts):
+            request_trace = RequestWriteTrace()
+            post_kwargs["extensions"] = {"trace": request_trace}
             try:
                 if stream:
                     # For streaming, we return early - retry happens at higher level
@@ -2974,10 +2980,16 @@ class HeadroomProxy(
             # HTTP/2 `StreamReset`) that a poisoned shared h2 connection raises on
             # every in-flight request. Retrying drops the bad connection and
             # re-sends on a fresh one instead of collapsing to a 502. (#1639)
-            except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            # A raw ssl.SSLError escapes httpx's TransportError mapping; it is
+            # retried only if the request write failed (RequestWriteTrace).
+            except (httpx.TransportError, httpx.HTTPStatusError, ssl.SSLError) as e:
                 last_error = e
 
-                if not self.config.retry_enabled or attempt >= self.config.retry_max_attempts - 1:
+                if (
+                    not self.config.retry_enabled
+                    or attempt >= self.config.retry_max_attempts - 1
+                    or request_trace.forbids_retry(e)
+                ):
                     # On exhaustion, preserve the upstream 5xx status (e.g. 503
                     # Service Unavailable, 500, 502, 504) so the client can apply
                     # its own retry/backoff. Collapsing every exhausted 5xx into a
@@ -4541,6 +4553,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     proxy.metrics.record_stack(stack)
                 except Exception:
                     logger.debug("record_stack failed", exc_info=True)
+        if method == "POST":
+            # The harness's own release, for the anonymous beacon. Every route,
+            # not only /v1/: Gemini, Bedrock and ChatGPT-auth Codex live
+            # elsewhere. Only the middleware sees the User-Agent; nothing but a
+            # known harness name and a numeric version leaves this call.
+            try:
+                harness = client_version_from_user_agent(headers.get("user-agent", ""))
+                if harness:
+                    record_client_version(*harness)
+            except Exception:
+                logger.debug("record_client_version failed", exc_info=True)
         try:
             response = await call_next(request)
         except asyncio.CancelledError:
@@ -6191,8 +6214,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         Returns empty list if log_full_messages is disabled (messages are not stored).
         """
-        if limit > 100:
-            limit = 100
+        # Clamp both ends: limit<=0 would otherwise slice the whole log.
+        limit = max(1, min(limit, 100))
 
         transformations = []
         log_full_messages = proxy.config.log_full_messages if proxy else False
@@ -7074,6 +7097,13 @@ def _proxy_config_from_env() -> ProxyConfig:
             DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
         ),
         ccr_buffered_chat_streaming=_get_env_bool("HEADROOM_CCR_BUFFERED_CHAT_STREAMING", False),
+        ccr_inject_system_instructions=(
+            False
+            if (
+                _get_env_bool("HEADROOM_NO_CCR", False) or _get_env_bool("HEADROOM_LOSSLESS", False)
+            )
+            else _get_env_bool("HEADROOM_CCR_INJECT_SYSTEM_INSTRUCTIONS", False)
+        ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
         omlx_target_api_url=resolve_omlx_target_api_url(environ=os.environ),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),

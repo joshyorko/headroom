@@ -284,7 +284,9 @@ def test_streaming_response_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch
                 "url": url,
                 **kwargs,
             }
-            return SimpleNamespace()
+            import httpx
+
+            return httpx.Request(method, url, **kwargs)
 
         async def _send(self, request, stream: bool):  # noqa: ANN001, ANN003
             return SimpleNamespace(headers={}, status_code=200)

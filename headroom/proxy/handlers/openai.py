@@ -116,6 +116,7 @@ from headroom.proxy.auth_mode import (
 from headroom.proxy.buffered_ccr_response import (
     DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
     OPENAI_ERROR_FORMAT,
+    OPENAI_RESPONSES_ERROR_FORMAT,
     buffered_ccr_asgi_call,
 )
 from headroom.proxy.compression_decision import CompressionDecision
@@ -679,7 +680,11 @@ def _allowed_ws_origins_from_env() -> list[str] | None:
         raw = os.environ.get(_CORS_ALLOWED_ORIGINS_ENV)
     if raw is None or not raw.strip():
         return None
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    # "*" is a CORS answer (which pages may read a response). It never waives
+    # the Origin check, which decides whether the proxy acts on the request at
+    # all, so it is dropped here; a list left empty means the loopback default.
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return [origin for origin in origins if origin != "*"] or None
 
 
 def _is_loopback_ws_origin(origin: str) -> bool:
@@ -696,7 +701,7 @@ def _is_allowed_websocket_origin(headers: dict[str, str]) -> bool:
 
     Native clients commonly omit Origin, so absence is allowed. When Origin is
     present, default to loopback-only and allow explicit configured origins via
-    HEADROOM_WS_ORIGINS or HEADROOM_CORS_ORIGINS.
+    HEADROOM_WS_ORIGINS or HEADROOM_CORS_ORIGINS. A ``*`` entry matches nothing.
     """
     origin = _header_get(headers, "origin")
     if not origin:
@@ -705,8 +710,6 @@ def _is_allowed_websocket_origin(headers: dict[str, str]) -> bool:
     allowed_origins = _allowed_ws_origins_from_env()
     if allowed_origins is None:
         return _is_loopback_ws_origin(origin)
-    if "*" in allowed_origins:
-        return True
 
     normalized_origin = _normalize_origin(origin)
     if normalized_origin is None:
@@ -3868,7 +3871,10 @@ class OpenAIHandlerMixin:
                 COMPRESSION_BODY_MAX_BYTES,
             )
             backend = resolver_for(self).for_request(
-                request, body=body, native_providers=("openai",)
+                request,
+                body=body,
+                native_providers=("openai",),
+                upstream_url=upstream_base_url,
             )
             passthrough_model = body.get("model", "unknown")
             if not isinstance(passthrough_model, str):
@@ -4656,7 +4662,7 @@ class OpenAIHandlerMixin:
         # Decided before injection: a turn that can buffer can answer the tool,
         # so it may carry it even though the client asked for a stream. Whether
         # it actually buffers is settled at dispatch, from the final body.
-        from headroom.proxy.route_advice import advice_from
+        from headroom.proxy.route_advice import resolver_for
 
         _ccr_handler = getattr(self, "ccr_response_handler", None)
         chat_stream_ccr_eligible = _is_openai_chat_stream_ccr_eligible(
@@ -4666,10 +4672,12 @@ class OpenAIHandlerMixin:
                 _ccr_handler and getattr(_ccr_handler.config, "enabled", True)
             ),
             ccr_inject_tool=self.config.ccr_inject_tool,
-            routed_to_backend=(
-                getattr(self, "anthropic_backend", None) is not None
-                or advice_from(request) is not None
-            ),
+            # Ask the resolver, not the advice: advice it ignores (a Copilot
+            # upstream) leaves this request on the direct path.
+            routed_to_backend=resolver_for(self).for_request(
+                request, native_providers=("openai",), upstream_url=upstream_base_url
+            )
+            is not None,
             upstream_base_url=upstream_base_url,
         )
         can_inject_ccr_tool = _should_inject_openai_chat_ccr_tool(
@@ -5249,7 +5257,7 @@ class OpenAIHandlerMixin:
         _normalize_openai_max_tokens(
             body,
             backend_owns_translation=resolver_for(self).for_request(
-                request, native_providers=("openai",)
+                request, native_providers=("openai",), upstream_url=upstream_base_url
             )
             is not None,
         )
@@ -5315,12 +5323,13 @@ class OpenAIHandlerMixin:
 
         # Route through LiteLLM/any-llm backend if configured -- or through a
         # per-request one an extension asked for (see proxy/route_advice.py).
-        # Keep OpenRouter on its explicit chat backend. Other requests let route advice
-        # select a translating backend while treating this handler as native to OpenAI.
+        # Keep OpenRouter on its explicit chat backend; other requests use route advice.
         request_backend = (
             chat_backend
             if _is_openrouter_model(model)
-            else resolver_for(self).for_request(request, body=body, native_providers=("openai",))
+            else resolver_for(self).for_request(
+                request, body=body, native_providers=("openai",), upstream_url=upstream_base_url
+            )
         )
         if request_backend is not None:
             try:
@@ -7872,18 +7881,15 @@ class OpenAIHandlerMixin:
                                 "handling; failing closed"
                             )
 
-                            async def _residual_ccr_error_sse():
-                                error_event = {
-                                    "type": "error",
-                                    "error": {
-                                        "message": "Unable to safely complete streamed CCR retrieval.",
-                                    },
-                                }
-                                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
-
-                            return StreamingResponse(
-                                _residual_ccr_error_sse(),
-                                media_type="text/event-stream",
+                            # Same split as the Chat twin: a plain JSON error
+                            # works on both sides of the commit. The wrapper
+                            # turns it into the typed stream event if SSE is
+                            # already on the wire.
+                            return Response(
+                                content=OPENAI_RESPONSES_ERROR_FORMAT.json_body(
+                                    "Unable to safely complete streamed CCR retrieval."
+                                ),
+                                media_type="application/json",
                                 headers=sse_headers,
                                 status_code=502,
                             )
@@ -7945,7 +7951,7 @@ class OpenAIHandlerMixin:
                 # differs. See headroom/proxy/buffered_ccr_response.py (#3079).
                 _buffered_call = buffered_ccr_asgi_call(
                     operation=operation,
-                    fmt=OPENAI_ERROR_FORMAT,
+                    fmt=OPENAI_RESPONSES_ERROR_FORMAT,
                     grace_seconds=getattr(
                         self.config,
                         "buffered_ccr_grace_seconds",

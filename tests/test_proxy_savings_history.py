@@ -151,6 +151,8 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
         "total_input_cost_usd": 0.0,
         "output_tokens_saved": 0,
         "output_savings_usd": 0.0,
+        "output_tokens_saved_high": 0,
+        "output_savings_usd_high": 0.0,
         "output_tokens": 0,
         "total_output_cost_usd": 0.0,
     }
@@ -205,6 +207,8 @@ def test_non_dict_savings_state_resets_to_default(tmp_path):
         "total_input_cost_usd": 0.0,
         "output_tokens_saved": 0,
         "output_savings_usd": 0.0,
+        "output_tokens_saved_high": 0,
+        "output_savings_usd_high": 0.0,
         "output_tokens": 0,
         "total_output_cost_usd": 0.0,
     }
@@ -2062,13 +2066,14 @@ def test_non_finite_state_values_coerce_to_defaults(tmp_path):
     assert tracker.snapshot()["lifetime"]["cache_read_tokens"] == 5
 
 
-def test_cache_only_request_still_appends_a_history_point(tmp_path):
+def test_cache_only_request_still_appends_a_history_point(tmp_path, monkeypatch):
     # Regression: in --mode cache, tokens_saved is ~always 0 (the frozen
     # prefix is byte-replayed, not lossy-compressed, to keep the provider's
     # prompt cache warm). The history-append guard used to gate on
     # tokens_saved alone, so a cache-only deployment silently wrote zero
     # history points regardless of real cache_read_tokens/cache_savings_usd —
     # making headroom-monthly-style tooling read as a total collapse.
+    monkeypatch.setattr(savings_tracker_module, "_get_litellm_module", lambda: None)
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(path=str(path))
 

@@ -1,0 +1,217 @@
+<%
+require "dotenv"
+Dotenv.load(".env.kamal.local") if File.exist?(".env.kamal.local")
+
+kamal_host = ENV.fetch("KAMAL_HOST")
+kamal_public_host = ENV.fetch("KAMAL_PUBLIC_HOST", kamal_host)
+kamal_ssh_user = ENV.fetch("KAMAL_SSH_USER", "kdlocpanda")
+kamal_storage_path = ENV.fetch("KAMAL_STORAGE_PATH", "/var/lib/headroom")
+kamal_arch = ENV.fetch("KAMAL_ARCH", "amd64")
+kamal_proxy_http_port = ENV.fetch("KAMAL_PROXY_HTTP_PORT", "80")
+headroom_port = ENV.fetch("HEADROOM_PORT", "8787")
+headroom_proxy_token_configured = !ENV.fetch("HEADROOM_PROXY_TOKEN", "").strip.empty?
+headroom_savings_profile = ENV.fetch("HEADROOM_SAVINGS_PROFILE", "balanced")
+headroom_tool_search = ENV.fetch("HEADROOM_TOOL_SEARCH", "1")
+headroom_protect_reads = ENV.fetch("HEADROOM_PROTECT_READS", "1")
+headroom_memory_injection_mode = ENV.fetch("HEADROOM_MEMORY_INJECTION_MODE", "live_zone_tail")
+headroom_strip_internal_headers = ENV.fetch("HEADROOM_STRIP_INTERNAL_HEADERS", "enabled")
+headroom_output_shaper = ENV.fetch("HEADROOM_OUTPUT_SHAPER", "1")
+headroom_output_holdout = ENV.fetch("HEADROOM_OUTPUT_HOLDOUT", "0.10")
+headroom_target_ratio = ENV.fetch("HEADROOM_TARGET_RATIO", "0.4")
+headroom_memory_top_k = ENV.fetch("HEADROOM_MEMORY_TOP_K", "5")
+headroom_min_evidence = ENV.fetch("HEADROOM_MIN_EVIDENCE", "3")
+headroom_memory_context_timeout_seconds = ENV.fetch("HEADROOM_MEMORY_CONTEXT_TIMEOUT_SECONDS", "1.0")
+headroom_request_timeout = ENV.fetch("HEADROOM_REQUEST_TIMEOUT", "600")
+headroom_write_timeout_seconds = ENV.fetch("HEADROOM_WRITE_TIMEOUT_SECONDS", headroom_request_timeout)
+headroom_proxy_trusted_gateway_cidrs = ENV.fetch(
+  "HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", ""
+)
+headroom_proxy_trusted_dashboard_client_cidrs = ENV.fetch(
+  "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", ""
+)
+headroom_compression_max_workers = ENV.fetch("HEADROOM_COMPRESSION_MAX_WORKERS", "16")
+headroom_tool_output_compression_parallelism = ENV.fetch("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "8")
+headroom_lossless = ENV.fetch("HEADROOM_LOSSLESS", "1")
+headroom_dedupe = ENV.fetch("HEADROOM_DEDUPE", "1")
+headroom_lossless_then_lossy = ENV.fetch("HEADROOM_LOSSLESS_THEN_LOSSY", "0")
+headroom_disable_kompress = ENV.fetch("HEADROOM_DISABLE_KOMPRESS", "1")
+headroom_disable_kompress_fallback = ENV.fetch("HEADROOM_DISABLE_KOMPRESS_FALLBACK", "1")
+headroom_disable_kompress_anthropic = ENV.fetch("HEADROOM_DISABLE_KOMPRESS_ANTHROPIC", "1")
+headroom_disable_kompress_openai = ENV.fetch("HEADROOM_DISABLE_KOMPRESS_OPENAI", "1")
+headroom_debug_dump = ENV.fetch("HEADROOM_DEBUG_DUMP", "off")
+headroom_ws_origins = ENV.fetch("HEADROOM_WS_ORIGINS", "")
+headroom_ws_fail_open_on_compression_failure = ENV.fetch("HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE", "0")
+headroom_offline = ENV.fetch("HEADROOM_OFFLINE", "0")
+headroom_beacon = ENV.fetch("HEADROOM_BEACON", "off")
+headroom_telemetry = ENV.fetch("HEADROOM_TELEMETRY", "off")
+do_not_track = ENV.fetch("DO_NOT_TRACK", "1")
+headroom_verbosity_level = ENV.fetch("HEADROOM_VERBOSITY_LEVEL", "").strip
+kamal_image = ENV.fetch("KAMAL_IMAGE", "joshyorko/headroom")
+kamal_registry_server = ENV.fetch("KAMAL_REGISTRY_SERVER", "ghcr.io")
+kamal_registry_username = ENV.fetch("KAMAL_REGISTRY_USERNAME", "joshyorko")
+%>
+service: headroom
+image: <%= kamal_image %>
+
+servers:
+  web:
+    hosts:
+      - <%= kamal_host %>
+    cmd: >-
+      --host 0.0.0.0
+      --port <%= headroom_port %>
+      --mode token
+      --target-ratio <%= headroom_target_ratio %>
+      --memory
+      --memory-storage project
+      --memory-db-path /home/nonroot/.headroom/memory.db
+      --memory-project-root /home/nonroot
+      --memory-top-k <%= headroom_memory_top_k %>
+      --memory-qdrant-host qdrant
+      --memory-qdrant-port 6333
+      --min-evidence <%= headroom_min_evidence %>
+      --anthropic-pre-upstream-memory-context-timeout-seconds <%= headroom_memory_context_timeout_seconds %>
+      --compression-max-workers <%= headroom_compression_max_workers %>
+      --learn
+
+ssh:
+  user: <%= kamal_ssh_user %>
+
+proxy:
+  host: <%= kamal_public_host %>
+  app_port: <%= headroom_port %>
+  ssl: false
+  forward_headers: true
+  response_timeout: <%= headroom_request_timeout %>
+  healthcheck:
+    path: /readyz
+    interval: 3
+    timeout: 3
+  run:
+    http_port: <%= kamal_proxy_http_port %>
+    bind_ips:
+      - 0.0.0.0
+
+registry:
+  server: <%= kamal_registry_server %>
+  username: <%= kamal_registry_username %>
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+builder:
+  arch: <%= kamal_arch %>
+  context: .
+  dockerfile: Dockerfile
+  args:
+    HEADROOM_EXTRAS: proxy,code,memory-stack,bedrock
+
+env:
+  secret:
+<% if headroom_proxy_token_configured %>
+    - HEADROOM_PROXY_TOKEN
+<% end %>
+    - HEADROOM_NEO4J_PASSWORD
+    - GITHUB_TOKEN
+    - GITHUB_COPILOT_TOKEN
+    - OPENAI_API_KEY
+    - OPENROUTER_API_KEY
+  clear:
+    HEADROOM_HOST: 0.0.0.0
+    HEADROOM_PORT: "<%= headroom_port %>"
+    HEADROOM_CODEX_QUOTA_OPERATOR: "<%= ENV.fetch('HEADROOM_CODEX_QUOTA_OPERATOR', '') %>"
+    HEADROOM_MODE: token
+    GITHUB_COPILOT_USE_TOKEN_EXCHANGE: "true"
+    HEADROOM_SAVINGS_PROFILE: "<%= headroom_savings_profile %>"
+    HEADROOM_AGENT_TYPE: codex
+    HEADROOM_WORKSPACE_DIR: /home/nonroot/.headroom
+    HEADROOM_CONFIG_DIR: /home/nonroot/.headroom/config
+    HEADROOM_TARGET_RATIO: "<%= headroom_target_ratio %>"
+    HEADROOM_LOSSLESS: "<%= headroom_lossless %>"
+    HEADROOM_DEDUPE: "<%= headroom_dedupe %>"
+    HEADROOM_TOOL_SEARCH: "<%= headroom_tool_search %>"
+    HEADROOM_PROTECT_READS: "<%= headroom_protect_reads %>"
+    HEADROOM_LOSSLESS_THEN_LOSSY: "<%= headroom_lossless_then_lossy %>"
+    HEADROOM_DISABLE_KOMPRESS: "<%= headroom_disable_kompress %>"
+    HEADROOM_DISABLE_KOMPRESS_FALLBACK: "<%= headroom_disable_kompress_fallback %>"
+    HEADROOM_DISABLE_KOMPRESS_ANTHROPIC: "<%= headroom_disable_kompress_anthropic %>"
+    HEADROOM_DISABLE_KOMPRESS_OPENAI: "<%= headroom_disable_kompress_openai %>"
+    HEADROOM_KOMPRESS_MAX_TOKENS: "50000"
+    HEADROOM_TEXT_CRUSHER: "1"
+    HEADROOM_COMPRESSION_DEADLINE_MS: "12000"
+    HEADROOM_COMPRESS_USER_MESSAGES: "0"
+    HEADROOM_CODE_AWARE_ENABLED: "0"
+    HEADROOM_MIN_TOKENS: "5000"
+    HEADROOM_MEMORY_DB_PATH: /home/nonroot/.headroom/memory.db
+    HEADROOM_MEMORY_PROJECT_ROOT: /home/nonroot
+    HEADROOM_MEMORY_BACKEND: qdrant-neo4j
+    HEADROOM_MEMORY_TOP_K: "<%= headroom_memory_top_k %>"
+    HEADROOM_MIN_EVIDENCE: "<%= headroom_min_evidence %>"
+    HEADROOM_MEMORY_CONTEXT_TIMEOUT_SECONDS: "<%= headroom_memory_context_timeout_seconds %>"
+    HEADROOM_REQUEST_TIMEOUT: "<%= headroom_request_timeout %>"
+    HEADROOM_WRITE_TIMEOUT_SECONDS: "<%= headroom_write_timeout_seconds %>"
+    HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS: "<%= headroom_proxy_trusted_gateway_cidrs %>"
+    HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS: "<%= headroom_proxy_trusted_dashboard_client_cidrs %>"
+    HEADROOM_MEMORY_INJECTION_MODE: "<%= headroom_memory_injection_mode %>"
+    HEADROOM_COMPRESSION_MAX_WORKERS: "<%= headroom_compression_max_workers %>"
+    HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM: "<%= headroom_tool_output_compression_parallelism %>"
+    HEADROOM_QDRANT_HOST: qdrant
+    HEADROOM_QDRANT_PORT: "6333"
+    HEADROOM_NEO4J_URI: neo4j://neo4j:7687
+    HEADROOM_NEO4J_USER: neo4j
+    HEADROOM_OUTPUT_SHAPER: "<%= headroom_output_shaper %>"
+    HEADROOM_OUTPUT_HOLDOUT: "<%= headroom_output_holdout %>"
+    HEADROOM_STRIP_INTERNAL_HEADERS: "<%= headroom_strip_internal_headers %>"
+<% unless headroom_verbosity_level.empty? %>
+    HEADROOM_VERBOSITY_LEVEL: "<%= headroom_verbosity_level %>"
+<% end %>
+    HEADROOM_LOG_MESSAGES: "0"
+    HEADROOM_DEBUG_DUMP: "<%= headroom_debug_dump %>"
+    HEADROOM_WS_ORIGINS: "<%= headroom_ws_origins %>"
+    HEADROOM_WS_FAIL_OPEN_ON_COMPRESSION_FAILURE: "<%= headroom_ws_fail_open_on_compression_failure %>"
+    HEADROOM_OFFLINE: "<%= headroom_offline %>"
+    HEADROOM_BEACON: "<%= headroom_beacon %>"
+    HEADROOM_TELEMETRY: "<%= headroom_telemetry %>"
+    DO_NOT_TRACK: "<%= do_not_track %>"
+
+volumes:
+  - "<%= kamal_storage_path %>/state:/home/nonroot/.headroom"
+
+aliases:
+  shell: 'app exec --interactive --reuse "sh"'
+  logs: "app logs -f"
+  ready: 'app exec --reuse "python -c ''import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:<%= headroom_port %>/readyz\", timeout=5); print(\"ready\")''"'
+  qdrant-logs: "accessory logs qdrant -f"
+  neo4j-logs: "accessory logs neo4j -f"
+
+accessories:
+  qdrant:
+    service: qdrant
+    image: qdrant/qdrant:v1.17.1
+    host: <%= kamal_host %>
+    options:
+      publish:
+        - "127.0.0.1:6333:6333"
+        - "127.0.0.1:6334:6334"
+    env:
+      clear:
+        QDRANT__SERVICE__GRPC_PORT: "6334"
+    directories:
+      - <%= kamal_storage_path %>/qdrant:/qdrant/storage
+  neo4j:
+    service: neo4j
+    image: neo4j:5.26
+    host: <%= kamal_host %>
+    options:
+      publish:
+        - "127.0.0.1:7474:7474"
+        - "127.0.0.1:7687:7687"
+    env:
+      clear:
+        NEO4J_PLUGINS: '["apoc"]'
+        NEO4J_apoc_export_file_enabled: "true"
+        NEO4J_apoc_import_file_enabled: "true"
+        NEO4J_apoc_import_file_use__neo4j__config: "true"
+      secret:
+        - NEO4J_AUTH
+    directories:
+      - <%= kamal_storage_path %>/neo4j:/data

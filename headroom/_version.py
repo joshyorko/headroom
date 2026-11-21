@@ -72,6 +72,10 @@ def _source_root() -> Path | None:
 def _source_tree_version(root: Path) -> str | None:
     """Compute the version release automation would assign to this checkout."""
     try:
+        project_version = _project_version(root)
+        if project_version and "+" in project_version:
+            return project_version
+
         from headroom.release_version import (
             compute_release_version,
             determine_bump_level,
@@ -93,6 +97,21 @@ def _source_tree_version(root: Path) -> str | None:
             level=level,
             tags=tags,
         ).version
+    except Exception:
+        return None
+
+
+def _project_version(root: Path) -> str | None:
+    """Read the package version declared by pyproject.toml."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+        import tomli as tomllib  # type: ignore[no-redef]
+
+    try:
+        with open(root / "pyproject.toml", "rb") as file:
+            project = tomllib.load(file)["project"]
+        return str(project["version"])
     except Exception:
         return None
 

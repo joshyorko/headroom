@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: headroom-dagger-mcp [dagger mcp options]
+
+Expose a local Headroom Dagger module as a stdio MCP server.
+
+By default, the current working directory is used when it contains dagger.json
+and .dagger/. Set HEADROOM_DAGGER_REPO or HEADROOM_DAGGER_MODULE only when you
+want to pin the server to a specific checkout regardless of current directory.
+
+Examples:
+  scripts/headroom-dagger-mcp
+  HEADROOM_DAGGER_REPO=/path/to/headroom scripts/headroom-dagger-mcp
+
+Register this bridge in the repo-local .codex/config.toml:
+  [mcp_servers.headroom-dagger]
+  command = "/path/to/headroom/scripts/headroom-dagger-mcp"
+
+Use the pinned env form only when Codex may start outside this checkout:
+  [mcp_servers.headroom-dagger.env]
+  HEADROOM_DAGGER_REPO = "/path/to/headroom"
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if ! command -v dagger >/dev/null 2>&1; then
+  echo "dagger CLI is required to expose the Headroom Dagger module as MCP." >&2
+  exit 127
+fi
+
+run_dagger_mcp() {
+  python3 "$script_dir/headroom-dagger-mcp-filter.py" "$@"
+}
+
+headroom_repo="${HEADROOM_DAGGER_REPO:-${HEADROOM_DAGGER_MODULE:-}}"
+if [[ -z "$headroom_repo" && -f dagger.json && -d .dagger ]]; then
+  headroom_repo="$PWD"
+fi
+
+if [[ -z "$headroom_repo" ]]; then
+  run_dagger_mcp --no-mod --env-privileged "$@"
+  exit $?
+fi
+
+headroom_repo="$(python3 - "$headroom_repo" <<'PY'
+import sys
+from pathlib import Path
+
+print(Path(sys.argv[1]).expanduser().resolve())
+PY
+)"
+
+if [[ ! -f "$headroom_repo/dagger.json" || ! -d "$headroom_repo/.dagger" ]]; then
+  echo "Dagger module path must contain dagger.json and .dagger/: $headroom_repo" >&2
+  exit 2
+fi
+
+run_dagger_mcp --mod "$headroom_repo" "$@"

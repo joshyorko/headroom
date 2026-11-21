@@ -74,6 +74,7 @@ from headroom.copilot_auth import (
     _COPILOT_OAUTH_TOKEN_ENV_VARS,
     _GENERIC_GITHUB_TOKEN_ENV_VARS,
     _REFRESH_OAUTH_TOKEN_ENV_VAR,
+    DEFAULT_API_URL,
     CopilotSubscriptionTokenResolution,
     has_oauth_auth,
     resolve_client_bearer_token,
@@ -152,6 +153,9 @@ from headroom.providers.copilot import (
 )
 from headroom.providers.copilot import (
     model_configured as _copilot_model_configured_impl,
+)
+from headroom.providers.copilot import (
+    normalize_proxy_root_url as _normalize_copilot_proxy_root_url,
 )
 from headroom.providers.copilot import (
     provider_key_source as _copilot_provider_key_source,
@@ -242,6 +246,10 @@ from headroom.providers.zcode import (
 from headroom.providers.zcode import (
     upstream_to_proxy_urls as _zcode_upstream_to_urls,
 )
+from headroom.proxy.project_context import with_client_prefix as _with_client_prefix
+from headroom.proxy.project_context import (
+    with_copilot_upstream_prefix as _with_copilot_upstream_prefix,
+)
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
 from .main import main
@@ -268,6 +276,23 @@ def _scrub_copilot_proxy_seed_env(env: dict[str, str]) -> None:
 def _scrub_copilot_subscription_launch_env(env: dict[str, str]) -> None:
     for key in _COPILOT_SUBSCRIPTION_LAUNCH_SECRET_ENV_VARS:
         env.pop(key, None)
+
+
+def _scrub_copilot_generic_token_env(env: dict[str, str]) -> list[str]:
+    """Keep ambient GitHub credentials out of an OAuth Copilot child process.
+
+    The wrapper resolves and pins the bearer token passed to the proxy.  A
+    generic ``GITHUB_TOKEN``/``GH_TOKEN`` left in the child environment could
+    otherwise make Copilot select a different credential than the one that was
+    validated, while ``COPILOT_PROVIDER_BEARER_TOKEN`` remains available for
+    the explicit proxy handoff.
+    """
+    scrubbed = [
+        key for key in (*_GENERIC_GITHUB_TOKEN_ENV_VARS, "COPILOT_GITHUB_TOKEN") if env.get(key)
+    ]
+    for key in scrubbed:
+        env.pop(key, None)
+    return scrubbed
 
 
 def _read_text(path: Path) -> str:
@@ -2335,7 +2360,12 @@ def _restore_claude_wrap_base_url(
 
 
 def _setup_headroom_mcp(
-    registrar: Any, port: int, *, verbose: bool = False, force: bool = False
+    registrar: Any,
+    port: int,
+    *,
+    proxy_url: str | None = None,
+    verbose: bool = False,
+    force: bool = False,
 ) -> None:
     """Register the headroom MCP server with the given agent (idempotent).
 
@@ -2353,8 +2383,8 @@ def _setup_headroom_mcp(
             click.echo(f"  MCP retrieve tool: {registrar.display_name} not detected — skipping")
         return
 
-    proxy_url = f"http://127.0.0.1:{port}"
-    spec = build_headroom_spec(proxy_url)
+    resolved_proxy_url = _normalize_proxy_url(proxy_url, port)
+    spec = build_headroom_spec(resolved_proxy_url)
     result = registrar.register_server(spec, force=force)
 
     line = format_result(
@@ -2362,7 +2392,7 @@ def _setup_headroom_mcp(
         result,
         label="MCP retrieve tool",
         verbose=verbose,
-        overwrite_hint=f"headroom mcp install --proxy-url {proxy_url} --force",
+        overwrite_hint=f"headroom mcp install --proxy-url {resolved_proxy_url} --force",
         restart_hint=f"restart {registrar.display_name} if it was already running",
     )
     if line is not None:
@@ -3242,8 +3272,12 @@ _MEMORY_MCP_END = "# --- end Headroom memory ---"
 _MEMORY_AGENTS_MARKER = "<!-- headroom:memory-instructions -->"
 
 # Codex config injection markers
-_CODEX_TOP_LEVEL_MARKER = "# --- Headroom proxy (auto-injected by headroom wrap codex) ---"
-_CODEX_END_MARKER = "# --- end Headroom ---"
+_CODEX_TOP_LEVEL_MARKER = "# --- Headroom Codex provider ---"
+_CODEX_END_MARKER = "# --- end Headroom Codex provider ---"
+_LEGACY_CODEX_PROVIDER_MARKERS = (
+    ("# --- Headroom proxy (auto-injected by headroom wrap codex) ---", "# --- end Headroom ---"),
+    ("# --- Headroom init provider ---", "# --- end Headroom init provider ---"),
+)
 _CODEX_MCP_MARKER = "# --- Headroom MCP server ---"
 _CODEX_MCP_END = "# --- end Headroom MCP server ---"
 # File name used for the pre-wrap snapshot of the Codex config file.  The
@@ -3251,6 +3285,15 @@ _CODEX_MCP_END = "# --- end Headroom MCP server ---"
 # if the user had their own `model_provider` / `[model_providers.*]` config
 # before running wrap.
 _CODEX_CONFIG_BACKUP_SUFFIX = ".headroom-backup"
+
+
+def _normalize_proxy_url(proxy_url: str | None, port: int) -> str:
+    return (proxy_url or f"http://127.0.0.1:{port}").rstrip("/")
+
+
+def _proxy_v1_url(proxy_url: str) -> str:
+    url = proxy_url.rstrip("/")
+    return url if url.endswith("/v1") else f"{url}/v1"
 
 
 def _codex_home_dir() -> Path:
@@ -3323,7 +3366,11 @@ _CODEX_EMBEDDED_MODE_NOTE = (
 
 
 def _codex_session_launch_settings(
-    *, port: int, codex_args: tuple[str, ...], environ: dict[str, str]
+    *,
+    port: int,
+    codex_args: tuple[str, ...],
+    environ: dict[str, str],
+    proxy_url: str | None = None,
 ) -> tuple[tuple[str, ...], dict[str, str], list[str]]:
     """Build process-local routing while preserving the selected provider id."""
     config_file, _ = _codex_config_paths()
@@ -3345,7 +3392,7 @@ def _codex_session_launch_settings(
     provider = str(provider)
 
     project = _project_name_from_cwd()
-    proxy_url = _with_project_prefix(f"http://127.0.0.1:{port}/v1", project)
+    proxy_url = _with_project_prefix(_proxy_v1_url(_normalize_proxy_url(proxy_url, port)), project)
     overrides: list[str] = []
     env = dict(environ)
     display = [f"OPENAI_BASE_URL={proxy_url}"]
@@ -3452,6 +3499,8 @@ def _strip_codex_headroom_blocks(
 
     # Remove any top-level-marker → end-marker span, possibly repeated.
     content = _remove_marker_span(content, _CODEX_TOP_LEVEL_MARKER, _CODEX_END_MARKER)
+    for start_marker, end_marker in _LEGACY_CODEX_PROVIDER_MARKERS:
+        content = _remove_marker_span(content, start_marker, end_marker)
 
     if remove_mcp:
         # Remove Headroom-managed MCP blocks written by `wrap codex`.
@@ -3486,7 +3535,13 @@ def _strip_codex_headroom_blocks(
         if isinstance(providers, MutableMapping):
             provider = providers.get("headroom")
             base_url = provider.get("base_url") if isinstance(provider, Mapping) else None
-            if isinstance(base_url, str) and re.fullmatch(r"http://127\.0\.0\.1:\d+/v1", base_url):
+            owned_name = isinstance(provider, Mapping) and provider.get("name") in {
+                "Headroom init proxy",
+                "OpenAI via Headroom proxy",
+            }
+            if isinstance(base_url, str) and (
+                re.fullmatch(r"http://127\.0\.0\.1:\d+/v1", base_url) or owned_name
+            ):
                 del providers["headroom"]
                 content = tomlkit.dumps(document)
 
@@ -3498,7 +3553,12 @@ def _strip_codex_headroom_blocks(
 # we can rewrite it cleanly.  Bare keys must precede any [section] in TOML,
 # so a `^` anchor combined with `^[ \t]*key` is sufficient — table lines
 # start with `[`, not with the key name.
-_REDIRECTABLE_KEYS: tuple[str, ...] = ("model_provider", "openai_base_url")
+_REDIRECTABLE_KEYS: tuple[str, ...] = (
+    "model_provider",
+    "openai_base_url",
+    "experimental_realtime_webrtc_call_base_url",
+    "experimental_realtime_ws_base_url",
+)
 
 
 def _strip_existing_codex_headroom_provider_table(content: str) -> str:
@@ -3549,7 +3609,9 @@ def _strip_existing_codex_memory_mcp_table(content: str) -> str:
     return str(tomlkit.dumps(document))
 
 
-def _redirect_existing_top_level_keys(content: str, port: int) -> str:
+def _redirect_existing_top_level_keys(
+    content: str, provider_url: str, *, uses_chatgpt_auth: bool = False
+) -> str:
     """Rewrite user-defined top-level keys so wrap does not create duplicates.
 
     Codex's ``config.toml`` rejects duplicate top-level keys (TOML spec),
@@ -3573,13 +3635,19 @@ def _redirect_existing_top_level_keys(content: str, port: int) -> str:
     if not content.strip():
         return content
 
-    def _make_replacer(current_key: str, current_port: int) -> Callable[[re.Match[str]], str]:
+    def _make_replacer(current_key: str) -> Callable[[re.Match[str]], str]:
         def _replace(match: re.Match[str]) -> str:
             original_value = match.group("value")
             if current_key == "model_provider":
                 new_value = "headroom"
-            else:  # openai_base_url
-                new_value = f"http://127.0.0.1:{current_port}/v1"
+            elif current_key == "experimental_realtime_webrtc_call_base_url":
+                new_value = (
+                    f"{provider_url.removesuffix('/v1')}/backend-api/codex"
+                    if uses_chatgpt_auth
+                    else provider_url
+                )
+            else:
+                new_value = provider_url
             if original_value == new_value:
                 return match.group(0)
             # Keep the user's original value in a trailing comment so they
@@ -3595,7 +3663,7 @@ def _redirect_existing_top_level_keys(content: str, port: int) -> str:
     root_lines = sorted(root_assignment_lines(content))
     for key in _REDIRECTABLE_KEYS:
         pattern = re.compile(rf'[ \t]*{re.escape(key)}[ \t]*=[ \t]*"(?P<value>[^"\n]*)"[^\n]*')
-        replace = _make_replacer(key, port)
+        replace = _make_replacer(key)
         for index in root_lines:
             match = pattern.match(lines[index])
             if match:
@@ -3618,6 +3686,7 @@ def _codex_config_has_headroom_markers(content: str) -> bool:
     managed_markers = (
         _CODEX_TOP_LEVEL_MARKER,
         _CODEX_END_MARKER,
+        *[marker for pair in _LEGACY_CODEX_PROVIDER_MARKERS for marker in pair],
         _CODEX_MCP_MARKER,
         _MEMORY_MCP_MARKER,
     )
@@ -3829,7 +3898,7 @@ def _detect_custom_codex_upstream_base_url(content: str) -> str | None:
     return None
 
 
-def _inject_codex_provider_config(port: int) -> str | None:
+def _inject_codex_provider_config(port: int, proxy_url: str | None = None) -> str | None:
     """Inject a Headroom model provider into Codex's config.toml.
 
     Two keys need to be in effect for the proxy to route all traffic:
@@ -3867,9 +3936,11 @@ def _inject_codex_provider_config(port: int) -> str | None:
     """
     config_file, backup_file = _codex_config_paths()
     config_dir = config_file.parent
+    provider_url = _proxy_v1_url(_normalize_proxy_url(proxy_url, port))
     # Never repoint an existing headroom provider to another port silently: a
     # different live proxy (or a persistent install) may own the old route.
-    warn_codex_provider_port_change(config_file, port)
+    if proxy_url is None:
+        warn_codex_provider_port_change(config_file, port)
 
     # Detect an existing custom OpenAI-compatible provider BEFORE building the
     # injected block below, so it can be preserved as the upstream the proxy
@@ -3897,8 +3968,12 @@ def _inject_codex_provider_config(port: int) -> str | None:
     # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
     # account menu); omitting it for API-key users avoids forcing an OAuth
     # login (#406).
-    requires_openai_auth = (
-        "requires_openai_auth = true\n" if codex_uses_chatgpt_auth(config_dir / "auth.json") else ""
+    uses_chatgpt_auth = codex_uses_chatgpt_auth(config_dir / "auth.json")
+    requires_openai_auth = "requires_openai_auth = true\n" if uses_chatgpt_auth else ""
+    realtime_call_url = (
+        f"{provider_url.removesuffix('/v1')}/backend-api/codex"
+        if uses_chatgpt_auth
+        else provider_url
     )
     try:
         auth_config = build_codex_auth_config(config_dir / "auth.json", config_path=config_file)
@@ -3917,7 +3992,7 @@ def _inject_codex_provider_config(port: int) -> str | None:
         f"{_CODEX_TOP_LEVEL_MARKER}\n"
         "[model_providers.headroom]\n"
         'name = "OpenAI via Headroom proxy"\n'
-        f'base_url = "http://127.0.0.1:{port}/v1"\n'
+        f'base_url = "{provider_url}"\n'
         f"supports_websockets = true\n"
         f"{auth_config}"
         f"{requires_openai_auth}"
@@ -3930,7 +4005,9 @@ def _inject_codex_provider_config(port: int) -> str | None:
     # The two redirectable keys and their headroom target values.
     _REDIRECT_TARGETS = {
         "model_provider": "headroom",
-        "openai_base_url": f"http://127.0.0.1:{port}/v1",
+        "openai_base_url": provider_url,
+        "experimental_realtime_webrtc_call_base_url": realtime_call_url,
+        "experimental_realtime_ws_base_url": provider_url,
     }
 
     def _build_top_level_block(user_content: str) -> str:
@@ -3993,7 +4070,9 @@ def _inject_codex_provider_config(port: int) -> str | None:
             # byte-for-byte restoration on unwrap.
             user_content = content.strip()
             if user_content:
-                redirected = _redirect_existing_top_level_keys(user_content, port)
+                redirected = _redirect_existing_top_level_keys(
+                    user_content, provider_url, uses_chatgpt_auth=uses_chatgpt_auth
+                )
                 top_block = _build_top_level_block(user_content)
                 if top_block:
                     content = top_block + "\n" + redirected + "\n\n" + provider_section
@@ -4006,6 +4085,8 @@ def _inject_codex_provider_config(port: int) -> str | None:
                     f"{_CODEX_TOP_LEVEL_MARKER}\n"
                     f'model_provider = "{_REDIRECT_TARGETS["model_provider"]}"\n'
                     f'openai_base_url = "{_REDIRECT_TARGETS["openai_base_url"]}"\n'
+                    f'experimental_realtime_webrtc_call_base_url = "{_REDIRECT_TARGETS["experimental_realtime_webrtc_call_base_url"]}"\n'
+                    f'experimental_realtime_ws_base_url = "{_REDIRECT_TARGETS["experimental_realtime_ws_base_url"]}"\n'
                     f"{_CODEX_END_MARKER}\n"
                     f"\n{provider_section}"
                 )
@@ -4015,6 +4096,8 @@ def _inject_codex_provider_config(port: int) -> str | None:
                 f"{_CODEX_TOP_LEVEL_MARKER}\n"
                 f'model_provider = "{_REDIRECT_TARGETS["model_provider"]}"\n'
                 f'openai_base_url = "{_REDIRECT_TARGETS["openai_base_url"]}"\n'
+                f'experimental_realtime_webrtc_call_base_url = "{_REDIRECT_TARGETS["experimental_realtime_webrtc_call_base_url"]}"\n'
+                f'experimental_realtime_ws_base_url = "{_REDIRECT_TARGETS["experimental_realtime_ws_base_url"]}"\n'
                 f"{_CODEX_END_MARKER}\n"
                 f"\n{provider_section}"
             )
@@ -4354,9 +4437,14 @@ def _inject_memory_agents_md(file_path: Path) -> bool:
     return True
 
 
-def _resolve_copilot_provider_type(backend: str | None, provider_type: str) -> str:
+def _resolve_copilot_provider_type(
+    backend: str | None,
+    provider_type: str,
+    *,
+    environ: dict[str, str] | None = None,
+) -> str:
     """Resolve Copilot BYOK provider type for the current proxy backend."""
-    return _copilot_resolve_provider_type(backend, provider_type)
+    return _copilot_resolve_provider_type(backend, provider_type, environ=environ)
 
 
 def _is_headroom_health(payload: dict[str, Any] | None) -> bool:
@@ -5023,11 +5111,25 @@ def _copilot_default_wire_api_for_model(model: str | None) -> str:
 
 
 def _build_copilot_native_launch_env(
-    *, port: int, environ: dict[str, str], project: str | None
+    *,
+    port: int,
+    environ: dict[str, str],
+    project: str | None,
+    proxy_url: str | None = None,
+    api_url: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     from headroom.providers.copilot.wrap import build_native_launch_env
 
-    return build_native_launch_env(port=port, environ=environ, project=project)
+    env, display = build_native_launch_env(port=port, environ=environ, project=project)
+    if proxy_url is None:
+        base_url = _with_client_prefix(env["COPILOT_API_URL"], "copilot")
+    else:
+        base_url = _with_copilot_upstream_prefix(proxy_url, api_url)
+        base_url = _with_project_prefix(base_url, project)
+        base_url = _with_client_prefix(base_url, "copilot")
+    env["COPILOT_API_URL"] = base_url
+    display[0] = f"COPILOT_API_URL={base_url}"
+    return env, display
 
 
 def _native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> bool | None:
@@ -7000,9 +7102,24 @@ def unwrap_claude(
 def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolution:
     resolution = resolve_subscription_bearer_token_details()
     if resolution is None:
+        classic_token = next(
+            (
+                os.environ.get(name)
+                for name in ("GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN")
+                if (os.environ.get(name) or "").startswith("ghp")
+            ),
+            None,
+        )
+        if classic_token:
+            raise click.ClickException(
+                "could not resolve a reusable Copilot bearer token: a classic GitHub PAT "
+                "does not carry the Copilot Requests permission. Run "
+                "`headroom copilot-auth login` to create reusable Copilot auth."
+            )
         raise click.ClickException(
-            "GitHub Copilot subscription mode requires a reusable GitHub/Copilot bearer "
-            "token, but none could be resolved. Run `headroom copilot-auth login` first, or set "
+            "GitHub Copilot subscription mode could not resolve a reusable Copilot bearer "
+            "token. No reusable Copilot token was found. Run `headroom copilot-auth login` "
+            "first, or set "
             "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
         )
     return resolution
@@ -7012,6 +7129,12 @@ def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolu
 @_retired_context_tool_option
 @proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option(
+    "--proxy-url",
+    default=None,
+    envvar="HEADROOM_PROXY_URL",
+    help="Existing Headroom proxy URL for Copilot routing.",
+)
 @click.option(
     "--backend",
     default=None,
@@ -7060,6 +7183,7 @@ def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolu
 def copilot(
     port: int,
     no_proxy: bool,
+    proxy_url: str | None,
     backend: str | None,
     anyllm_provider: str | None,
     region: str | None,
@@ -7104,8 +7228,15 @@ def copilot(
     )
 
     explicit_subscription = subscription
+    proxy_root = _normalize_copilot_proxy_root_url(proxy_url)
+    if proxy_root is not None:
+        no_proxy = True
+
+    env = os.environ.copy()
+    _scrub_copilot_proxy_seed_env(env)
+    env.pop("COPILOT_PROVIDER_TYPE", None)
     effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
-    if _check_proxy(port):
+    if proxy_root is None and _check_proxy(port):
         running_backend = _detect_running_proxy_backend(port)
         if effective_backend and running_backend and effective_backend != running_backend:
             raise click.ClickException(
@@ -7125,7 +7256,9 @@ def copilot(
                 "--native selects the wire per request; drop the BYOK-only --wire-api option."
             )
 
-    effective_provider_type = _resolve_copilot_provider_type(effective_backend, provider_type)
+    effective_provider_type = _resolve_copilot_provider_type(
+        effective_backend, provider_type, environ=env
+    )
     if subscription:
         if effective_backend not in (None, "", "anthropic"):
             raise click.ClickException(
@@ -7144,8 +7277,6 @@ def copilot(
         backend=effective_backend,
     )
 
-    env = os.environ.copy()
-    _scrub_copilot_proxy_seed_env(env)
     openai_api_url: str | None = None
     copilot_proxy_token: str | None = None
     copilot_refresh_oauth_token: str | None = None
@@ -7164,7 +7295,7 @@ def copilot(
     # switches) were then forwarded literally and rejected by GitHub (#1910).
     # Explicit --subscription remains on its existing fixed-wire behavior;
     # implicit GitHub OAuth uses Copilot's own routing automatically.
-    if use_copilot_oauth and not explicit_subscription:
+    if use_copilot_oauth and not explicit_subscription and proxy_root is None:
         native = True
 
     if use_copilot_oauth:
@@ -7180,6 +7311,14 @@ def copilot(
                 "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
             )
 
+        scrubbed_token_vars = _scrub_copilot_generic_token_env(env)
+        if scrubbed_token_vars:
+            click.echo(
+                "  Ignoring "
+                + ", ".join(scrubbed_token_vars)
+                + "; using the validated Copilot subscription token instead."
+            )
+
         if native:
             openai_api_url = (
                 subscription_resolution.api_url
@@ -7190,6 +7329,8 @@ def copilot(
                 port=port,
                 environ=env,
                 project=_project_name_from_cwd(),
+                proxy_url=proxy_root,
+                api_url=openai_api_url,
             )
             env["GITHUB_COPILOT_API_URL"] = openai_api_url
             env["OPENAI_TARGET_API_URL"] = openai_api_url
@@ -7226,6 +7367,15 @@ def copilot(
             )
 
         if not native:
+            # Non-subscription OAuth keeps upstream's generic-host policy from
+            # #610. Subscription mode can use the endpoint returned by the Copilot
+            # token exchange, which is how Business accounts advertise their API
+            # host without requiring users to configure it manually.
+            openai_api_url = (
+                subscription_resolution.api_url
+                if subscription_resolution is not None
+                else resolve_copilot_api_url(client_bearer)
+            )
             env_wire_api = env.get("COPILOT_PROVIDER_WIRE_API")
             effective_wire_api = wire_api or (
                 env_wire_api
@@ -7235,8 +7385,20 @@ def copilot(
             env["COPILOT_PROVIDER_TYPE"] = "openai"
             # Per-project savings: the Copilot CLI cannot send custom headers, so
             # the project rides as a /p/<name> base-URL prefix the proxy strips.
-            env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
-                f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
+            env["COPILOT_PROVIDER_BASE_URL"] = _with_client_prefix(
+                _with_project_prefix(
+                    _with_copilot_upstream_prefix(
+                        f"{proxy_root or f'http://127.0.0.1:{port}'}/v1",
+                        (
+                            openai_api_url
+                            if proxy_root is not None
+                            or (subscription and openai_api_url != DEFAULT_API_URL)
+                            else None
+                        ),
+                    ),
+                    _project_name_from_cwd(),
+                ),
+                "copilot",
             )
             env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
             env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
@@ -7265,15 +7427,6 @@ def copilot(
                     else "COPILOT_AUTH_MODE=github-oauth"
                 ),
             ]
-            # Non-subscription OAuth keeps upstream's generic-host policy from
-            # #610. Subscription mode can use the endpoint returned by the Copilot
-            # token exchange, which is how Business accounts advertise their API
-            # host without requiring users to configure it manually.
-            openai_api_url = (
-                subscription_resolution.api_url
-                if subscription_resolution is not None
-                else resolve_copilot_api_url(client_bearer)
-            )
             env["GITHUB_COPILOT_API_URL"] = openai_api_url
             env["OPENAI_TARGET_API_URL"] = openai_api_url
             env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
@@ -7284,7 +7437,17 @@ def copilot(
             wire_api=wire_api,
             environ=env,
             project=_project_name_from_cwd(),
+            proxy_url=proxy_root,
         )
+        env["COPILOT_PROVIDER_BASE_URL"] = _with_client_prefix(
+            env["COPILOT_PROVIDER_BASE_URL"], "copilot"
+        )
+        env_vars_display = [
+            line
+            if not line.startswith("COPILOT_PROVIDER_BASE_URL=")
+            else f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}"
+            for line in env_vars_display
+        ]
 
         if not env.get("COPILOT_PROVIDER_API_KEY"):
             src = _copilot_provider_key_source(effective_provider_type)
@@ -7576,6 +7739,7 @@ def _prepare_codex_wrap_state(
     no_serena: bool,
     memory: bool,
     verbose: bool,
+    proxy_url: str | None = None,
     persistent_routing: bool = True,
 ) -> None:
     """Prepare the active Codex home for a wrap or prepare-only invocation."""
@@ -7608,7 +7772,9 @@ def _prepare_codex_wrap_state(
         # Codex starts a long-lived local MCP subprocess from config.toml.
         # If a previous wrap used another port, retrieval can silently point
         # at the wrong proxy while model traffic uses the right one.
-        _setup_headroom_mcp(CodexRegistrar(), port, verbose=verbose, force=True)
+        _setup_headroom_mcp(
+            CodexRegistrar(), port, proxy_url=proxy_url, verbose=verbose, force=True
+        )
     elif verbose:
         click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
@@ -7673,7 +7839,7 @@ def _prepare_codex_wrap_state(
     # NOTE: this must run BEFORE _inject_memory_mcp_config because it rewrites
     # the config file.  Re-inject MCP config after if memory is enabled.
     if persistent_routing:
-        _inject_codex_provider_config(port)
+        _inject_codex_provider_config(port, proxy_url=proxy_url)
         if memory:
             _inject_memory_mcp_config(os.environ.get("USER", os.environ.get("USERNAME", "default")))
 
@@ -7687,6 +7853,7 @@ def _run_codex_wrap(
     no_serena: bool,
     code_graph: bool,
     no_proxy: bool,
+    proxy_url: str | None,
     learn: bool,
     memory: bool,
     backend: str | None,
@@ -7701,6 +7868,22 @@ def _run_codex_wrap(
         ensure_proxy_dependencies()
 
     if prepare_only:
+        from headroom.cli import init as init_cli
+
+        codex_config_file, codex_backup_file = _codex_config_paths()
+        _snapshot_codex_config_if_unwrapped(codex_config_file, codex_backup_file)
+        normalized_proxy_url = init_cli._configure_codex_durable_setup(
+            global_scope=False,
+            profile=init_cli._runtime_profile(False),
+            port=port,
+            proxy_url=proxy_url,
+            install_headroom_mcp=not no_mcp,
+            serena=serena,
+            no_serena=no_serena,
+            no_tokensave=no_tokensave,
+            code_graph=code_graph,
+            verbose=verbose,
+        )
         _prepare_codex_wrap_state(
             port=port,
             no_mcp=no_mcp,
@@ -7709,6 +7892,8 @@ def _run_codex_wrap(
             no_serena=no_serena,
             memory=memory,
             verbose=verbose,
+            proxy_url=normalized_proxy_url,
+            persistent_routing=False,
         )
         return
 
@@ -7726,10 +7911,11 @@ def _run_codex_wrap(
         no_serena=no_serena,
         memory=memory,
         verbose=verbose,
+        proxy_url=proxy_url,
         persistent_routing=False,
     )
 
-    env, env_vars_display = _build_codex_launch_env(port, os.environ)
+    env, env_vars_display = _build_codex_launch_env(port, os.environ, proxy_url=proxy_url)
     env["CODEX_HOME"] = str(active_codex_home)
 
     def configure_codex_launch(
@@ -7743,6 +7929,7 @@ def _run_codex_wrap(
             port=actual_port,
             codex_args=current_args,
             environ=current_env,
+            proxy_url=proxy_url,
         )
 
     _launch_tool(
@@ -7782,6 +7969,12 @@ def _run_codex_wrap(
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
+    "--proxy-url",
+    default=None,
+    envvar="HEADROOM_PROXY_URL",
+    help="Existing Headroom proxy URL for provider and MCP routing.",
+)
+@click.option(
     "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to AGENTS.md)"
 )
 @click.option(
@@ -7809,6 +8002,7 @@ def codex(
     no_serena: bool,
     code_graph: bool,
     no_proxy: bool,
+    proxy_url: str | None,
     learn: bool,
     memory: bool,
     backend: str | None,
@@ -7842,6 +8036,7 @@ def codex(
         no_serena=no_serena,
         code_graph=code_graph,
         no_proxy=no_proxy,
+        proxy_url=proxy_url,
         learn=learn,
         memory=memory,
         backend=backend,

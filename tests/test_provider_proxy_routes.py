@@ -31,6 +31,34 @@ def _app() -> Any:
     )
 
 
+def test_client_and_project_prefixes_reach_openai_chat_handler(monkeypatch) -> None:
+    async def fake_handle(self, request):  # type: ignore[no-untyped-def]
+        return JSONResponse(
+            {
+                "path": request.url.path,
+                "client": request.headers.get("x-client"),
+                "headroom_client": request.headers.get("x-headroom-client"),
+                "project": get_current_project(),
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_chat", fake_handle)
+
+    with TestClient(_app()) as client:
+        response = client.post(
+            "/c/hermes/p/headroom/v1/chat/completions",
+            json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "ok"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "path": "/v1/chat/completions",
+        "client": None,
+        "headroom_client": "hermes",
+        "project": "headroom",
+    }
+
+
 def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> None:
     # This routing test uses reserved, intentionally unresolvable hostnames.
     # Explicitly allow them so the SSRF guard can remain fail-closed on DNS errors.
@@ -1126,6 +1154,103 @@ def test_v1_models_fetches_codex_registry_under_chatgpt_auth(monkeypatch) -> Non
             (["gpt-5.5", "gpt-5.3-codex-spark"],),
         ),
     ]
+
+
+def test_v1_models_fetches_openrouter_catalog_for_hermes_client_prefix(monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-headroom-owned-test")
+
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, str]]] = []
+
+        async def get(self, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append((url, dict(kwargs.get("headers", {}))))
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "deepseek/deepseek-v4-flash",
+                            "name": "DeepSeek: V4 Flash",
+                            "created": 1780000000,
+                            "pricing": {"prompt": "0.0000001"},
+                        },
+                        {"id": "z-ai/glm-5.2", "name": "Z.AI: GLM 5.2"},
+                        {"id": "openrouter/auto", "name": "OpenRouter Auto"},
+                    ]
+                },
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    async def fail_passthrough(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("Hermes model discovery must use the OpenRouter catalog")
+
+    with patch.object(HeadroomProxy, "handle_passthrough", fail_passthrough):
+        with TestClient(_app()) as client:
+            fake_http_client = FakeAsyncClient()
+            client.app.state.proxy.http_client = fake_http_client
+            response = client.get(
+                "/c/hermes/v1/models",
+                headers={
+                    "authorization": "Bearer hermes-placeholder-key",
+                    "x-api-key": "hermes-placeholder-key",
+                },
+            )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["object"] == "list"
+    assert [entry["id"] for entry in payload["data"]] == [
+        "openrouter/deepseek/deepseek-v4-flash",
+        "openrouter/z-ai/glm-5.2",
+        "openrouter/auto",
+    ]
+    assert payload["data"][0]["object"] == "model"
+    assert payload["data"][0]["created"] == 1780000000
+    assert payload["data"][0]["owned_by"] == "openrouter"
+    assert payload["data"][0]["pricing"] == {"prompt": "0.0000001"}
+    assert fake_http_client.calls == [
+        (
+            "https://openrouter.ai/api/v1/models",
+            {
+                "accept": "application/json",
+                "authorization": "Bearer sk-or-headroom-owned-test",
+            },
+        )
+    ]
+
+
+def test_v1_models_gets_openrouter_detail_for_prefixed_hermes_model(monkeypatch) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    class FakeAsyncClient:
+        async def get(self, url, **kwargs):  # type: ignore[no-untyped-def]
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "deepseek/deepseek-v4-flash", "name": "DeepSeek: V4 Flash"},
+                        {"id": "z-ai/glm-5.2", "name": "Z.AI: GLM 5.2"},
+                    ]
+                },
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        client.app.state.proxy.http_client = FakeAsyncClient()
+        ok = client.get("/c/hermes/v1/models/openrouter/deepseek/deepseek-v4-flash")
+        missing = client.get("/c/hermes/v1/models/openrouter/not-real")
+
+    assert ok.status_code == 200
+    assert ok.json()["id"] == "openrouter/deepseek/deepseek-v4-flash"
+    assert ok.json()["name"] == "DeepSeek: V4 Flash"
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "model_not_found"
+    assert missing.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_v1_models_falls_back_to_synthetic_list_under_chatgpt_auth(monkeypatch) -> None:

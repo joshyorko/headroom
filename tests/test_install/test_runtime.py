@@ -9,8 +9,10 @@ from pathlib import Path
 
 import pytest
 
+import headroom.install.runtime as runtime_mod
 from headroom.install.models import DeploymentManifest, InstallPreset
 from headroom.install.runtime import (
+    _checkout_headroom_script,
     _clear_pid,
     _deployment_env,
     _mount_source,
@@ -21,6 +23,7 @@ from headroom.install.runtime import (
     acquire_runtime_start_lock,
     build_runtime_command,
     resolve_headroom_command,
+    resolve_headroom_config_command,
     run_foreground,
     runtime_ownership,
     runtime_status,
@@ -397,7 +400,13 @@ def test_build_runtime_command_for_docker_does_not_duplicate_entrypoint(
     assert container_args[2:] == ["--port", "8787", "--backend", "anthropic"]
 
 
-def test_resolve_headroom_command_prefers_headroom_binary(monkeypatch) -> None:
+def test_resolve_headroom_command_prefers_installed_headroom_binary(
+    monkeypatch, tmp_path: Path
+) -> None:
+    script = tmp_path / "headroom"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setattr("headroom.install.runtime._checkout_headroom_script", lambda: script)
     monkeypatch.setattr(
         "shutil.which", lambda name: "/usr/bin/headroom" if name == "headroom" else None
     )
@@ -405,7 +414,40 @@ def test_resolve_headroom_command_prefers_headroom_binary(monkeypatch) -> None:
     assert resolve_headroom_command() == ["/usr/bin/headroom"]
 
 
-def test_resolve_headroom_command_falls_back_to_python_module(monkeypatch) -> None:
+def test_resolve_headroom_config_command_prefers_portable_headroom_name(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/var/home/user/.local/bin/headroom" if name == "headroom" else None,
+    )
+
+    assert resolve_headroom_config_command() == ["headroom"]
+
+
+def test_checkout_headroom_script_uses_windows_venv_scripts_dir(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_mod, "_is_windows", lambda: True)
+
+    script = _checkout_headroom_script()
+
+    assert script.name == "headroom.exe"
+    assert script.parent.name == "Scripts"
+
+
+def test_resolve_headroom_command_uses_checkout_script_when_no_installed_binary(
+    monkeypatch, tmp_path: Path
+) -> None:
+    script = tmp_path / "headroom"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setattr("headroom.install.runtime._checkout_headroom_script", lambda: script)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
+    assert resolve_headroom_command() == [str(script)]
+
+
+def test_resolve_headroom_command_falls_back_to_python_module(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        "headroom.install.runtime._checkout_headroom_script", lambda: tmp_path / "missing-headroom"
+    )
     monkeypatch.setattr("shutil.which", lambda name: None)
     monkeypatch.setattr("headroom.install.runtime.sys.executable", "/usr/bin/python")
     assert resolve_headroom_command() == ["/usr/bin/python", "-m", "headroom.cli"]
@@ -1248,6 +1290,9 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
 
     _write_pid("default", 125)
     monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: False)
+    monkeypatch.setattr(
+        "headroom.install.runtime.os.kill", lambda pid, sig: (_ for _ in ()).throw(OSError())
+    )
     assert runtime_status(python_manifest) == "stopped"
     assert _read_pid("default") is None
 

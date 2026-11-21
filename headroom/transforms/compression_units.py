@@ -363,13 +363,13 @@ def compress_unit_with_router(
         and unit.item_type == "local_shell_call_output"
         and _is_structured_shell_output(unit.text)
         and strategy in _LOSSY_UNMARKED_STRATEGIES
+        and not _CCR_MARKER_RE.search(replacement)
     ):
-        if not _CCR_MARKER_RE.search(replacement):
-            return _with_reason(
-                strategy=strategy,
-                router_result=router_result,
-                reason="lossy_unrecoverable_tool_output",
-            )
+        return _with_reason(
+            strategy=strategy,
+            router_result=router_result,
+            reason="lossy_unrecoverable_tool_output",
+        )
 
     return UnitCompressionResult(
         original=unit.text,

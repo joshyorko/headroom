@@ -3,6 +3,7 @@
 This module contains performance benchmarks for Headroom transforms:
 - SmartCrusher: Statistical tool output compression
 - CacheAligner: Cache-aligned prefix optimization
+- RollingWindow: Token budget management
 
 Performance Targets:
     SmartCrusher:
@@ -13,6 +14,10 @@ Performance Targets:
     CacheAligner:
         - Date extraction: < 1ms
         - Hash computation: < 0.5ms
+
+    RollingWindow:
+        - 50 turns: < 5ms
+        - 200 turns: < 20ms
 
 Run with:
     pytest benchmarks/bench_transforms.py --benchmark-only -v
@@ -369,7 +374,7 @@ class TestTransformPipelineBenchmarks:
     """Benchmarks for full transform pipeline.
 
     Tests the complete flow:
-    CacheAligner -> SmartCrusher
+    CacheAligner -> SmartCrusher -> RollingWindow
 
     Expected performance:
     - Simple conversation: < 5ms

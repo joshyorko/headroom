@@ -983,7 +983,7 @@ class TestNewlineContract:
             "CLAUDE.md",  # legacy-migration rewrite
             "MEMORY.md",  # ClaudeCodeWriter memory target
             "AGENTS.md",  # CodexWriter context target
-            "instructions.md",  # CodexWriter memory target
+            "AGENTS.headroom.md",  # CodexWriter complete archive
             "GEMINI.md",  # GeminiWriter
             "GROK.md",  # GrokWriter
         }

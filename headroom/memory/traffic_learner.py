@@ -154,6 +154,14 @@ class ExtractedPattern:
             self.content_hash = hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
+@dataclass(frozen=True)
+class _QueuedPattern:
+    pattern: ExtractedPattern
+    user_id: str
+    backend: Any | None
+    dedup_hash: str
+
+
 def _normalize_hash_key(
     category: PatternCategory,
     content: str,
@@ -525,6 +533,7 @@ class TrafficLearner:
         # the least-recently-corroborated pending pattern is safe: if it recurs
         # it simply restarts accumulation.
         self._pattern_counts: OrderedDict[str, tuple[ExtractedPattern, int]] = OrderedDict()
+        self._pattern_targets: dict[str, tuple[str, Any | None]] = {}
 
         # Dedup: hashes of patterns already saved to DB
         self._saved_hashes: set[str] = set()
@@ -540,7 +549,7 @@ class TrafficLearner:
         self._requests_processed = 0
 
         # Background save queue
-        self._save_queue: asyncio.Queue[ExtractedPattern] = asyncio.Queue(maxsize=100)
+        self._save_queue: asyncio.Queue[_QueuedPattern] = asyncio.Queue(maxsize=100)
         # Keep queued/in-flight dedup separate from confirmed persistence.
         self._queued_patterns: dict[str, ExtractedPattern] = {}
         # Keep an attempt's idempotency key until its whole evidence total is durable.
@@ -784,6 +793,8 @@ class TrafficLearner:
         tool_output: str,
         is_error: bool,
         agent_type: str = "unknown",
+        user_id: str | None = None,
+        backend: Any | None = None,
     ) -> None:
         """Process a tool call result from proxy traffic.
 
@@ -813,12 +824,12 @@ class TrafficLearner:
         if not is_error and self._tool_history:
             patterns = self._extract_error_recovery(entry)
             for pattern in patterns:
-                await self._accumulate(pattern)
+                await self._accumulate(pattern, user_id=user_id, backend=backend)
 
         # Extract environment patterns
         env_patterns = self._extract_environment(entry)
         for pattern in env_patterns:
-            await self._accumulate(pattern)
+            await self._accumulate(pattern, user_id=user_id, backend=backend)
 
         # Add to history (bounded)
         self._tool_history.append(entry)
@@ -829,6 +840,8 @@ class TrafficLearner:
         self,
         messages: list[dict[str, Any]],
         agent_type: str = "unknown",
+        user_id: str | None = None,
+        backend: Any | None = None,
     ) -> None:
         """Process message content for preference/architecture patterns.
 
@@ -847,7 +860,8 @@ class TrafficLearner:
                 content = " ".join(
                     block.get("text", "")
                     for block in content
-                    if isinstance(block, dict) and block.get("type") == "text"
+                    if isinstance(block, dict)
+                    and block.get("type") in {"text", "input_text", "output_text"}
                 )
             if not content:
                 continue
@@ -858,7 +872,7 @@ class TrafficLearner:
                     continue
                 patterns = self._extract_preferences(canonical)
                 for pattern in patterns:
-                    await self._accumulate(pattern)
+                    await self._accumulate(pattern, user_id=user_id, backend=backend)
 
     def get_stats(self) -> dict[str, Any]:
         """Get learner statistics."""
@@ -1277,11 +1291,53 @@ class TrafficLearner:
     # Pattern Accumulation & Persistence
     # =========================================================================
 
-    async def _accumulate(self, pattern: ExtractedPattern) -> None:
+    def _dedup_hash(
+        self,
+        content_hash: str,
+        *,
+        user_id: str | None = None,
+        backend: Any | None = None,
+    ) -> str:
+        """Return the in-process dedup key for one persistence scope.
+
+        The legacy default scope keeps the raw content hash for backwards
+        compatibility with persisted-state hydration and tests. Request-scoped
+        learning includes both the effective user id and backend identity so
+        one user's evidence cannot suppress another user's save.
+        """
+
+        effective_user_id = user_id or self._user_id
+        effective_backend = backend if backend is not None else self._backend
+        if effective_user_id == self._user_id and effective_backend is self._backend:
+            return content_hash
+
+        db_path = _resolve_backend_db_path(effective_backend)
+        if db_path is not None:
+            backend_key = f"db:{db_path}"
+        elif effective_backend is None:
+            backend_key = "backend:none"
+        else:
+            backend_key = f"backend:{type(effective_backend).__name__}:{id(effective_backend)}"
+        return f"{backend_key}|user:{effective_user_id}|{content_hash}"
+
+    async def _accumulate(
+        self,
+        pattern: ExtractedPattern,
+        *,
+        user_id: str | None = None,
+        backend: Any | None = None,
+    ) -> None:
         """Accumulate a pattern, saving when evidence threshold is met."""
         self._patterns_extracted += 1
         self._flush_dirty = True
-        h = pattern.content_hash
+        effective_user_id = user_id or self._user_id
+        effective_backend = backend if backend is not None else self._backend
+        h = self._dedup_hash(
+            pattern.content_hash,
+            user_id=effective_user_id,
+            backend=effective_backend,
+        )
+
         queued = self._queued_patterns.get(h)
         if queued is not None:
             queued.evidence_count += 1
@@ -1293,7 +1349,7 @@ class TrafficLearner:
         if h in self._saved_hashes:
             memory_id = self._persisted_ids.get(h)
             if memory_id is not None:
-                await self._bump_persisted_evidence(memory_id)
+                await self._bump_persisted_evidence(memory_id, backend=effective_backend)
             return
 
         # Accumulate evidence
@@ -1309,7 +1365,9 @@ class TrafficLearner:
             if len(self._pattern_counts) >= self._max_pending_patterns:
                 evicted, _ = self._pattern_counts.popitem(last=False)
                 self._save_tokens.pop(evicted, None)
+                self._pattern_targets.pop(evicted, None)
             self._pattern_counts[h] = (pattern, 1)
+            self._pattern_targets[h] = (effective_user_id, effective_backend)
 
         # Check if evidence threshold met
         pattern, count = self._pattern_counts[h]
@@ -1319,31 +1377,40 @@ class TrafficLearner:
         if count >= self._min_evidence:
             pattern.evidence_count = count
             try:
-                self._save_queue.put_nowait(pattern)
+                queued_user_id, queued_backend = self._pattern_targets[h]
+                self._save_queue.put_nowait(
+                    _QueuedPattern(pattern, queued_user_id, queued_backend, h)
+                )
             except asyncio.QueueFull:
                 logger.debug("Traffic learner save queue full, keeping pending evidence")
                 return
             del self._pattern_counts[h]
             self._queued_patterns[h] = pattern
 
-    def _restore_pattern(self, pattern: ExtractedPattern) -> None:
+    def _restore_pattern(self, pattern: ExtractedPattern, dedup_hash: str | None = None) -> None:
         """Keep corroborated evidence eligible after an unsuccessful save."""
-        h = pattern.content_hash
+        h = dedup_hash or pattern.content_hash
         if (
             h not in self._pattern_counts
             and len(self._pattern_counts) >= self._max_pending_patterns
         ):
             evicted, _ = self._pattern_counts.popitem(last=False)
             self._save_tokens.pop(evicted, None)
+            self._pattern_targets.pop(evicted, None)
         self._pattern_counts[h] = (pattern, pattern.evidence_count)
         self._pattern_counts.move_to_end(h)
         self._flush_dirty = True
 
     async def _find_persisted_pattern(
-        self, pattern: ExtractedPattern, save_token: str
+        self,
+        pattern: ExtractedPattern,
+        save_token: str,
+        *,
+        user_id: str | None = None,
+        backend: Any | None = None,
     ) -> tuple[str, int] | None:
         """Resolve an uncertain local save before another insert is allowed."""
-        db_path = _resolve_backend_db_path(self._backend)
+        db_path = _resolve_backend_db_path(backend if backend is not None else self._backend)
         if db_path is None or not db_path.exists():
             return None
 
@@ -1359,7 +1426,7 @@ class TrafficLearner:
                     "AND json_extract(metadata, '$.learner_save_token') = ? "
                     "ORDER BY json_extract(metadata, '$.last_seen_at') DESC, id DESC LIMIT 1",
                     (
-                        self._user_id,
+                        user_id or self._user_id,
                         pattern.content,
                         pattern.category.value,
                         pattern.content_hash,
@@ -1372,11 +1439,13 @@ class TrafficLearner:
 
         return await asyncio.to_thread(_read)
 
-    async def _save_pattern(self, pattern: ExtractedPattern) -> None:
-        h = pattern.content_hash
+    async def _save_pattern(self, queued: _QueuedPattern) -> None:
+        pattern = queued.pattern
+        h = queued.dedup_hash
+        backend = queued.backend if queued.backend is not None else self._backend
         try:
-            if self._backend is None:
-                self._restore_pattern(pattern)
+            if backend is None:
+                self._restore_pattern(pattern, h)
                 return
             existing: tuple[str, int] | None = None
             save_token = self._save_tokens.get(h)
@@ -1384,13 +1453,15 @@ class TrafficLearner:
                 save_token = uuid.uuid4().hex
                 self._save_tokens[h] = save_token
             else:
-                existing = await self._find_persisted_pattern(pattern, save_token)
+                existing = await self._find_persisted_pattern(
+                    pattern, save_token, user_id=queued.user_id, backend=backend
+                )
             if existing is None:
                 saved_count = pattern.evidence_count
                 now_iso = datetime.now(timezone.utc).isoformat()
-                memory = await self._backend.save_memory(
+                memory = await backend.save_memory(
                     content=pattern.content,
-                    user_id=self._user_id,
+                    user_id=queued.user_id,
                     importance=pattern.importance,
                     metadata={
                         "source": "traffic_learner",
@@ -1399,7 +1470,7 @@ class TrafficLearner:
                         "first_seen_at": now_iso,
                         "last_seen_at": now_iso,
                         **pattern.metadata,
-                        "content_hash": h,
+                        "content_hash": pattern.content_hash,
                         "learner_save_token": save_token,
                         "learner_saved_evidence": saved_count,
                     },
@@ -1421,18 +1492,20 @@ class TrafficLearner:
                     count=0,
                     last_seen_at=last_seen if isinstance(last_seen, str) else None,
                     save_attempt=(save_token, target_count),
+                    backend=backend,
                 )
                 if not updated:
                     raise RuntimeError("Learner evidence update was not persisted")
                 saved_count = target_count
                 refresh = False
         except (Exception, asyncio.CancelledError):
-            self._restore_pattern(pattern)
+            self._restore_pattern(pattern, h)
             raise
         else:
             self._patterns_saved += 1
             self._saved_hashes.add(h)
             self._save_tokens.pop(h, None)
+            self._pattern_targets.pop(h, None)
             if len(self._saved_hashes) > self._dedup_window:
                 self._persisted_ids.pop(self._saved_hashes.pop(), None)
             if memory_id is not None and h in self._saved_hashes:
@@ -1555,6 +1628,7 @@ class TrafficLearner:
                 self._pattern_counts.items(),
                 ((h, (p, p.evidence_count)) for h, p in self._queued_patterns.items()),
             )
+            if h == pattern.content_hash
         ]
 
         def _write() -> None:
@@ -1590,7 +1664,7 @@ class TrafficLearner:
         for entry in entries[: self._max_pending_patterns]:
             try:
                 h = entry["content_hash"]
-                if not h or h in self._pattern_counts:
+                if not isinstance(h, str) or not h or "|user:" in h or h in self._pattern_counts:
                     continue
                 save_token = entry.get("save_token")
                 if not isinstance(save_token, str) or not save_token:
@@ -1609,6 +1683,7 @@ class TrafficLearner:
                     content_hash=h,
                 )
                 self._pattern_counts[h] = (pattern, max(1, int(entry.get("count", 1))))
+                self._pattern_targets[h] = (self._user_id, self._backend)
                 if save_token is not None:
                     self._save_tokens[h] = save_token
             except Exception:
@@ -1621,9 +1696,10 @@ class TrafficLearner:
         last_seen_at: str | None = None,
         *,
         save_attempt: tuple[str, int] | None = None,
+        backend: Any | None = None,
     ) -> bool:
         """Atomically add evidence to a persisted row and refresh its indexes."""
-        db_path = _resolve_backend_db_path(self._backend)
+        db_path = _resolve_backend_db_path(backend if backend is not None else self._backend)
         if db_path is None or not db_path.exists():
             return False
 
@@ -1673,7 +1749,9 @@ class TrafficLearner:
             logger.debug("Traffic learner evidence bump failed for %s: %s", memory_id, e)
             return False
 
-        refresh = getattr(self._backend, "refresh_memory_indexes", None)
+        refresh = getattr(
+            backend if backend is not None else self._backend, "refresh_memory_indexes", None
+        )
         if updated and refresh is not None:
             try:
                 await refresh(memory_id)

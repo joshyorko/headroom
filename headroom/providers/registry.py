@@ -293,10 +293,10 @@ def create_proxy_backend(
         preflight_backend(backend)
     try:
         backend_cls = litellm_backend_cls or _load_litellm_backend()
-        instance = cast(
-            "Backend",
-            backend_cls(provider=provider, region=bedrock_region, profile_name=bedrock_profile),
-        )
+        backend_kwargs: dict[str, Any] = {"provider": provider, "region": bedrock_region}
+        if bedrock_profile:
+            backend_kwargs["profile_name"] = bedrock_profile
+        instance = cast("Backend", backend_cls(**backend_kwargs))
         logger.info("LiteLLM backend enabled (provider=%s, region=%s)", provider, bedrock_region)
         return instance
     except ImportError as exc:

@@ -277,7 +277,7 @@ class _TomlMarkerRegistrar(MCPRegistrar):
         if not raw.strip():
             return None
         try:
-            data = loads_codex_config(fsutil.read_text(self._config_file))
+            data = loads_codex_config(raw)
         except (tomllib.TOMLDecodeError, OSError) as exc:
             return f"{self._config_file} is not valid TOML ({exc})"
         if not isinstance(data, dict):
@@ -336,14 +336,28 @@ class CodexRegistrar(_TomlMarkerRegistrar):
     name = "codex"
     display_name = "OpenAI Codex CLI"
 
-    def __init__(self, *, home_dir: Path | None = None) -> None:
-        if home_dir is not None:
+    def __init__(
+        self,
+        *,
+        home_dir: Path | None = None,
+        scope: str = "user",
+        project_dir: Path | None = None,
+    ) -> None:
+        if scope not in ("user", "project"):
+            raise ValueError(f"scope must be 'user' or 'project', got {scope!r}")
+        self._scope = scope
+        if scope == "project":
+            config_dir = (project_dir if project_dir is not None else Path.cwd()) / ".codex"
+        elif home_dir is not None:
             config_dir = home_dir / ".codex"
         else:
             from headroom.install.paths import codex_home_dir
 
             config_dir = codex_home_dir()
         super().__init__(config_dir)
+
+    def detect(self) -> bool:
+        return self._scope == "project" or super().detect()
 
 
 # ----------------------------------------------------------------------

@@ -24,16 +24,6 @@ run_act() {
   done
 }
 
-run_act act workflow_dispatch -W .github/workflows/release.yml -e .github/act/dry-run.json -n
-# release.yml's main trigger is now `release: published` (release-please
-# emits this event when its release PR is merged). The earlier `push`
-# trigger on main was removed in PR #495 to gate PyPI uploads behind
-# the bot's release-PR pattern. Simulate the new trigger here so the
-# validation step exercises the same code path CI actually fires on.
-run_act act release -W .github/workflows/release.yml -e .github/act/release-published.json -n
-run_act act push -W .github/workflows/release-please.yml -e .github/act/push-feat.json -n
-run_act act pull_request_target -W .github/workflows/pr-health.yml -e .github/act/pr-governance-invalid.json -n
-run_act act pull_request_target -W .github/workflows/pr-health.yml -e .github/act/pr-governance-valid.json -n
 run_act act pull_request -W .github/workflows/docs.yml -n
 run_act act workflow_dispatch -W .github/workflows/docs.yml -n
 run_act act workflow_dispatch -W .github/workflows/docker.yml -e .github/act/docker-version.json -n

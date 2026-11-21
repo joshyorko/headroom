@@ -179,10 +179,6 @@ def load_manifest(profile: str = "default") -> DeploymentManifest | None:
     path = manifest_path(profile)
     if not path.exists():
         return None
-    # A present-but-corrupt manifest (partial write, hand-edit, schema drift)
-    # must not crash callers with a raw traceback — every install lifecycle
-    # command and the auto-run `init hook ensure` route through here. Raise a
-    # typed error so callers can report cleanly or degrade gracefully.
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:

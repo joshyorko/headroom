@@ -26,7 +26,7 @@ def _debug_dump_mode(config: Any) -> str:
     """Return the diagnostic-dump mode for upstream (>=400) errors.
 
     - "off"      : nothing written (default, and forced in stateless mode)
-    - "redacted" : structure, roles, and lengths only — content elided
+    - "redacted" : structure, roles, and lengths only - content elided
                    (``HEADROOM_DEBUG_DUMP=1``/``true``/``on``/``redacted``)
     - "full"     : everything including content (``HEADROOM_DEBUG_DUMP=full``)
     """
@@ -41,11 +41,10 @@ def _debug_dump_mode(config: Any) -> str:
 
 
 def _redact_debug_value(value: Any, _max_len: int = 80) -> Any:
-    """Recursively elide long strings (likely prompt/tool content) while keeping
-    structure, roles, type tags, ids, and other short fields for debugging.
+    """Recursively elide long strings while keeping structure and short fields.
 
     Note: short strings (<= ``_max_len``) are preserved, so the redacted tier is
-    not a guarantee against leaking very short sensitive values — it is a
+    not a guarantee against leaking very short sensitive values - it is a
     best-effort convenience. The default ("off") writes nothing at all.
     """
     if isinstance(value, str):

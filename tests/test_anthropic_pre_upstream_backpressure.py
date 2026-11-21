@@ -9,7 +9,7 @@ Covers:
 - N+1 contention (only the (N+1)th waiter records ``pre_upstream_wait`` > 0)
 - strict serialization under concurrency=1
 - unbounded mode (``anthropic_pre_upstream_concurrency=0`` -> no semaphore)
-- acquire timeout fails fast with passthrough compression skip
+- acquire timeout fails fast with ``503`` + ``Retry-After``
 - memory-context timeout fails open without leaking the semaphore
 - exception-safety (semaphore released when the critical section raises)
 - ``/livez`` unaffected under Anthropic backpressure
@@ -687,7 +687,7 @@ def test_acquire_timeout_degrades_to_passthrough(stage_log_capture):
     payloads = _parse_all_stage_logs(stage_log_capture)
     assert len(payloads) == 1
     assert "pre_upstream_wait" in payloads[0]["stages"]
-    assert payloads[0]["stages"]["pre_upstream_wait"] >= 0.0
+    assert payloads[0]["stages"]["pre_upstream_wait"] >= 10.0
 
 
 def test_memory_context_timeout_fails_open_and_releases_semaphore():

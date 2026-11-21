@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from headroom.proxy.semantic_cache import SemanticCache
 from headroom.proxy.semantic_cache_key_policy import (
     compute_semantic_cache_key,
@@ -78,3 +80,22 @@ def test_semantic_cache_private_key_wrapper_delegates_to_policy() -> None:
         partition="p_test",
         **kwargs,
     )
+
+
+@pytest.mark.asyncio
+async def test_semantic_cache_round_trip_uses_response_shaping_fields() -> None:
+    cache = SemanticCache()
+    tools = [{"name": "read"}]
+
+    await cache.set(
+        MESSAGES,
+        MODEL,
+        b'{"ok":true}',
+        {"content-type": "application/json"},
+        partition="p_test",
+        tools=tools,
+    )
+
+    assert await cache.get(MESSAGES, MODEL, partition="p_test", tools=tools) is not None
+    assert await cache.get(MESSAGES, MODEL, partition="p_test", tools=[{"name": "write"}]) is None
+    assert await cache.get(MESSAGES, MODEL, partition="other", tools=tools) is None

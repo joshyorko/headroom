@@ -56,7 +56,7 @@ a silent degradation. Interactive paths get that from the CLI boundary in
 loaders translate it into their own "model unavailable"; background pollers
 call :func:`note_refusal` and stop.
 
-Kept at the top level (depends only on the stdlib) so any layer — telemetry,
+Kept at the top level (depends only on the stdlib) so any layer - telemetry,
 proxy, model code — can import it without creating a package cycle.
 """
 

@@ -472,6 +472,25 @@ class TestTrafficLearner:
         assert stats["patterns_extracted"] >= 1
 
     @pytest.mark.asyncio
+    async def test_preference_from_openai_responses_input_text_blocks(
+        self, learner: TrafficLearner
+    ):
+        """OpenAI Responses ``input_text`` blocks should feed --learn."""
+        await learner.on_messages(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "No, use httpx not requests."},
+                    ],
+                },
+            ]
+        )
+
+        stats = learner.get_stats()
+        assert stats["patterns_extracted"] >= 1
+
+    @pytest.mark.asyncio
     async def test_evidence_accumulation(self):
         """Test that patterns need min_evidence before saving."""
         learner = TrafficLearner(backend=None, min_evidence=3)
@@ -1064,6 +1083,7 @@ class _FakeBackend:
 
         self._config = _types.SimpleNamespace(db_path=str(db_path))
         self._db_path = str(db_path)
+        self.saved_user_ids: list[str] = []
         self.refreshed_ids = []
 
     async def refresh_memory_indexes(self, memory_id: str):
@@ -1082,6 +1102,7 @@ class _FakeBackend:
         import types as _types
         import uuid
 
+        self.saved_user_ids.append(user_id)
         mid = str(uuid.uuid4())
         conn = _sql.connect(self._db_path)
         try:
@@ -1775,6 +1796,83 @@ class TestEvidencePersistence:
         assert len(rows) == 1
         assert rows[0][0] == "seed-id"
         assert rows[0][2]["evidence_count"] == 4
+
+    @pytest.mark.asyncio
+    async def test_same_pattern_persists_per_request_user_scope(self, tmp_path):
+        """A process-wide learner must not dedup one user's evidence against another's."""
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, user_id="default", min_evidence=2)
+        await learner.start()
+
+        def mk() -> ExtractedPattern:
+            return ExtractedPattern(
+                category=PatternCategory.PREFERENCE,
+                content="User preference: use httpx rather than requests.",
+                importance=0.7,
+            )
+
+        for _ in range(2):
+            await learner._accumulate(mk(), user_id="alice")
+        await _wait_for_saved(learner, 1, db)
+
+        for _ in range(2):
+            await learner._accumulate(mk(), user_id="bob")
+        await _wait_for_saved(learner, 2, db)
+
+        await learner.stop()
+
+        assert backend.saved_user_ids == ["alice", "bob"]
+
+    @pytest.mark.asyncio
+    async def test_scoped_lru_eviction_preserves_targets_and_persistence_scope(self, tmp_path):
+        """LRU eviction must remove scoped targets without misrouting later saves."""
+        db_one = tmp_path / "one.db"
+        db_two = tmp_path / "two.db"
+        _init_db(db_one)
+        _init_db(db_two)
+        backend_one = _FakeBackend(db_one)
+        backend_two = _FakeBackend(db_two)
+        learner = TrafficLearner(
+            backend=backend_one,
+            user_id="default",
+            min_evidence=2,
+            max_pending_patterns=2,
+        )
+        await learner.start()
+
+        def mk(content: str) -> ExtractedPattern:
+            return ExtractedPattern(
+                category=PatternCategory.PREFERENCE,
+                content=content,
+                importance=0.7,
+            )
+
+        first = mk("first scoped preference")
+        surviving_one = mk("surviving preference in backend one")
+        surviving_two = mk("surviving preference in backend two")
+
+        await learner._accumulate(first, user_id="alice", backend=backend_one)
+        await learner._accumulate(surviving_one, user_id="carol", backend=backend_one)
+        await learner._accumulate(surviving_two, user_id="bob", backend=backend_two)
+        first_scope = learner._dedup_hash(first.content_hash, user_id="alice", backend=backend_one)
+        assert first_scope not in learner._pattern_counts
+        assert first_scope not in learner._pattern_targets
+
+        await learner._accumulate(surviving_one, user_id="carol", backend=backend_one)
+        await learner._accumulate(surviving_two, user_id="bob", backend=backend_two)
+        await _wait_for_saved(learner, 1, db_one)
+        await _wait_for_saved(learner, 1, db_two)
+
+        # The evicted scoped pattern can re-enter and must retain its new scope.
+        await learner._accumulate(first, user_id="alice", backend=backend_one)
+        await learner._accumulate(first, user_id="alice", backend=backend_one)
+        await _wait_for_saved(learner, 2, db_one)
+        await learner.stop()
+
+        assert backend_one.saved_user_ids == ["carol", "alice"]
+        assert backend_two.saved_user_ids == ["bob"]
 
 
 # =============================================================================
@@ -3291,6 +3389,71 @@ class TestPendingStatePersistence:
         "content": "Use /usr/bin/python3 for system scripts.",
         "importance": 0.6,
     }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("different_backend", [False, True])
+    async def test_request_scope_is_not_written_to_default_sidecar(
+        self, tmp_path, different_backend
+    ):
+        import json as _json
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, user_id="default", min_evidence=3)
+        default_pattern = ExtractedPattern(**self._PATTERN_KWARGS)
+        await learner._accumulate(default_pattern)
+        private_pattern = ExtractedPattern(
+            category=PatternCategory.ENVIRONMENT,
+            content="Private workspace instruction",
+            importance=0.6,
+        )
+        await learner._accumulate(
+            private_pattern,
+            user_id="default" if different_backend else "alice",
+            backend=_FakeBackend(tmp_path / "private.db") if different_backend else backend,
+        )
+
+        await learner._save_pending_state()
+
+        sidecar = tmp_path / "pending_patterns.json"
+        stored = _json.loads(sidecar.read_text())["patterns"]
+        assert [entry["content_hash"] for entry in stored] == [default_pattern.content_hash]
+        assert private_pattern.content not in sidecar.read_text()
+        restarted = TrafficLearner(backend=backend, user_id="default", min_evidence=3)
+        await restarted._load_pending_state()
+        assert list(restarted._pattern_counts) == [default_pattern.content_hash]
+        assert restarted._pattern_targets[default_pattern.content_hash] == ("default", backend)
+
+    @pytest.mark.asyncio
+    async def test_scoped_sidecar_entry_is_not_rebound_to_default_user(self, tmp_path):
+        import json as _json
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        learner = TrafficLearner(backend=_FakeBackend(db), user_id="default", min_evidence=3)
+        private_pattern = ExtractedPattern(**self._PATTERN_KWARGS)
+        scoped_hash = learner._dedup_hash(private_pattern.content_hash, user_id="alice")
+        (tmp_path / "pending_patterns.json").write_text(
+            _json.dumps(
+                {
+                    "version": 1,
+                    "patterns": [
+                        {
+                            "category": private_pattern.category.value,
+                            "content": private_pattern.content,
+                            "content_hash": scoped_hash,
+                            "count": 2,
+                        }
+                    ],
+                }
+            )
+        )
+
+        await learner._load_pending_state()
+
+        assert learner.get_stats()["pending_patterns"] == 0
+        assert learner._pattern_targets == {}
 
     @pytest.mark.asyncio
     async def test_pending_evidence_survives_restart(self, tmp_path):

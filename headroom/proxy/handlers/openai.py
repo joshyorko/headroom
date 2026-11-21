@@ -263,6 +263,7 @@ def _strip_codex_lite_metadata(raw_msg: str) -> str:
 
 
 _OPENAI_CHAT_COMPLETIONS_PATH = "/chat/completions"
+_OPENROUTER_MODEL_PREFIX = "openrouter/"
 _OPENAI_RESPONSES_PATH = "/responses"
 _OPENAI_ORIGINAL_PATH_HEADER = "x-headroom-original-path"
 _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
@@ -579,6 +580,44 @@ def _resolve_openai_chat_handler_path(base_url: str, model: str | None) -> str:
     if is_copilot_api_url(base_url) and model_prefers_responses_api(model):
         return _OPENAI_RESPONSES_PATH
     return _OPENAI_CHAT_COMPLETIONS_PATH
+
+
+def _is_openrouter_model(model: Any) -> bool:
+    return isinstance(model, str) and model.strip().lower().startswith(_OPENROUTER_MODEL_PREFIX)
+
+
+def _select_openai_chat_backend(proxy: Any, model: Any) -> Any | None:
+    if not _is_openrouter_model(model):
+        return proxy.anthropic_backend
+
+    cache = getattr(proxy, "_openai_model_prefix_backends", None)
+    if cache is None:
+        cache = {}
+        proxy._openai_model_prefix_backends = cache
+    if "openrouter" not in cache:
+        from headroom.providers import registry as provider_registry
+
+        cache["openrouter"] = provider_registry.create_proxy_backend(
+            backend="openrouter",
+            anyllm_provider=getattr(proxy.config, "anyllm_provider", "openai"),
+            bedrock_region=getattr(proxy.config, "bedrock_region", None),
+            bedrock_profile=getattr(proxy.config, "bedrock_profile", None),
+            logger=logger,
+            openai_api_url=getattr(proxy.config, "openai_api_url", None),
+        )
+    return cache["openrouter"]
+
+
+def _openai_chat_backend_headers(
+    headers: dict[str, str], *, model: Any, client: str | None
+) -> dict[str, str]:
+    if client == "hermes" and _is_openrouter_model(model):
+        return {
+            key: value
+            for key, value in headers.items()
+            if key.lower() not in {"authorization", "x-api-key"}
+        }
+    return headers
 
 
 def _resolve_openai_chat_forward_path(
@@ -2218,11 +2257,50 @@ class OpenAIHandlerMixin:
             while len(cache) > _OPENAI_RESPONSES_UNIT_CACHE_MAX_ENTRIES:
                 cache.popitem(last=False)
 
+    async def _execute_responses_memory_tool(
+        self,
+        name: str,
+        args: dict[str, Any],
+        user_id: str,
+        request_context: Any = None,
+    ) -> str:
+        """Dispatch older adapters only when their backend can retain this scope."""
+        import inspect
+
+        handler = self.memory_handler
+        execute = handler._execute_memory_tool
+        if "request_context" in inspect.signature(execute).parameters:
+            return await execute(name, args, user_id, "openai", request_context=request_context)
+
+        unresolved = getattr(handler, "is_project_unresolved", None)
+        if callable(unresolved) and unresolved(request_context):
+            return json.dumps({"status": "skipped", "reason": "project_unresolved"})
+        await handler._ensure_initialized()
+        if handler._backend is None:
+            return json.dumps({"error": "Memory backend not initialized"})
+        effective_user_id = user_id
+        if request_context is not None:
+            resolve = getattr(handler, "_resolve_for_request", None)
+            if not callable(resolve):
+                return json.dumps(
+                    {"status": "skipped", "reason": "legacy_request_scope_unsupported"}
+                )
+            backend, _scope, effective_user_id = resolve(user_id, request_context)
+            if backend is None:
+                return json.dumps({"status": "skipped", "reason": "project_unresolved"})
+            if backend is not handler._backend:
+                return json.dumps(
+                    {"status": "skipped", "reason": "legacy_request_scope_unsupported"}
+                )
+        return await execute(name, args, effective_user_id, "openai")
+
     async def _observe_openai_responses_traffic(
         self,
         body: dict[str, Any],
         *,
         request_id: str,
+        user_id: str | None = None,
+        backend: Any | None = None,
         request_context: Any = None,
     ) -> None:
         """Feed one Responses HTTP request into the live traffic learner."""
@@ -2252,8 +2330,14 @@ class OpenAIHandlerMixin:
                     tool_input=tool_result["input"],
                     tool_output=tool_result["output"],
                     is_error=tool_result["is_error"],
+                    user_id=user_id,
+                    backend=backend,
                 )
-            await traffic_learner.on_messages(learner_messages)
+            await traffic_learner.on_messages(
+                learner_messages,
+                user_id=user_id,
+                backend=backend,
+            )
         except Exception as exc:
             logger.debug("[%s] Traffic learner (responses): %s", request_id, exc)
 
@@ -5154,6 +5238,9 @@ class OpenAIHandlerMixin:
             if _th_raw_saved is not None:
                 tokens_saved = net_hook_tool_saving(_th_raw_saved, tags, _th_saved)
 
+        chat_backend = _select_openai_chat_backend(self, model)
+        backend_headers = _openai_chat_backend_headers(headers, model=model, client=client)
+
         # Compatibility shim: GPT-5 / o-series chat models REJECT the legacy
         # `max_tokens` ("Unsupported parameter … Use 'max_completion_tokens'
         # instead"); gpt-4o/4.1 accept `max_completion_tokens` too. openai-
@@ -5236,12 +5323,13 @@ class OpenAIHandlerMixin:
 
         # Route through LiteLLM/any-llm backend if configured -- or through a
         # per-request one an extension asked for (see proxy/route_advice.py).
-        # anthropic is NOT native to this OpenAI-shape handler, so cross-family
-        # advice (e.g. Codex routed to a Claude model) resolves to a translating
-        # litellm backend; same-family (openai) advice still resolves to
-        # `self.anthropic_backend`, unchanged.
-        request_backend = resolver_for(self).for_request(
-            request, body=body, native_providers=("openai",), upstream_url=upstream_base_url
+        # Keep OpenRouter on its explicit chat backend; other requests use route advice.
+        request_backend = (
+            chat_backend
+            if _is_openrouter_model(model)
+            else resolver_for(self).for_request(
+                request, body=body, native_providers=("openai",), upstream_url=upstream_base_url
+            )
         )
         if request_backend is not None:
             try:
@@ -5259,7 +5347,7 @@ class OpenAIHandlerMixin:
                     # Streaming: use stream_openai_message() → SSE events
                     return await self._stream_openai_via_backend(
                         body,
-                        headers,
+                        backend_headers,
                         model,
                         request_id,
                         start_time,
@@ -5278,7 +5366,9 @@ class OpenAIHandlerMixin:
                     )
                 else:
                     # Non-streaming: use send_openai_message() → JSON
-                    backend_response = await request_backend.send_openai_message(body, headers)
+                    backend_response = await request_backend.send_openai_message(
+                        body, backend_headers
+                    )
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,
                         operation="proxy.request",
@@ -5354,7 +5444,7 @@ class OpenAIHandlerMixin:
 
                             continuation_headers = {
                                 k: v
-                                for k, v in headers.items()
+                                for k, v in backend_headers.items()
                                 if k.lower()
                                 not in (
                                     "content-encoding",
@@ -6400,28 +6490,6 @@ class OpenAIHandlerMixin:
         model = body.get("model", "unknown")
         stream = body.get("stream", False)
 
-        # /v1/responses uses provider-specific CompressionUnit extraction
-        # below, then routes mutable text through ContentRouter. The
-        # standalone Rust proxy has native item-aware handling, but the
-        # Python CLI runtime does not run that proxy today. We synthesise a
-        # minimal `messages` list purely for downstream memory injection and
-        # telemetry; list-typed `input` is consulted directly by the unit
-        # extraction helpers.
-        #
-        # Before anything reads `input`: drop web_search_call history from a
-        # request that declares no web_search tool (Codex local compaction).
-        # A bypass request asked for its bytes untouched, so it is left alone.
-        if not _bypass and _drop_undeclared_web_search_calls(body, request_id=request_id):
-            body_mutation_tracker.mark_mutated("responses_web_search_history")
-        input_data = body.get("input", "")
-        instructions = body.get("instructions")
-
-        messages: list[dict[str, Any]] = []
-        if instructions:
-            messages.append({"role": "system", "content": instructions})
-        if isinstance(input_data, str):
-            messages.append({"role": "user", "content": input_data})
-
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
@@ -6491,6 +6559,32 @@ class OpenAIHandlerMixin:
             request_id=request_id,
         )
         headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
+        if is_chatgpt_auth:
+            from headroom.subscription.credential_policy import is_configured_codex_operator
+
+            if is_configured_codex_operator(headers):
+                from headroom.subscription.codex_rate_limits import maybe_schedule_usage_poll
+
+                maybe_schedule_usage_poll(headers)
+        # Apply the ChatGPT backend workaround before reading input, using the
+        # same resolved headers that select the upstream endpoint below.
+        if (
+            is_chatgpt_auth
+            and not _bypass
+            and _drop_undeclared_web_search_calls(body, request_id=request_id)
+        ):
+            body_mutation_tracker.mark_mutated("responses_web_search_history")
+        input_data = body.get("input", "")
+        instructions = body.get("instructions")
+
+        # List input is handled by Responses compression units. These messages
+        # support memory injection and telemetry for instructions and text input.
+        messages: list[dict[str, Any]] = []
+        if instructions:
+            messages.append({"role": "system", "content": instructions})
+        if isinstance(input_data, str):
+            messages.append({"role": "user", "content": input_data})
+
         if is_chatgpt_auth:
             client = "codex"
         # Rate limiting
@@ -6621,6 +6715,11 @@ class OpenAIHandlerMixin:
         resolved_project_root_override = codex_project_root_override or (
             str(codex_project.cwd) if codex_project and codex_project.cwd else None
         )
+        # The shared learner cannot isolate project state. Scoped Codex turns
+        # skip learning until a project-scoped learner is available.
+        learn_responses_traffic = not codex_project_scope_required and (
+            codex_project is None or codex_project.reason == "metadata_missing"
+        )
         memory_client = (
             "codex"
             if is_chatgpt_auth
@@ -6697,14 +6796,28 @@ class OpenAIHandlerMixin:
                 project_root_override=resolved_project_root_override,
             )
 
-        # The shared learner cannot isolate project state. Scoped Codex turns
-        # skip learning until a project-scoped learner is available.
-        if not codex_project_scope_required and (
-            codex_project is None or codex_project.reason == "metadata_missing"
-        ):
+        learner_user_id = memory_user_id
+        if learn_responses_traffic and self.memory_handler and codex_project_features_allowed:
+            resolve_for_request = getattr(self.memory_handler, "_resolve_for_request", None)
+            if callable(resolve_for_request):
+                resolved_backend, _, learner_user_id = resolve_for_request(
+                    memory_user_id,
+                    memory_request_ctx,
+                )
+            else:
+                resolved_backend = getattr(self.memory_handler, "backend", None)
+        else:
+            resolved_backend = None
+
+        # Learn from the original client payload before memory context or
+        # compression mutates it. Carry the same request-scoped identity and
+        # backend used by memory routing.
+        if learn_responses_traffic:
             await self._observe_openai_responses_traffic(
                 body,
                 request_id=request_id,
+                user_id=learner_user_id,
+                backend=resolved_backend,
                 request_context=memory_request_ctx,
             )
 
@@ -7622,12 +7735,8 @@ class OpenAIHandlerMixin:
                                 except (json.JSONDecodeError, TypeError):
                                     args = {}
 
-                                result = await self.memory_handler._execute_memory_tool(
-                                    name,
-                                    args,
-                                    memory_user_id,
-                                    "openai",
-                                    request_context=memory_request_ctx,
+                                result = await self._execute_responses_memory_tool(
+                                    name, args, memory_user_id, memory_request_ctx
                                 )
 
                                 tool_outputs.append(
@@ -8431,12 +8540,11 @@ class OpenAIHandlerMixin:
 
                 Every response.create frame headed upstream (first frame, which
                 the HTTP fallback also replays, later frames, memory
-                continuations) passes through here, so it also drops
-                web_search_call history the frame declares no tool for (see
-                ``_drop_undeclared_web_search_calls``), except on a bypass
-                session, whose frames stay as the client sent them.
+                continuations) passes through here. For ChatGPT auth, drop
+                undeclared web_search_call history unless the session bypasses
+                mutations (see ``_drop_undeclared_web_search_calls``).
                 """
-                if not _ws_bypass:
+                if is_chatgpt_auth and not _ws_bypass:
                     raw_msg = _drop_undeclared_web_search_calls_from_frame(
                         raw_msg, request_id=request_id
                     )
@@ -12456,6 +12564,18 @@ class OpenAIHandlerMixin:
 
         start_time = _start_time if _start_time is not None else time.time()
         path = request.url.path
+        if provider == "openai" and not is_copilot_api_url(base_url):
+            authorization = next(
+                (value for key, value in request.headers.items() if key.lower() == "authorization"),
+                "",
+            )
+            scheme, _, token = authorization.partition(" ")
+            if scheme.lower() == "bearer" and token.strip().startswith(
+                ("tid_", "gho_", "ghs_", "ghp_", "github_pat_")
+            ):
+                from headroom.proxy.project_context import get_current_copilot_api_url
+
+                base_url = get_current_copilot_api_url() or base_url
         if provider == "anthropic" and endpoint_name == "models" and path.startswith("/v1/models/"):
             from headroom.providers.anthropic import sanitize_anthropic_model_id
 

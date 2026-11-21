@@ -5,7 +5,7 @@ changes, cache clears, stats resets) to the dedicated ``headroom.audit``
 logger. Operators capture this stream the same way they capture the proxy
 log; routing/retention is theirs to configure.
 
-Logger-only by design — it writes **no** dedicated file, so it is safe under
+Logger-only by design - it writes **no** dedicated file, so it is safe under
 ``HEADROOM_STATELESS`` (no filesystem writes) and respects whatever log sink
 the deployment already uses.
 """
@@ -41,8 +41,7 @@ def record_admin_action(
     status_code: int,
     details: dict[str, Any] | None = None,
 ) -> None:
-    """Emit a structured audit event. Never raises (audit must not break a
-    request); logs at WARNING on its own failure."""
+    """Emit a structured audit event without interrupting the request."""
     try:
         event: dict[str, Any] = {
             "event": "headroom_admin_audit",
@@ -55,5 +54,5 @@ def record_admin_action(
         if details:
             event["details"] = details
         audit_logger.info(json.dumps(event, ensure_ascii=False, default=str))
-    except Exception:  # noqa: BLE001 — auditing must never break the request
+    except Exception:  # noqa: BLE001 - auditing must never break the request
         audit_logger.warning("audit event emission failed", exc_info=True)

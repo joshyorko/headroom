@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import importlib
 import sys
 import types
@@ -19,6 +20,14 @@ from headroom.copilot_auth import DEFAULT_API_URL, CopilotSubscriptionTokenResol
 def _expected_project_prefix() -> str:
     """The /p/<name> prefix the wrap now embeds (launch-directory basename)."""
     return f"/p/{quote(Path.cwd().name, safe='')}"
+
+
+def _expected_copilot_prefix() -> str:
+    return f"/c/copilot{_expected_project_prefix()}"
+
+
+def _encoded_copilot_api_url(value: str) -> str:
+    return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
 
 
 @pytest.fixture(autouse=True)
@@ -62,6 +71,9 @@ def wrap_modules(monkeypatch: pytest.MonkeyPatch) -> tuple[types.ModuleType, cli
         name: sys.modules.get(name)
         for name in ("headroom.cli", "headroom.cli.main", "headroom.cli.wrap")
     }
+    saved_cli_main_attr = (
+        saved_modules["headroom.cli"].main if saved_modules["headroom.cli"] is not None else None
+    )
 
     fake_main_module = types.ModuleType("headroom.cli.main")
     fake_main_module.main = click.Group()
@@ -82,8 +94,7 @@ def wrap_modules(monkeypatch: pytest.MonkeyPatch) -> tuple[types.ModuleType, cli
                 sys.modules[name] = module
         if saved_modules["headroom.cli"] is not None:
             cli_pkg = saved_modules["headroom.cli"]
-            if saved_modules["headroom.cli.main"] is not None:
-                cli_pkg.main = saved_modules["headroom.cli.main"]
+            cli_pkg.main = saved_cli_main_attr
             if saved_modules["headroom.cli.wrap"] is not None:
                 cli_pkg.wrap = saved_modules["headroom.cli.wrap"]
         if headroom_pkg is not None:
@@ -103,6 +114,7 @@ def test_wrap_copilot_auto_anthropic_sets_provider_env(
     _wrap_cli, main = wrap_modules
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-dummy")
+    monkeypatch.setenv("COPILOT_PROVIDER_TYPE", "openai")
     captured: dict[str, object] = {}
 
     def fake_launch_tool(**kwargs):  # noqa: ANN003
@@ -122,7 +134,7 @@ def test_wrap_copilot_auto_anthropic_sets_provider_env(
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["COPILOT_PROVIDER_TYPE"] == "anthropic"
-    assert env["COPILOT_PROVIDER_BASE_URL"] == f"http://127.0.0.1:8787{_expected_project_prefix()}"
+    assert env["COPILOT_PROVIDER_BASE_URL"] == f"http://127.0.0.1:8787{_expected_copilot_prefix()}"
     assert "COPILOT_PROVIDER_WIRE_API" not in env
     assert captured["agent_type"] == "copilot"
     assert captured["tool_label"] == "COPILOT"
@@ -169,9 +181,55 @@ def test_wrap_copilot_openai_backend_sets_completions_env(
     assert isinstance(env, dict)
     assert env["COPILOT_PROVIDER_TYPE"] == "openai"
     assert env["COPILOT_PROVIDER_BASE_URL"] == (
-        f"http://127.0.0.1:8787{_expected_project_prefix()}/v1"
+        f"http://127.0.0.1:8787{_expected_copilot_prefix()}/v1"
     )
     assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
+
+
+def test_wrap_copilot_byok_proxy_url_skips_local_proxy(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrap_cli, main = wrap_modules
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-dummy")
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
+        patch("headroom.cli.wrap._check_proxy") as check_proxy,
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "copilot",
+                "--no-rtk",
+                "--provider-type",
+                "openai",
+                "--proxy-url",
+                "http://10.10.10.89/dashboard/",
+                "--",
+                "--model",
+                "gpt-4o",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    check_proxy.assert_not_called()
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_PROVIDER_TYPE"] == "openai"
+    assert env["COPILOT_PROVIDER_BASE_URL"] == (
+        f"http://10.10.10.89{_expected_copilot_prefix()}/v1"
+    )
+    assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
+    assert captured["no_proxy"] is True
 
 
 def test_wrap_copilot_byok_rejects_auto_model_before_launch(
@@ -237,7 +295,7 @@ def test_wrap_copilot_auto_detects_running_proxy_backend(
     assert isinstance(env, dict)
     assert env["COPILOT_PROVIDER_TYPE"] == "openai"
     assert env["COPILOT_PROVIDER_BASE_URL"] == (
-        f"http://127.0.0.1:8787{_expected_project_prefix()}/v1"
+        f"http://127.0.0.1:8787{_expected_copilot_prefix()}/v1"
     )
     assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
 
@@ -266,7 +324,7 @@ def test_wrap_copilot_prefers_existing_oauth_session(
     assert result.exit_code == 0, result.output
     env = captured["env"]
     assert isinstance(env, dict)
-    assert env["COPILOT_API_URL"] == f"http://127.0.0.1:8787{_expected_project_prefix()}"
+    assert env["COPILOT_API_URL"] == f"http://127.0.0.1:8787{_expected_copilot_prefix()}"
     assert "COPILOT_PROVIDER_TYPE" not in env
     assert "COPILOT_PROVIDER_BASE_URL" not in env
     assert "COPILOT_PROVIDER_WIRE_API" not in env
@@ -387,12 +445,72 @@ def test_wrap_copilot_subscription_uses_github_auth_without_provider_key(
     assert isinstance(env, dict)
     assert env["COPILOT_PROVIDER_TYPE"] == "openai"
     assert env["COPILOT_PROVIDER_BASE_URL"] == (
-        f"http://127.0.0.1:8787{_expected_project_prefix()}/v1"
+        f"http://127.0.0.1:8787{_expected_copilot_prefix()}/v1"
     )
     assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-existing"
     assert "COPILOT_PROVIDER_API_KEY" not in env
     assert captured["openai_api_url"] == DEFAULT_API_URL
+
+
+def test_wrap_copilot_subscription_proxy_url_skips_local_proxy(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_classic_pat_not_supported_by_copilot")
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution(
+                "tid_existing", api_url="https://api.individual.githubcopilot.com"
+            ),
+        ),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
+        patch("headroom.cli.wrap._check_proxy") as check_proxy,
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "copilot",
+                "--subscription",
+                "--no-rtk",
+                "--proxy-url",
+                "http://10.10.10.89/dashboard/",
+                "--",
+                "--model",
+                "gpt-4.1",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    check_proxy.assert_not_called()
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_PROVIDER_BASE_URL"] == (
+        "http://10.10.10.89"
+        f"{_expected_copilot_prefix()}"
+        f"/_copilot/{_encoded_copilot_api_url('https://api.individual.githubcopilot.com')}/v1"
+    )
+    assert env["COPILOT_PROVIDER_TYPE"] == "openai"
+    assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "tid_existing"
+    assert "GITHUB_TOKEN" not in env
+    assert captured["no_proxy"] is True
+    assert captured["copilot_api_token"] == "tid_existing"
+    assert captured["openai_api_url"] == "https://api.individual.githubcopilot.com"
+    assert "tid_existing" not in result.output
+    assert "ghp_classic_pat_not_supported_by_copilot" not in result.output
+    assert "GITHUB_TOKEN" in result.output
 
 
 def test_wrap_copilot_subscription_defaults_to_responses_for_reasoning_model(
@@ -581,8 +699,12 @@ def test_wrap_copilot_subscription_pins_validated_token_for_proxy(
 def test_wrap_copilot_subscription_requires_reusable_auth(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _wrap_cli, main = wrap_modules
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
         patch("headroom.cli.wrap.resolve_subscription_bearer_token_details", return_value=None),
@@ -590,8 +712,31 @@ def test_wrap_copilot_subscription_requires_reusable_auth(
         result = runner.invoke(main, ["wrap", "copilot", "--subscription"])
 
     assert result.exit_code != 0
-    assert "subscription mode requires a reusable GitHub/Copilot bearer token" in result.output
+    assert "could not resolve a reusable Copilot bearer token" in result.output
+    assert "No reusable Copilot token was found" in result.output
     assert "headroom copilot-auth login" in result.output
+
+
+def test_wrap_copilot_subscription_explains_classic_pat(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrap_cli, main = wrap_modules
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-classic")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_subscription_bearer_token_details", return_value=None),
+    ):
+        result = runner.invoke(main, ["wrap", "copilot", "--subscription", "--no-rtk"])
+
+    assert result.exit_code != 0
+    assert "classic GitHub PAT" in result.output
+    assert "Copilot Requests" in result.output
+    assert "ghp-classic" not in result.output
 
 
 def test_wrap_copilot_subscription_rejects_translated_backend(
@@ -1133,3 +1278,92 @@ def test_resolve_copilot_api_url_ignores_user_info_and_never_calls_network(
     with patch.object(copilot_auth, "_fetch_copilot_user_info") as fetch:
         assert copilot_auth.resolve_copilot_api_url("gho-real") == "https://pin.example.com"
     fetch.assert_not_called()
+
+
+def test_wrap_copilot_oauth_proxy_url_encodes_generic_upstream(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reused remote proxy must receive the Copilot upstream in the URL."""
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_client_bearer_token", return_value="gho-oauth"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=True),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "copilot",
+                "--no-rtk",
+                "--proxy-url",
+                "http://10.10.10.89",
+                "--",
+                "--model",
+                "gpt-4o-mini",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_PROVIDER_BASE_URL"] == (
+        "http://10.10.10.89"
+        f"{_expected_copilot_prefix()}"
+        f"/_copilot/{_encoded_copilot_api_url(DEFAULT_API_URL)}/v1"
+    )
+
+
+def test_wrap_copilot_native_remote_proxy_encodes_upstream_and_preserves_prefixes(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native routing must not bypass a reused remote proxy or lose attribution."""
+    _wrap_cli, main = wrap_modules
+    _clear_copilot_env(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch(
+            "headroom.cli.wrap.resolve_subscription_bearer_token_details",
+            return_value=_subscription_resolution("gho-native"),
+        ),
+        patch("headroom.cli.wrap._native_api_url_supported", return_value=True),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "copilot",
+                "--native",
+                "--no-rtk",
+                "--proxy-url",
+                "http://10.10.10.89/dashboard/",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_API_URL"] == (
+        "http://10.10.10.89"
+        f"{_expected_copilot_prefix()}"
+        f"/_copilot/{_encoded_copilot_api_url(DEFAULT_API_URL)}"
+    )
+    assert not any(key.startswith("COPILOT_PROVIDER_") for key in env)
+    assert captured["no_proxy"] is True

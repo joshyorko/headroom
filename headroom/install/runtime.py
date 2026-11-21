@@ -55,6 +55,7 @@ PASSTHROUGH_ENV_PREFIXES = (
     "OLLAMA_",
     "LITELLM_",
     "OTEL_",
+    "SUPABASE_",
     "QDRANT_",
     "NEO4J_",
     "LANGSMITH_",
@@ -101,13 +102,37 @@ def _deployment_env(manifest: DeploymentManifest) -> dict[str, str]:
     }
 
 
+def _checkout_headroom_script() -> Path:
+    executable = "headroom.exe" if _is_windows() else "headroom"
+    script_dir = "Scripts" if _is_windows() else "bin"
+    return Path(__file__).resolve().parents[2] / ".venv" / script_dir / executable
+
+
 def resolve_headroom_command() -> list[str]:
     """Resolve the most reliable command to invoke headroom."""
 
     headroom_bin = shutil.which("headroom")
     if headroom_bin:
         return [headroom_bin]
+
+    checkout_script = _checkout_headroom_script()
+    if checkout_script.is_file() and os.access(checkout_script, os.X_OK):
+        return [str(checkout_script)]
+
     return [sys.executable, "-m", "headroom.cli"]
+
+
+def resolve_headroom_config_command() -> list[str]:
+    """Resolve the command shape written into durable user config.
+
+    Config files should not capture checkout-local virtualenv paths or a
+    workstation-specific uv tool shim path when the intended contract is
+    simply "the installed headroom command is on PATH".
+    """
+
+    if shutil.which("headroom"):
+        return ["headroom"]
+    return resolve_headroom_command()
 
 
 def _runtime_env(manifest: DeploymentManifest) -> dict[str, str]:
@@ -530,14 +555,11 @@ def start_detached_agent(profile: str) -> subprocess.Popen[str]:
     else:
         kwargs["start_new_session"] = True
     try:
-        proc = subprocess.Popen(command, **kwargs)
+        return subprocess.Popen(command, **kwargs)
     finally:
-        # The child has inherited the log file descriptor, so the parent's
-        # copy is dead weight. Closing it (even when Popen raises) avoids
-        # leaking one fd per `headroom install start` and lets the log file
-        # be rotated. Wrapped in try/finally so a Popen failure can't leak.
+        # The child owns its inherited descriptor; the parent must release its
+        # copy even when spawning fails so repeated starts do not leak it.
         log_file.close()
-    return proc
 
 
 def start_persistent_docker(manifest: DeploymentManifest) -> None:
@@ -600,7 +622,7 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
     try:
         os.kill(pid, signal.SIGTERM)
     except (OSError, SystemError):
-        # SystemError covers the Windows WinError 87 surfacing described in #1544.
+        # Windows may report a vanished detached process as WinError 87.
         pass
     for _ in range(_STOP_POLL_ATTEMPTS):
         if not pid_alive(pid):

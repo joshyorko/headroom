@@ -80,7 +80,7 @@ def update_server_json(file_path: Path, version: str) -> None:
     ``server.json`` is asserted byte-for-byte against ``render_server_json()``
     (tests/test_mcp_registry/test_server_json.py), which derives the version from
     ``pyproject.toml``. Nothing regenerated this file, so it silently fell behind
-    every release and failed that test on the release PR. Values are rewritten in
+    every release and failed that test during release validation. Values are rewritten in
     place so key order and formatting keep matching the builder's output.
     """
     with open(file_path, encoding="utf-8") as f:

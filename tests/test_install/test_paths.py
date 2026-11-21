@@ -49,6 +49,7 @@ def test_profile_and_artifact_paths(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_env_target_and_config_paths(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("headroom.install.paths.sys.platform", "linux")
 
@@ -94,3 +95,11 @@ def test_opencode_config_path_opencode_config_env_wins_over_home(
     monkeypatch.setenv("OPENCODE_CONFIG", str(explicit))
 
     assert install_paths.opencode_config_path() == explicit
+
+
+def test_codex_config_path_respects_codex_home(monkeypatch, tmp_path: Path) -> None:
+    codex_home = tmp_path / "codex-home"
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert install_paths.codex_config_path() == codex_home / "config.toml"

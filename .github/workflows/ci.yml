@@ -1,4 +1,5 @@
 name: CI
+run-name: CI / ${{ github.ref_name }}
 
 # Intelligent + parallel pipeline (cutover from the old 4-version matrix):
 #   changes      — paths-filter; skips heavy work for docs-only changes
@@ -15,9 +16,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Verify the self-hosted deployment branch before its image is published.
+    branches: [main, self-hosted]
   pull_request:
-    branches: [main]
+    branches: [main, self-hosted]
     paths-ignore:
       - 'docs/**'
       - 'wiki/**'
@@ -54,6 +56,7 @@ jobs:
         with:
           filters: |
             code:
+              - '.kamal/secrets'
               - 'headroom/**'
               - 'crates/**'
               - '**/*.rs'
@@ -65,8 +68,8 @@ jobs:
               - '.github/workflows/**'
               - '.github/actions/**'
             # native = anything that can change the compiled wrapper, the native
-            # install flow, or the docker image (drives the scarce macOS/Windows
-            # runners + docker E2E). A pure-Python logic change hits none of these.
+            # install flow, or the docker image (drives the Windows runner +
+            # docker E2E). A pure-Python logic change hits none of these.
             native:
               - 'headroom/cli/**'
               - 'headroom/install/**'
@@ -78,6 +81,8 @@ jobs:
               - 'rust-toolchain.toml'
               - 'docker/**'
               - 'Dockerfile'
+              - 'config/deploy.yml'
+              - 'docker-bake.hcl'
               - 'e2e/**'
               - 'scripts/install*'
               - 'pyproject.toml'
@@ -101,6 +106,33 @@ jobs:
             workflows:
               - '.github/workflows/**'
               - '.github/actions/**'
+
+  kamal-dotenv-compat:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        dotenv: ["2.8.1", "3.2.0"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1
+        with:
+          ruby-version: "3.2"
+      - name: Install test dependencies
+        run: |
+          python -m pip install pytest
+          gem install dotenv --version '${{ matrix.dotenv }}' --no-document
+      - name: Verify token interpolation
+        env:
+          KAMAL_TEST_DOTENV_VERSION: ${{ matrix.dotenv }}
+          KAMAL_TEST_REQUIRE_DOTENV: "1"
+        run: python -m pytest --noconftest -o addopts='' tests/test_kamal_proxy_token.py -q
 
   lint:
     needs: changes
@@ -243,7 +275,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -257,19 +289,6 @@ jobs:
         with:
           name: headroom-wheel
           path: dist
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        if: runner.os == 'macOS'
-        with:
-          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        if: runner.os == 'macOS'
-        with:
-          workspaces: ". -> target"
-      - name: Build macOS wheel
-        if: runner.os == 'macOS'
-        run: |
-          python -m pip install --upgrade pip maturin
-          maturin build --profile ci --out dist --interpreter python3.14
       - name: Install headroom-ai[lean] from prebuilt wheels only
         run: |
           python -m pip install --upgrade pip
@@ -440,40 +459,6 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
-  # Keep a small but real pytest lane on Darwin. The full four-shard suite is
-  # intentionally Linux-only for cost, but platform-gated CLI/proxy code must
-  # execute somewhere on macOS; otherwise Darwin regressions can merge green
-  # while being unreachable in every pytest job (#3065).
-  test-macos:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: ${{ env.PY_VERSION }}
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
-          components: rustfmt, clippy
-      - name: Verify native build toolchain
-        run: |
-          cargo --version
-          rustc --version
-      - name: Install package and focused test dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e '.[proxy]' pytest pytest-asyncio numpy
-      - name: Run macOS CLI and install tests
-        run: |
-          pytest \
-            tests/test_cli \
-            tests/test_cli_*.py \
-            tests/test_install \
-            --tb=short -q
-
   test-extras:
     needs: [changes, build-wheel]
     if: needs.changes.outputs.code == 'true'
@@ -613,9 +598,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: ./.github/actions/commitlint
-        with:
-          configFile: .commitlintrc.json
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Lint first-parent PR commits
+        env:
+          COMMITLINT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          COMMITLINT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          npm install --prefix "$RUNNER_TEMP/commitlint" --no-save --no-audit --no-fund \
+            @commitlint/cli@19.2.1 @commitlint/config-conventional@19.1.0
+          config="$RUNNER_TEMP/commitlint/node_modules/.headroom-commitlintrc.json"
+          cp .commitlintrc.json "$config"
+          "$RUNNER_TEMP/commitlint/node_modules/.bin/commitlint" \
+            --from "$COMMITLINT_BASE_SHA" \
+            --to "$COMMITLINT_HEAD_SHA" \
+            --git-log-args='--first-parent' \
+            --config "$config"
 
   build:
     needs: changes
@@ -639,8 +636,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ". -> target"
-      # Smoke check that the SHIPPED build (release profile) + sdist are wired
-      # right; release.yml's matrix is what actually publishes to PyPI.
+      # Smoke check that the shipped build profile and sdist are still wired.
       - name: Install build tools
         run: |
           python -m pip install --upgrade pip
@@ -824,24 +820,3 @@ jobs:
         shell: bash
         run: |
           pytest tests/test_cache_breakpoint_diagnostics.py tests/test_private_state_files.py -v
-
-  macos-native-wrapper:
-    needs: changes
-    if: needs.changes.outputs.native == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.11"
-      - name: Install bash and test dependencies
-        run: |
-          brew install bash
-          python -m pip install --upgrade pip
-          python -m pip install --retries 10 --timeout 60 pytest 'opentelemetry-api>=1.24.0'
-      - name: Run native installer wrapper tests
-        run: |
-          BASH_PREFIX="$(brew --prefix bash)"
-          export PATH="$BASH_PREFIX/bin:$PATH"
-          pytest tests/test_install/test_native_installers.py -q

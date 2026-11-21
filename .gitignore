@@ -42,6 +42,9 @@ scripts/*
 !scripts/audit_wheel_glibc_symbols.py
 !scripts/replay_codex_ws_load.py
 !scripts/export_kompress_v2_onnx.py
+!scripts/headroom-rebuild-install
+!scripts/headroom-dagger-mcp
+!scripts/headroom-dagger-mcp-filter.py
 !scripts/refresh_tool_hashes.py
 !scripts/record_kompress_fixtures.py
 !scripts/record_code_compressor_fixtures.py
@@ -92,6 +95,9 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# Node.js dependencies
+node_modules/
+
 # PyInstaller
 *.manifest
 *.spec
@@ -124,6 +130,7 @@ pytest_cache/
 .env.*
 !.env.act.example
 !.env.example
+!.env.kamal.local.example
 .venv
 env/
 venv/
@@ -252,10 +259,16 @@ pyrightconfig.json
 # Local development configuration
 CLAUDE.md
 
+# Serena local generated memories
+.serena/memories/
+
 # Vitals provenance data
 .vitals/
 
-# Separate private repos — never commit here
+# Superpowers working files (plans, specs, brainstorming)
+# docs/spec/           (lives in git - git-versioned living specification)
+
+# Managed platform (separate private repo)
 headroom-managed/
 
 # Local act testing (never commit test tokens)
@@ -275,6 +288,7 @@ uv.lock
 # package shadows the maturin overlay on sys.path.
 /headroom/_core.*.so
 /headroom/_core.so
+.codex/
 .tokensave
 
 .codebase-memory/

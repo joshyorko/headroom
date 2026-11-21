@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from headroom.mcp_registry.base import (
     MCPRegistrar,
     RegisterResult,
@@ -53,7 +55,7 @@ class _FakeRegistrar(MCPRegistrar):
 
 def test_build_spec_default_proxy_no_env(monkeypatch) -> None:
     monkeypatch.setattr(
-        "headroom.mcp_registry.install.resolve_headroom_command",
+        "headroom.mcp_registry.install.resolve_headroom_config_command",
         lambda: ["/opt/headroom/bin/headroom"],
     )
     spec = build_headroom_spec()
@@ -74,6 +76,10 @@ def test_build_spec_default_url_omits_env() -> None:
 
 
 def test_build_spec_falls_back_to_python_module_when_no_binary(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "headroom.install.runtime._checkout_headroom_script",
+        lambda: Path("/missing/headroom"),
+    )
     monkeypatch.setattr("headroom.install.runtime.shutil.which", lambda name: None)
     monkeypatch.setattr("headroom.install.runtime.sys.executable", "/usr/bin/python")
 

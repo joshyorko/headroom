@@ -2066,13 +2066,14 @@ def test_non_finite_state_values_coerce_to_defaults(tmp_path):
     assert tracker.snapshot()["lifetime"]["cache_read_tokens"] == 5
 
 
-def test_cache_only_request_still_appends_a_history_point(tmp_path):
+def test_cache_only_request_still_appends_a_history_point(tmp_path, monkeypatch):
     # Regression: in --mode cache, tokens_saved is ~always 0 (the frozen
     # prefix is byte-replayed, not lossy-compressed, to keep the provider's
     # prompt cache warm). The history-append guard used to gate on
     # tokens_saved alone, so a cache-only deployment silently wrote zero
     # history points regardless of real cache_read_tokens/cache_savings_usd —
     # making headroom-monthly-style tooling read as a total collapse.
+    monkeypatch.setattr(savings_tracker_module, "_get_litellm_module", lambda: None)
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(path=str(path))
 

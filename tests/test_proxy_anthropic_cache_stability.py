@@ -96,32 +96,10 @@ def _make_proxy_client() -> TestClient:
     return TestClient(app)
 
 
-@pytest.mark.parametrize(
-    ("optimize", "expected_names"),
-    [
-        (False, ["zeta", "alpha", "mu"]),
-        (True, ["alpha", "mu", "zeta"]),
-    ],
-)
-def test_anthropic_tools_forwarding_order_matches_optimization_mode(
-    optimize: bool,
-    expected_names: list[str],
-) -> None:
+def test_anthropic_tools_preserve_caller_order_before_forward() -> None:
     captured = {}
     with _make_proxy_client() as client:
         proxy = client.app.state.proxy
-        proxy.config.optimize = optimize
-        proxy.config.mode = "token"
-
-        if optimize:
-            proxy.anthropic_pipeline.apply = lambda **kwargs: SimpleNamespace(
-                messages=kwargs["messages"],
-                transforms_applied=[],
-                timing={},
-                tokens_before=100,
-                tokens_after=100,
-                waste_signals=None,
-            )
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             captured["body"] = body
@@ -160,7 +138,7 @@ def test_anthropic_tools_forwarding_order_matches_optimization_mode(
 
         assert response.status_code == 200
         sent_tools = captured["body"]["tools"]
-        assert [t["name"] for t in sent_tools] == expected_names
+        assert [t["name"] for t in sent_tools] == ["zeta", "alpha", "mu"]
 
 
 def test_image_compression_only_applies_to_latest_non_frozen_user_turn() -> None:
@@ -218,20 +196,10 @@ def test_image_compression_does_not_touch_previous_turns_if_last_message_not_use
     assert result[0]["content"][0]["source"]["data"] == "OLD_IMAGE_BYTES"
 
 
-@pytest.mark.parametrize(
-    ("optimize", "expected_names"),
-    [
-        (False, ["zeta", "alpha", "mu"]),
-        (True, ["alpha", "mu", "zeta"]),
-    ],
-)
-def test_anthropic_batch_tools_forwarding_order_matches_optimization_mode(
-    optimize: bool,
-    expected_names: list[str],
-) -> None:
+def test_anthropic_batch_tools_preserve_caller_order_before_forward() -> None:
     captured = {}
     config = ProxyConfig(
-        optimize=optimize,
+        optimize=False,
         cache_enabled=False,
         rate_limit_enabled=False,
         cost_tracking_enabled=False,
@@ -245,17 +213,6 @@ def test_anthropic_batch_tools_forwarding_order_matches_optimization_mode(
 
     with TestClient(app) as client:
         proxy = client.app.state.proxy
-        proxy.config.mode = "token"
-
-        if optimize:
-            proxy.anthropic_pipeline.apply = lambda **kwargs: SimpleNamespace(
-                messages=kwargs["messages"],
-                transforms_applied=[],
-                timing={},
-                tokens_before=100,
-                tokens_after=100,
-                waste_signals=None,
-            )
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             captured["body"] = body
@@ -312,7 +269,7 @@ def test_anthropic_batch_tools_forwarding_order_matches_optimization_mode(
 
         assert response.status_code == 200
         sent_tools = captured["body"]["requests"][0]["params"]["tools"]
-        assert [t["name"] for t in sent_tools] == expected_names
+    assert [t["name"] for t in sent_tools] == ["zeta", "alpha", "mu"]
 
 
 def test_append_context_targets_latest_non_frozen_user_turn() -> None:

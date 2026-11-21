@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,13 @@ _LONG_OUTPUT_FLOOR = 200
 _ECHO_CONTEXT_LOOKBACK = 4
 
 _INTERRUPT_MARKER = "[Request interrupted by user"
+_CODEX_TOOL_EVENT_TYPES = {
+    "function_call",
+    "custom_tool_call",
+    "function_call_output",
+    "custom_tool_call_output",
+}
+_CODEX_TOOL_OUTPUT_TYPES = {"function_call_output", "custom_tool_call_output"}
 
 
 @dataclass
@@ -173,12 +181,22 @@ def _parse_ts(s: str | None) -> float | None:
         return None
 
 
-def _assistant_words_and_text(content: Any) -> tuple[int, str]:
+def _text_from_content(content: Any, text_types: set[str]) -> str:
+    if isinstance(content, str):
+        return content
     if not isinstance(content, list):
-        return 0, ""
-    text = " ".join(
-        b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
-    )
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") in text_types:
+            parts.append(str(block.get("text", "")))
+    return "\n".join(p for p in parts if p)
+
+
+def _assistant_words_and_text(content: Any) -> tuple[int, str]:
+    text = _text_from_content(content, {"text", "output_text"})
     return len(text.split()), text
 
 
@@ -189,14 +207,102 @@ def _human_text(content: Any) -> str | None:
     elif isinstance(content, list):
         if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
             return None
-        t = " ".join(
-            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
-        )
+        t = _text_from_content(content, {"text", "input_text"})
     else:
         return None
     if "<command-name>" in t or "<local-command-stdout>" in t:
         return None
     return t
+
+
+def _estimate_tokens_from_text(text: str) -> int:
+    """Cheap token-ish estimate for transcript formats that omit usage."""
+    words = len(text.split())
+    if words == 0:
+        return 0
+    return max(1, round(words * 4 / 3))
+
+
+def _usage_input_tokens(usage: dict[str, Any]) -> int:
+    base = usage.get("input_tokens", usage.get("prompt_tokens", 0))
+    return int(
+        base + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+    )
+
+
+def _usage_output_tokens(usage: dict[str, Any]) -> int:
+    return int(usage.get("output_tokens", usage.get("completion_tokens", 0)))
+
+
+def _normalize_codex_message_content(content: Any, role: str) -> list[dict[str, str]]:
+    """Convert Responses message parts into the Claude-ish text blocks we parse."""
+    if role == "assistant":
+        text = _text_from_content(content, {"text", "output_text"})
+    else:
+        text = _text_from_content(content, {"text", "input_text"})
+    return [{"type": "text", "text": text}] if text else []
+
+
+def _codex_payload(line: dict[str, Any]) -> dict[str, Any] | None:
+    payload = line.get("payload")
+    if isinstance(payload, dict) and (
+        line.get("type") == "response_item" or payload.get("type") in _CODEX_TOOL_EVENT_TYPES
+    ):
+        return payload
+    return None
+
+
+def _normalize_transcript_line(line: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a Claude-style user/assistant line for formats we can mine."""
+    if line.get("type") in {"assistant", "user"}:
+        return line
+
+    payload = _codex_payload(line)
+    if not payload or payload.get("type") != "message":
+        return None
+    role = payload.get("role")
+    if role not in {"assistant", "user"}:
+        return None
+    content = _normalize_codex_message_content(payload.get("content"), str(role))
+    return {
+        "_headroom_source": "codex",
+        "type": role,
+        "timestamp": line.get("timestamp")
+        or payload.get("timestamp")
+        or line.get("time")
+        or payload.get("created_at"),
+        "message": {
+            "role": role,
+            "model": payload.get("model") or line.get("model") or "gpt-codex",
+            "content": content,
+            "usage": payload.get("usage") or line.get("usage") or {},
+        },
+    }
+
+
+def _codex_line_has_tools(line: dict[str, Any]) -> bool:
+    payload = _codex_payload(line)
+    return bool(payload and payload.get("type") in _CODEX_TOOL_EVENT_TYPES)
+
+
+def _codex_tool_output_text(line: dict[str, Any]) -> str:
+    payload = _codex_payload(line)
+    if not payload or payload.get("type") not in _CODEX_TOOL_OUTPUT_TYPES:
+        return ""
+    raw = payload.get("output", "")
+    if isinstance(raw, list):
+        return _text_from_content(raw, {"text", "output_text", "input_text"})
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+        if isinstance(parsed, dict) and "output" in parsed:
+            return str(parsed.get("output", ""))
+        if isinstance(parsed, list):
+            return _text_from_content(parsed, {"text", "output_text", "input_text"})
+        return raw
+    return str(raw)
 
 
 def _parse_session(path: Path) -> tuple[list[_Response], list[_HumanMsg], bool]:
@@ -214,8 +320,22 @@ def _parse_session(path: Path) -> tuple[list[_Response], list[_HumanMsg], bool]:
 
     for line in lines:
         try:
-            d = json.loads(line)
+            raw = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        if _codex_line_has_tools(raw):
+            has_tools = True
+        tool_output = _codex_tool_output_text(raw)
+        if tool_output:
+            recent_context.append(tool_output)
+            prior_messages.append(
+                {"role": "user", "content": [{"type": "tool_result", "content": tool_output}]}
+            )
+            continue
+        d = _normalize_transcript_line(raw)
+        if d is None:
             continue
         ltype = d.get("type")
         msg = d.get("message", {}) if isinstance(d.get("message"), dict) else {}
@@ -229,12 +349,15 @@ def _parse_session(path: Path) -> tuple[list[_Response], list[_HumanMsg], bool]:
                 has_tools = True
             words, text = _assistant_words_and_text(content)
             usage = msg.get("usage", {}) if isinstance(msg.get("usage"), dict) else {}
-            in_tok = (
-                usage.get("input_tokens", 0)
-                + usage.get("cache_read_input_tokens", 0)
-                + usage.get("cache_creation_input_tokens", 0)
-            )
-            out_tok = usage.get("output_tokens", 0)
+            in_tok = _usage_input_tokens(usage)
+            out_tok = _usage_output_tokens(usage)
+            if d.get("_headroom_source") == "codex":
+                if out_tok <= 0 and text:
+                    out_tok = _estimate_tokens_from_text(text)
+                if in_tok <= 0 and recent_context:
+                    in_tok = _estimate_tokens_from_text(
+                        " ".join(recent_context[-_ECHO_CONTEXT_LOOKBACK:])
+                    )
             if words > 0 or out_tok > 0:
                 ctx = " ".join(recent_context[-_ECHO_CONTEXT_LOOKBACK:])
                 responses.append(
@@ -290,8 +413,13 @@ def _ordered_events(path: Path) -> list[tuple[float | None, str, _Response | _Hu
     ri = hi = 0
     for line in lines:
         try:
-            d = json.loads(line)
+            raw = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        d = _normalize_transcript_line(raw)
+        if d is None:
             continue
         ltype = d.get("type")
         if ltype == "assistant":
@@ -322,6 +450,8 @@ def _ordered_events(path: Path) -> list[tuple[float | None, str, _Response | _Hu
 
 def extract_signals(
     session_paths: list[Path],
+    *,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> tuple[VerbositySignals, BaselineModel]:
     """Compute behavioral signals and the per-stratum output-token baseline."""
     sig = VerbositySignals()
@@ -331,8 +461,13 @@ def extract_signals(
     # First pass: collect every response word-count to derive the per-user
     # adaptive "long" threshold (median), so "long" scales to the user.
     parsed: list[tuple[list[_Response], list[_HumanMsg]]] = []
-    for p in session_paths:
+    total = len(session_paths)
+    if on_progress:
+        on_progress("Reading responses (pass 1/2)", 0, total)
+    for index, p in enumerate(session_paths, 1):
         responses, humans, _ = _parse_session(p)
+        if on_progress:
+            on_progress("Reading responses (pass 1/2)", index, total)
         if not responses and not humans:
             continue
         sig.sessions += 1
@@ -347,6 +482,8 @@ def extract_signals(
 
     echo_sum = 0.0
     echo_n = 0
+    if on_progress:
+        on_progress("Computing response statistics", 0, len(parsed))
     for responses, humans in parsed:
         for r in responses:
             sig.asst_responses += 1
@@ -371,7 +508,9 @@ def extract_signals(
                 sig.human_msgs += 1
 
     # Second pass: fast-skip pairing via interleaved order.
-    for p in session_paths:
+    if on_progress:
+        on_progress("Checking reading times (pass 2/2)", 0, total)
+    for index, p in enumerate(session_paths, 1):
         events = _ordered_events(p)
         last_resp: _Response | None = None
         for ts, kind, obj in events:
@@ -391,6 +530,8 @@ def extract_signals(
                     if (ts - last_resp.ts) < _SKIP_READ_FRACTION * read_secs:
                         sig.fast_skips += 1
                 last_resp = None
+        if on_progress:
+            on_progress("Checking reading times (pass 2/2)", index, total)
 
     sig.mean_echo_ratio = echo_sum / echo_n if echo_n else 0.0
     return sig, baseline
@@ -454,6 +595,7 @@ def analyze(
     project_path: str,
     *,
     llm_judge: Any | None = None,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> tuple[VerbosityProfile, BaselineModel]:
     """Full analysis: signals → recommendation → profile, plus the baseline.
 
@@ -461,10 +603,12 @@ def analyze(
     that overrides the heuristic. Kept injectable so the core stays LLM-free and
     testable; the CLI wires a real LLM call.
     """
-    sig, baseline = extract_signals(session_paths)
+    sig, baseline = extract_signals(session_paths, on_progress=on_progress)
     level, confidence, rationale = recommend_level(sig)
     source = "heuristic"
     if llm_judge is not None:
+        if on_progress:
+            on_progress("Consulting LLM judge", 0, 1)
         try:
             verdict = llm_judge(sig.to_dict())
             if verdict is not None:

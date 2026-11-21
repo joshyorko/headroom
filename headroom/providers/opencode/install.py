@@ -13,12 +13,12 @@ from headroom.install.paths import opencode_config_path
 from .config import (
     _inject_key_into_json,
     _parse_json_loose,
+    headroom_provider_entry,
     load_user_opencode_config,
     migrate_legacy_opencode_jsonc_backup,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
-from .runtime import proxy_base_url
 
 
 def build_install_env(*, port: int, backend: str) -> dict[str, str]:
@@ -45,13 +45,7 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     else:
         data = {}
 
-    provider = {
-        "headroom": {
-            "npm": "@ai-sdk/openai-compatible",
-            "name": "Headroom Proxy",
-            "options": {"baseURL": proxy_base_url(manifest.port)},
-        }
-    }
+    provider = {"headroom": headroom_provider_entry(manifest.port)}
     data = _inject_key_into_json(data, "provider", provider)
 
     config_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")

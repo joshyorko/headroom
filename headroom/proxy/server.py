@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import concurrent.futures
 import contextlib
 import contextvars
@@ -190,8 +192,11 @@ from headroom.proxy.orphan_watchdog import (
 from headroom.proxy.probe_recorder import probe_recorder_from_env
 from headroom.proxy.project_context import (
     classify_project,
+    set_current_copilot_api_url,
     set_current_project,
     set_registered_cwd,
+    strip_client_path_prefix,
+    strip_copilot_upstream_path_prefix,
     strip_project_path_prefix,
 )
 from headroom.proxy.project_policy import split_project_path
@@ -541,12 +546,27 @@ def _output_reduction_payload(shaper_active: bool, est: Any = None) -> dict[str,
         "ci_low_percent": None,
         "ci_high_percent": None,
         "requests": 0,
+        "estimate_reliable": False,
+        "estimate_status": "inactive" if not shaper_active else "unmeasured",
+        "estimate_reasons": ["shaper_inactive"] if not shaper_active else [],
+        "estimate_quality": "inactive" if not shaper_active else "unmeasured",
+        "display_tokens_saved": None,
+        "display_reduction_percent": None,
     }
     if not shaper_active:
         payload["available"] = True
         payload["method"] = "inactive"
         return payload
     if getattr(est, "n_requests", 0) <= 0:
+        if est is not None:
+            payload.update(
+                {
+                    "estimate_reliable": bool(getattr(est, "estimate_reliable", False)),
+                    "estimate_status": getattr(est, "estimate_status", "unmeasured"),
+                    "estimate_reasons": list(getattr(est, "estimate_reasons", [])),
+                    "estimate_quality": getattr(est, "estimate_quality", "unmeasured"),
+                }
+            )
         return payload
     payload.update(
         {
@@ -561,6 +581,19 @@ def _output_reduction_payload(shaper_active: bool, est: Any = None) -> dict[str,
             "ci_low_percent": round(est.ci_low_pct, 1),
             "ci_high_percent": round(est.ci_high_pct, 1),
             "requests": est.n_requests,
+            # Retain the downstream dashboard's reliability contract. The
+            # measured total remains visible in the API; the UI headline only
+            # uses values the estimate marks reliable.
+            "estimate_reliable": bool(getattr(est, "estimate_reliable", False)),
+            "estimate_status": getattr(est, "estimate_status", "unmeasured"),
+            "estimate_reasons": list(getattr(est, "estimate_reasons", [])),
+            "estimate_quality": getattr(est, "estimate_quality", "unmeasured"),
+            "display_tokens_saved": (
+                round(est.tokens_saved) if getattr(est, "estimate_reliable", False) else None
+            ),
+            "display_reduction_percent": (
+                round(est.pct, 1) if getattr(est, "estimate_reliable", False) else None
+            ),
         }
     )
     return payload
@@ -3330,14 +3363,54 @@ def _auth_rejection_path(path: object) -> str:
 _PROXY_TOKEN_HEADER = b"x-headroom-proxy-token"
 
 
-def _is_proxy_token_bearer(value: bytes, token_bytes: bytes) -> bool:
-    """Whether a raw ``Authorization`` value is ``Bearer <proxy token>``.
+def _dashboard_basic_token(authorization: str) -> str | None:
+    """Read browser credentials without treating provider Basic auth as a token."""
+    scheme, _, encoded = authorization.partition(" ")
+    if scheme.lower() != "basic" or len(encoded) > 4096:
+        return None
+    try:
+        username, separator, password = (
+            base64.b64decode(encoded, validate=True).decode("utf-8").partition(":")
+        )
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+    return password if username == "headroom" and separator and password else None
+
+
+def _is_dashboard_browser_request(method: str, path: str) -> bool:
+    """Only registered UI routes accept ambient browser credentials."""
+    if method == "POST":
+        return path in {"/settings", "/settings/apply"}
+    return method == "GET" and (
+        path
+        in {
+            "/dashboard",
+            "/dashboard/",
+            "/dashboard/settings",
+            "/favicon.ico",
+            "/stats",
+            "/stats-history",
+            "/stats-lifetime",
+            "/subscription-window",
+            "/quota",
+            "/settings",
+            "/settings/schema",
+        }
+        or path.startswith("/dashboard/static/")
+    )
+
+
+def _is_proxy_token_authorization(value: bytes, token_bytes: bytes) -> bool:
+    """Whether Authorization contains the configured proxy credential.
 
     Parses exactly as :func:`read_proxy_token` does (case-insensitive scheme,
     stripped credential) and compares the way the gates do, so a value the gate
     accepted as the proxy credential is always recognised here.
     """
     auth = value.decode("latin-1")
+    browser_token = _dashboard_basic_token(auth)
+    if browser_token is not None:
+        return hmac.compare_digest(browser_token.encode("utf-8"), token_bytes)
     if not auth.lower().startswith("bearer "):
         return False
     credential = auth[7:].strip()
@@ -3359,8 +3432,8 @@ def scrub_proxy_token_headers(scope: Any, token_bytes: bytes) -> None:
 
     ``x-headroom-proxy-token`` is dropped unconditionally, so it cannot reach an
     upstream even with ``HEADROOM_STRIP_INTERNAL_HEADERS=disabled``. An
-    ``Authorization`` header is dropped only when it carries the configured
-    token; any other value is a provider credential and is left alone.
+    ``Authorization`` is dropped when its Bearer or dashboard Basic credential
+    carries the configured token. Other provider credentials are left alone.
     """
     headers = scope.get("headers")
     if not headers:
@@ -3373,7 +3446,7 @@ def scrub_proxy_token_headers(scope: Any, token_bytes: bytes) -> None:
             or (
                 token_bytes
                 and name.lower() == b"authorization"
-                and _is_proxy_token_bearer(value, token_bytes)
+                and _is_proxy_token_authorization(value, token_bytes)
             )
         )
     ]
@@ -3447,6 +3520,9 @@ class WebSocketAuthMiddleware:
         if provided is not None and hmac.compare_digest(
             provided.encode("utf-8", "replace"), self.token_bytes
         ):
+            # Route helpers must retain the authentication result after the
+            # proxy credential is removed from their inbound headers.
+            scope.setdefault("state", {})["_headroom_proxy_token_authenticated"] = True
             scrub_proxy_token_headers(scope, self.token_bytes)
             await self.app(scope, receive, send)
             return
@@ -4406,12 +4482,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def _record_headroom_stack(request, call_next):
         started = time.perf_counter()
         inbound_id = f"inbound-{time.time_ns()}"
-        # Project attribution: an explicit X-Headroom-Project header wins
-        # (claude/codex wraps); otherwise a /p/<name> base-URL prefix (aider,
-        # Copilot BYOK, Cursor — clients that cannot send custom headers).
+        # Client/project attribution: path prefixes cover clients that cannot
+        # send custom headers. Strip /c/<client> before /p/<project> so combined
+        # prefixes reach the canonical routes.
         # The prefix strip mutates the scope, so it must happen before
         # request.url is first accessed (Starlette caches the URL).
+        prefix_client = strip_client_path_prefix(request.scope)
+        if prefix_client is not None:
+            request.scope["headers"].append((b"x-headroom-client", prefix_client.encode()))
         prefix_project = strip_project_path_prefix(request.scope)
+        set_current_copilot_api_url(strip_copilot_upstream_path_prefix(request.scope))
         path = request.url.path
         method = request.method
         query = request.url.query
@@ -4667,6 +4747,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             exempt = hello_probe or (request.method == "GET" and path in _AUTH_EXEMPT_PATHS)
             if not exempt and not is_loopback_host(client_host):
                 provided = _extract_proxy_token(request.headers)
+                browser_request = _is_dashboard_browser_request(request.method, path)
+                if (
+                    provided is None
+                    and browser_request
+                    and "x-headroom-proxy-token" not in request.headers
+                ):
+                    provided = _dashboard_basic_token(request.headers.get("authorization", ""))
                 if provided is None or not hmac.compare_digest(
                     provided.encode("utf-8", "replace"), _proxy_token_bytes
                 ):
@@ -4682,6 +4769,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         forwarded_for,
                     )
                     rejection = JSONResponse(status_code=401, content={"error": "unauthorized"})
+                    if browser_request:
+                        rejection.headers["WWW-Authenticate"] = (
+                            'Basic realm="Headroom dashboard", charset="UTF-8"'
+                        )
                     _apply_security_headers(rejection)
                     return rejection
                 # The caller proved it holds the proxy token. The rate limiter
@@ -5114,8 +5205,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.post(
         "/settings",
         dependencies=[
-            Depends(_require_loopback_or_trusted_dashboard_client_for_write),
             Depends(_require_same_origin_or_trusted_dashboard_client),
+            Depends(_require_loopback_or_trusted_dashboard_client_for_write),
         ],
     )
     async def settings_post(request: Request):
@@ -5164,8 +5255,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.post(
         "/settings/apply",
         dependencies=[
-            Depends(_require_loopback_or_trusted_dashboard_client_for_write),
             Depends(_require_same_origin_or_trusted_dashboard_client),
+            Depends(_require_loopback_or_trusted_dashboard_client_for_write),
         ],
     )
     async def settings_apply(request: Request):
@@ -6192,6 +6283,64 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def quota():
         """Unified quota/rate-limit stats for all registered providers (Anthropic, Codex, Copilot)."""
         return JSONResponse(content=get_quota_registry().get_all_stats())
+
+    @app.get("/v0/management/auth-files", dependencies=_dashboard_gate)
+    async def hub_auth_files():
+        """Credential-free provider records for T3's hub usage reader."""
+        from headroom.proxy.hub_reporting import list_auth_files
+
+        return JSONResponse(
+            content=list_auth_files(get_quota_registry()), headers={"Cache-Control": "no-store"}
+        )
+
+    @app.post("/v0/management/api-call", dependencies=_dashboard_gate)
+    async def hub_api_call(request: Request):
+        """Refresh pinned operator quota; supplied URLs and credentials are never relayed."""
+        from headroom.proxy.hub_reporting import report_api_call
+
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeError):
+            body = None
+        if not isinstance(body, dict) or any(
+            not isinstance(body.get(key), str) or len(body[key]) > limit
+            for key, limit in (("auth_index", 200), ("method", 16), ("url", 2048))
+        ):
+            return JSONResponse(status_code=400, content={"error": "invalid usage request"})
+        if (
+            body["auth_index"] == "headroom-codex"
+            and body["method"].upper() == "GET"
+            and body["url"] == "https://chatgpt.com/backend-api/wham/usage"
+        ):
+            from headroom.subscription.codex_rate_limits import refresh_operator_usage
+
+            await refresh_operator_usage()
+        return JSONResponse(
+            content=report_api_call(
+                get_quota_registry(),
+                auth_index=body["auth_index"],
+                method=body["method"],
+                url=body["url"],
+            ),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.api_route(
+        "/v0/management",
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        dependencies=_dashboard_gate,
+        include_in_schema=False,
+    )
+    @app.api_route(
+        "/v0/management/{management_path:path}",
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        dependencies=_dashboard_gate,
+        include_in_schema=False,
+    )
+    async def unsupported_hub_management():
+        # Reserve this namespace before the provider catch-all: management
+        # mutations must never fall through to an upstream provider.
+        raise HTTPException(status_code=404)
 
     @app.get("/metrics", dependencies=[Depends(_require_metrics_scrape_client)])
     async def metrics():

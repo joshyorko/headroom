@@ -66,6 +66,7 @@ class AuthSignals:
     x_api_key: str = ""
     x_goog_api_key: str = ""
     x_client: str = ""
+    x_headroom_client: str = ""
 
     @property
     def user_agent_lower(self) -> str:
@@ -112,6 +113,9 @@ def classify_client_signals(signals: AuthSignals, *, default: str | None = None)
     explicit = signals.x_client.strip().lower()
     if explicit:
         return explicit
+    internal = signals.x_headroom_client.strip().lower()
+    if internal:
+        return internal
     ua_lower = signals.user_agent_lower
     if not ua_lower:
         return None

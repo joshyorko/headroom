@@ -1405,9 +1405,9 @@ class PrefixCacheTracker:
                 # Keep writes associated with the resolved request's floor,
                 # not a sibling fork that mutated the live value (#4548).
                 if resolved[2] is not None and len(resolved[2]) > 5:
-                    state = list(state)
-                    state[5] = resolved[2][5]
-                    state = tuple(state)
+                    mutable_state = list(state)
+                    mutable_state[5] = resolved[2][5]
+                    state = tuple(mutable_state)
                 self._turn_states[resolved[1]] = state
             # The request has its response; later reads see the current state.
             _resolved_turn.set((self, resolved[1], None))

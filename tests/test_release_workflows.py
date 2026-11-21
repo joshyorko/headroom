@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -18,6 +19,55 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
     import tomli as tomllib  # type: ignore[no-redef]
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_homebrew_dispatch_skips_without_pat_and_runs_when_configured(tmp_path: Path) -> None:
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+    step = next(
+        step
+        for step in workflow["jobs"]["docker-manifest"]["steps"]
+        if step.get("name") == "Dispatch Homebrew tap update"
+    )
+    assert step["env"]["HOMEBREW_TOOLS_PAT"] == "${{ secrets.HOMEBREW_TOOLS_PAT }}"
+    assert "tap-auto-update.yml/dispatches" in step["run"]
+
+    call_log = tmp_path / "curl-args"
+    curl = tmp_path / "curl"
+    curl.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" > "$TEST_CURL_CALL_LOG"\nexit 0\n',
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+
+    env = os.environ.copy()
+    env.pop("HOMEBREW_TOOLS_PAT", None)
+    env["PATH"] = f"{tmp_path}:{env['PATH']}"
+    env["TEST_CURL_CALL_LOG"] = str(call_log)
+
+    skipped = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail", "-c", step["run"]],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert skipped.returncode == 0, skipped.stderr
+    assert "HOMEBREW_TOOLS_PAT is unset; skipping" in skipped.stdout
+    assert not call_log.exists(), "an unset token must not attempt the cross-repo dispatch"
+
+    env["HOMEBREW_TOOLS_PAT"] = "test-token"
+    dispatched = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail", "-c", step["run"]],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert dispatched.returncode == 0, dispatched.stderr
+    curl_args = call_log.read_text(encoding="utf-8")
+    assert "Bearer test-token" in curl_args
+    assert "tap-auto-update.yml/dispatches" in curl_args
+    assert "headroom-daily" in curl_args
 
 
 def test_release_slack_payload_reports_the_completed_github_release(tmp_path: Path) -> None:
@@ -145,7 +195,7 @@ def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> 
     extras_lines = [
         line.strip() for line in bake.splitlines() if line.strip().startswith("HEADROOM_EXTRAS =")
     ]
-    assert len(extras_lines) == 9
+    assert len(extras_lines) == 10
     assert all("bedrock" in line for line in extras_lines), extras_lines
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -231,7 +281,7 @@ def test_every_docker_variant_includes_the_redis_extra() -> None:
 
     bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
     targets = re.findall(r'^\s*HEADROOM_EXTRAS = "([^"]*)"$', bake, re.MULTILINE)
-    assert len(targets) == 9
+    assert len(targets) == 10
     assert all("redis" in extras.split(",") for extras in targets), targets
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -340,18 +390,18 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     build_variants = build["strategy"]["matrix"]["variant"]
     architectures = build["strategy"]["matrix"]["arch"]
     root = next(entry for entry in variants if entry["name"] == "")
-    nonroot = next(entry for entry in variants if entry["name"] == "nonroot")
     promotion = next(
         step for step in manifest["steps"] if step["name"] == "Re-tag root image as :latest"
     )
     command = promotion["run"]
 
-    assert len(variants) == 8
+    assert len(variants) == 1
     assert [entry["name"] for entry in build_variants] == [entry["name"] for entry in variants]
-    assert len(architectures) == 2
-    assert {entry["platform"] for entry in architectures} == {"linux/amd64", "linux/arm64"}
+    assert len(architectures) == 1
+    assert {entry["platform"] for entry in architectures} == {"linux/amd64"}
     assert root["name"] == ""
-    assert nonroot["name"] == "nonroot"
+    assert root["bake_target"] == "runtime-self-hosted"
+    assert architectures[0]["runs_on"] == "ubuntu-24.04"
     assert "matrix.variant.name == ''" in promotion["if"]
     assert "steps.manifest.outputs.index_digest != ''" in promotion["if"]
     assert "steps.version.outputs.version != ''" in promotion["if"]
@@ -373,11 +423,11 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
         step["run"] for step in manifest["steps"] if step["name"] == "Create multi-arch manifest"
     )
     assert 'digest_count="$(find "${DIGEST_DIR}" -maxdepth 1 -type f | wc -l)"' in manifest_script
-    assert '"${digest_count}" -ne 2' in manifest_script
-    assert manifest_script.index('"${digest_count}" -ne 2') < manifest_script.index(
+    assert '"${digest_count}" -ne 1' in manifest_script
+    assert manifest_script.index('"${digest_count}" -ne 1') < manifest_script.index(
         "docker buildx imagetools create"
     )
-    guard_start = manifest_script.index('"${digest_count}" -ne 2')
+    guard_start = manifest_script.index('"${digest_count}" -ne 1')
     create_start = manifest_script.index("docker buildx imagetools create")
     assert guard_start < manifest_script.index("exit 1", guard_start) < create_start
 
@@ -412,8 +462,12 @@ def test_only_the_root_cell_can_ever_publish_a_bare_latest_tag() -> None:
         "every variant cell publishes a bare :latest and the last one wins"
     )
 
-    # No tag rule may reintroduce it explicitly either.
-    assert "value=latest" not in meta["with"]["tags"]
+    # The self-hosted root lane intentionally emits :latest on self-hosted
+    # branch pushes; the matrix assertion above proves no nonroot cell exists.
+    assert (
+        "type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref_name == 'self-hosted' && matrix.variant.name == '' }}"
+        in meta["with"]["tags"]
+    )
 
     create = next(
         step for step in manifest["steps"] if step["name"] == "Create multi-arch manifest"
@@ -427,8 +481,8 @@ def test_only_the_root_cell_can_ever_publish_a_bare_latest_tag() -> None:
     )
 
 
-def test_docker_manifest_downloads_exactly_one_artifact_per_architecture() -> None:
-    """Each manifest cell must download exactly its two architecture digests.
+def test_docker_manifest_downloads_exactly_one_artifact_for_self_hosted_amd64() -> None:
+    """The self-hosted manifest must download its sole amd64 digest.
 
     Keeping the variant before a trailing wildcard makes prefix-related names
     overlap: ``digests-code-*`` also selects code-nonroot, code-slim, and
@@ -455,7 +509,6 @@ def test_docker_manifest_downloads_exactly_one_artifact_per_architecture() -> No
     )
     assert [step["with"]["name"] for step in downloads] == [
         "digests-${{ matrix.variant.name || 'root' }}-amd64",
-        "digests-${{ matrix.variant.name || 'root' }}-arm64",
     ]
     assert all("pattern" not in step["with"] for step in downloads)
     assert all(step["with"]["path"] == "${{ runner.temp }}/digests" for step in downloads)
@@ -488,7 +541,7 @@ def test_create_release_requires_successful_build_and_pypi_publish() -> None:
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
     # Single-wheel maturin refactor (PR #360) added `build-wheels` (the
-    # cross-platform matrix that produces the linux/macos/aarch64 wheels)
+    # cross-platform matrix that produces the Linux amd64/arm64 wheels)
     # and `collect-dist` (aggregator that merges wheel artifacts + npm
     # release-assets) between `build` and the publish jobs. create-release
     # must wait for all of them.
@@ -509,16 +562,15 @@ def test_create_release_requires_successful_build_and_pypi_publish() -> None:
     assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
 
 
-def test_macos_native_wrapper_dependency_install_retries_pypi_downloads() -> None:
-    content = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-
-    assert "python -m pip install --retries 10 --timeout 60 pytest" in content
-
-
 def test_ci_commitlint_runs_only_for_pull_requests() -> None:
     content = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     assert "github.event_name == 'pull_request'" in content
+    assert "COMMITLINT_BASE_SHA: ${{ github.event.pull_request.base.sha }}" in content
+    assert "COMMITLINT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}" in content
+    assert "--git-log-args='--first-parent'" in content
+    assert "@commitlint/cli@19.2.1" in content
+    assert "@commitlint/config-conventional@19.1.0" in content
 
 
 def test_no_openssl_sys_in_wheel_build_tree() -> None:
@@ -741,65 +793,34 @@ def test_release_yml_does_not_install_openssl_or_perl_for_wheels() -> None:
         )
 
 
-def test_build_wheels_matrix_includes_intel_macos_with_dynamic_ort() -> None:
-    """Intel macOS wheels use `ort-load-dynamic` because `ort-sys 2.0.0-rc.12`
-    has no prebuilt ONNX Runtime binaries for `x86_64-apple-darwin`.
-
-    We assert against the actual matrix entry shape (`target: <triple>`
-    on a non-comment line) so explanatory comments mentioning other
-    triples don't false-positive.
-    """
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-
-    bw_start = content.index("\n  build-wheels:")
-    bw_end = content.index("\n  collect-dist:")
-    body = content[bw_start:bw_end]
-
-    matrix_targets: list[str] = []
-    for raw in body.splitlines():
-        stripped = raw.lstrip()
-        # Skip YAML comments — only look at real matrix-entry lines.
-        if stripped.startswith("#"):
-            continue
-        if stripped.startswith("target:"):
-            # `target: x86_64-apple-darwin` → `x86_64-apple-darwin`
-            matrix_targets.append(stripped.split(":", 1)[1].strip())
-
-    assert "aarch64-apple-darwin" in matrix_targets, "Apple Silicon must stay in the matrix"
-    assert "x86_64-unknown-linux-gnu" in matrix_targets
-    assert "aarch64-unknown-linux-gnu" in matrix_targets
-    assert "x86_64-apple-darwin" in matrix_targets, (
-        f"x86_64-apple-darwin must be a wheel-matrix target; got {matrix_targets}"
+def test_release_and_rust_workflows_keep_linux_and_windows_without_macos() -> None:
+    """Self-hosted fork CI retains Linux/Windows coverage without macOS runners."""
+    for path in (ROOT / ".github" / "workflows").glob("*.yml"):
+        executable = "\n".join(
+            line
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "macos-" not in executable.lower(), f"macOS runner restored in {path.name}"
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    rust = (ROOT / ".github" / "workflows" / "rust.yml").read_text(encoding="utf-8")
+    non_comment_lines = "\n".join(
+        line
+        for text in (release, rust)
+        for line in text.splitlines()
+        if not line.lstrip().startswith("#")
     )
 
-    matrix_os: list[str] = []
-    for raw in body.splitlines():
-        stripped = raw.lstrip()
-        if stripped.startswith("#"):
-            continue
-        if stripped.startswith("os:"):
-            matrix_os.append(stripped.split(":", 1)[1].strip())
-        elif stripped.startswith("- os:"):
-            matrix_os.append(stripped.split(":", 1)[1].strip())
-    assert "macos-15-intel" in matrix_os
-
-
-def test_smoke_import_macos_selects_wheel_arch_from_target() -> None:
-    """The macOS smoke-import step must pick the wheel tag from the matrix
-    target (arm64 for Apple Silicon, x86_64 for Intel) instead of
-    hardcoding `_arm64` for every macOS row."""
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-
-    step_start = content.index("- name: Smoke-import wheel on macOS host")
-    step_end = content.index("- name: Smoke-import wheel on Windows host", step_start)
-    macos_block = content[step_start:step_end]
-
-    assert "WHEEL_TARGET: ${{ matrix.wheel_target }}" in macos_block
-    assert "aarch64-apple-darwin) mac_arch=arm64" in macos_block
-    assert "x86_64-apple-darwin) mac_arch=x86_64" in macos_block
-    assert "macosx_*_${mac_arch}.whl" in macos_block
-    assert "headroom_ai-*-${py_tag}-${py_tag}-macosx_*_arm64.whl" not in macos_block
-    assert "headroom_ai-*-abi3-macosx_*_arm64.whl" not in macos_block
+    assert "macos-" not in non_comment_lines
+    assert "macos-latest" not in non_comment_lines
+    assert "apple-darwin" not in non_comment_lines
+    assert "Smoke-import wheel on macOS host" not in non_comment_lines
+    assert "Smoke-import wheel on Windows host" in non_comment_lines
+    assert "windows-latest" in non_comment_lines
+    assert "x86_64-unknown-linux-gnu" in non_comment_lines
+    assert "aarch64-unknown-linux-gnu" in non_comment_lines
+    assert "ubuntu-24.04-arm" in non_comment_lines
+    assert "os: [ubuntu-latest, windows-latest]" in non_comment_lines
 
 
 def test_aarch64_wheel_uses_native_arm64_runner() -> None:
@@ -864,31 +885,24 @@ def test_aarch64_wheel_uses_native_arm64_runner() -> None:
     )
 
 
-def test_docker_workflow_builds_on_native_arch_runners() -> None:
-    """STRUCTURAL INVARIANT: the docker variant build must fan out per
-    arch onto native runners — `linux/amd64` on `ubuntu-24.04`,
-    `linux/arm64` on `ubuntu-24.04-arm`. No QEMU.
+def test_docker_workflow_builds_self_hosted_image_on_amd64_runner() -> None:
+    """STRUCTURAL INVARIANT: the self-hosted image builds natively on amd64.
 
-    Pre-#377 each variant ran `docker bake` with
-    `platforms = ["linux/amd64","linux/arm64"]` on a single x64 runner
-    using QEMU for arm64 emulation — ~1h per variant. Splitting into
-    16 native single-arch builds (8 variants × 2 arches) + a manifest
-    merge job per variant cuts wall-clock to ~10 min and removes the
-    QEMU surface that contributed to transient build failures.
+    The upstream multi-variant workflow uses native amd64/arm64 runners.
+    This self-hosted fork deliberately narrows that matrix to the one
+    Kamal image and architecture it deploys.
     """
     content = (ROOT / ".github" / "workflows" / "docker.yml").read_text(encoding="utf-8")
 
-    # The fan-out job must exist with both runners in its arch matrix.
+    # The self-hosted lane intentionally has one amd64 runner and no ARM row.
     assert "docker-build:" in content, "docker-build fan-out job missing"
     assert "runs_on: ubuntu-24.04, platform: linux/amd64" in content, (
         "amd64 arch matrix entry must bind ubuntu-24.04 (native x86_64)"
     )
-    assert "runs_on: ubuntu-24.04-arm, platform: linux/arm64" in content, (
-        "arm64 arch matrix entry must bind ubuntu-24.04-arm (native aarch64)"
-    )
+    assert "runs_on: ubuntu-24.04-arm, platform: linux/arm64" not in content
 
-    # Per-arch builds must push by digest only — tags belong on the
-    # multi-arch manifest, applied later by docker-manifest.
+    # The amd64 build must push by digest only — tags belong on the
+    # manifest, applied later by docker-manifest.
     assert "push-by-digest=true,name-canonical=true,push=true" in content, (
         "per-arch builds must push by digest only; tags applied at manifest merge step"
     )
@@ -1346,7 +1360,7 @@ def test_release_workflow_has_smoke_import_wheel_gate() -> None:
       is a lie.
     - At least one customer-representative glibc per arch (Ubuntu
       LTS, the issue #355 reporter's environment).
-    - macOS native (Apple Silicon).
+    - Linux manylinux floor and customer environments for both architectures.
 
     Required gating: `publish-pypi`, `publish-docker`, AND
     `create-release` must all `needs:` smoke-import-wheels. A
@@ -1378,14 +1392,12 @@ def test_release_workflow_has_smoke_import_wheel_gate() -> None:
         # At least one Ubuntu LTS — issue #355's environment was
         # ubuntu:22.04 + Python 3.12.
         'image: "ubuntu:22.04"',
-        # macOS native (no container) — Apple Silicon wheel.
-        "runner: macos-26",
     ]
     for sub in required_matrix_substrings:
         assert sub in content, (
             f"smoke matrix missing required entry: {sub!r}. The matrix "
             f"must cover the manylinux floor + at least one customer-"
-            f"representative environment per arch + macOS native."
+            f"representative environment per arch."
         )
 
     # Gating: publish-pypi must wait for the smoke job.
@@ -1677,144 +1689,6 @@ def test_release_yml_preserves_release_please_notes_when_release_exists() -> Non
     )
 
 
-def test_release_please_workflow_exists_and_targets_main() -> None:
-    """The release-please bot workflow must be present and watch main."""
-    rp_path = ROOT / ".github" / "workflows" / "release-please.yml"
-    assert rp_path.exists(), (
-        "release-please.yml is the bot that opens/maintains the release "
-        "PR. Without it, no release ever fires (release.yml now only "
-        "triggers on the release event the bot emits)."
-    )
-
-    content = rp_path.read_text(encoding="utf-8")
-    assert re.search(r"googleapis/release-please-action@[0-9a-f]{40} # v[45]\.", content), (
-        "release-please.yml must use the v4 or v5 action — earlier versions "
-        "have different manifest semantics."
-    )
-    assert "branches: [main]" in content, (
-        "release-please.yml must watch main; that's where the bot reads "
-        "conventional-commit traffic to compute version bumps."
-    )
-    assert "config-file: .release-please-config.json" in content
-    assert "manifest-file: .release-please-manifest.json" in content
-    assert "pull-requests: write" in content, (
-        "Bot needs write permission to open/update its release PR."
-    )
-    assert "contents: write" in content, (
-        "Bot needs contents write to tag the release commit on merge."
-    )
-
-
-def test_release_please_config_and_manifest_are_present_and_consistent() -> None:
-    """Config and manifest must agree with pyproject.toml's version."""
-    import json
-
-    # tomllib is stdlib on 3.11+; tomli is the backport for 3.10 (which
-    # the project still supports per pyproject.toml `requires-python`).
-    # Matches the same fallback pattern in headroom/release_version.py.
-    try:
-        import tomllib
-    except ModuleNotFoundError:  # pragma: no cover - Python 3.10 only
-        import tomli as tomllib  # type: ignore[no-redef]
-
-    manifest = json.loads((ROOT / ".release-please-manifest.json").read_text(encoding="utf-8"))
-    config = json.loads((ROOT / ".release-please-config.json").read_text(encoding="utf-8"))
-    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-
-    # Manifest tracks current version per package; the root package must
-    # match pyproject.toml exactly. A drift here means the bot will
-    # propose a version bump from the wrong base.
-    assert manifest["."] == pyproject["project"]["version"], (
-        f"manifest['.'] ({manifest['.']}) must match "
-        f"pyproject.toml version ({pyproject['project']['version']}). "
-        "Update the manifest when you bump pyproject.toml manually, or "
-        "let release-please own both."
-    )
-
-    # Config: the root package must declare python release-type so the
-    # bot updates pyproject.toml.
-    root_pkg = config["packages"]["."]
-    assert root_pkg["release-type"] == "python"
-    assert root_pkg["package-name"] == "headroom-ai"
-
-    # Tag format: existing tags in this repo are `vX.Y.Z`, NOT
-    # `headroom-ai-vX.Y.Z`. release-please's default for manifest
-    # configs prepends the component name; that would produce
-    # `headroom-ai-v0.22.4` and the bot would never find the existing
-    # `v0.22.3` baseline tag. include-component-in-tag MUST be false
-    # to keep tag format consistent with the project's pre-bot tags.
-    assert config.get("include-component-in-tag") is False, (
-        "include-component-in-tag must be false — existing tags are "
-        "`vX.Y.Z`, not `headroom-ai-vX.Y.Z`. Reverting this setting "
-        "would orphan every prior tag and produce a months-long "
-        "changelog because the bot can't find its baseline."
-    )
-
-    # This manifest has one package. Sending it through the merge plugin
-    # produces the group title `chore: release main`, which contains neither
-    # the package component nor its version. On merge, release-please cannot
-    # associate that title with `headroom-ai`, leaves the PR tagged
-    # `autorelease: pending`, and never emits the release event that publishes
-    # to PyPI. Keep the single package on the normal, versioned PR path and
-    # preserve the component in the title used to match the merged PR.
-    assert config.get("separate-pull-requests") is True, (
-        "The single root package must bypass release-please's merge plugin; "
-        "its grouped PR title is `chore: release main` and cannot be tagged."
-    )
-    assert config.get("pull-request-title-pattern") == ("chore: release${component} ${version}"), (
-        "Release PR titles must include both component and version so "
-        "release-please can match the merged PR back to headroom-ai."
-    )
-
-    # extra-files: TypeScript SDK and npm plugin package.json files
-    # files must be in lockstep with pyproject.toml.
-    extra_paths = {ef["path"] for ef in root_pkg.get("extra-files", [])}
-    assert "sdk/typescript/package.json" in extra_paths, (
-        "release-please must bump sdk/typescript/package.json so the npm "
-        "publish in release.yml ships the same version as the wheel."
-    )
-    assert "plugins/openclaw/package.json" in extra_paths, (
-        "release-please must bump plugins/openclaw/package.json so the "
-        "openclaw npm publish stays in sync."
-    )
-    assert "plugins/opencode/package.json" in extra_paths, (
-        "release-please must bump plugins/opencode/package.json so the "
-        "opencode npm publish stays in sync."
-    )
-
-
-def test_release_metadata_sync_runs_on_release_please_branch() -> None:
-    """The release branch must self-heal the versions release-please does not bump.
-
-    release-please rewrites `pyproject.toml` plus its configured `extra-files` only.
-    `server.json` is asserted byte-for-byte against `render_server_json()`, which
-    reads the version from `pyproject.toml`, so a bump without a sync fails
-    `test_root_server_json_matches_builder` on the release PR — that is what blocked
-    v0.33.0 (#2339). `release.yml` syncs in-workspace before its own gate, but the
-    regular CI test job does not, so the sync has to be committed to the branch.
-    """
-    content = (ROOT / ".github" / "workflows" / "release-metadata-sync.yml").read_text(
-        encoding="utf-8"
-    )
-
-    # Keyed off a push to the release branch: release-please force-regenerates that
-    # branch on every merge to main, which is what wiped the hand-pushed fixes.
-    assert '"release-please--branches--**"' in content
-    assert "contents: write" in content
-
-    # Sync, then gate on the verifier, then commit — in that order.
-    sync = content.index("python scripts/version-sync.py")
-    verify = content.index("python scripts/verify-versions.py", sync)
-    commit = content.index("git commit", verify)
-    assert sync < verify < commit
-
-    # Must no-op rather than loop when the branch is already in sync.
-    assert "git diff --quiet" in content
-
-    # A GITHUB_TOKEN push would not re-trigger the release PR's checks.
-    assert "RELEASE_PLEASE_TOKEN" in content
-
-
 def test_version_sync_covers_every_file_the_verifier_gates() -> None:
     """version-sync.py must write every version location verify-versions.py checks.
 
@@ -1849,67 +1723,45 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         assert fragment in sync, f"version-sync.py no longer propagates a version to {fragment}"
 
 
-def test_metadata_sync_does_not_persist_credentials_for_branch_supplied_code() -> None:
-    """The release credential must not be readable by the synced branch's code.
-
-    ``release-metadata-sync`` triggers on a push to the ``release-please--branches--**``
-    glob, which is not a protected namespace, and then runs
-    ``scripts/version-sync.py`` *from the checked-out branch*. With
-    ``actions/checkout``'s default ``persist-credentials: true`` the token is
-    written to ``.git/config`` before that script runs, so anyone able to push a
-    matching branch could read it. The credential reaches PyPI, npm and GHCR via
-    the ``release: published`` publishes, so this is not a theoretical leak.
-    """
-    workflow = yaml.safe_load(
-        (ROOT / ".github/workflows/release-metadata-sync.yml").read_text(encoding="utf-8")
+def test_release_please_automation_is_not_present() -> None:
+    obsolete_paths = (
+        ".github/workflows/release-please.yml",
+        ".github/workflows/release-metadata-sync.yml",
+        ".github/workflows/changelog-guard.yml",
+        ".release-please-config.json",
+        ".release-please-manifest.json",
     )
-    steps = workflow["jobs"]["sync"]["steps"]
 
-    checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
-    assert checkouts, "expected a checkout step"
-    for step in checkouts:
-        assert step.get("with", {}).get("persist-credentials") is False, step
-        # A token passed to checkout is exactly what persist-credentials would
-        # write to disk; the push step supplies it via env instead.
-        assert "token" not in step.get("with", {}), step
+    assert not [path for path in obsolete_paths if (ROOT / path).exists()]
 
 
-@pytest.mark.parametrize(
-    "workflow_path,job",
-    [
-        (".github/workflows/release-please.yml", "release-please"),
-        (".github/workflows/release-metadata-sync.yml", "sync"),
-    ],
-)
-def test_release_workflows_prefer_scoped_app_token(workflow_path: str, job: str) -> None:
-    """A repo-scoped, short-lived app token must be preferred over the PAT.
+def test_ci_covers_self_hosted_pushes_and_pull_requests() -> None:
+    workflow = yaml.load(
+        (ROOT / ".github" / "workflows" / "ci.yml").read_text(), Loader=yaml.BaseLoader
+    )
 
-    The PAT carries a maintainer's entire account and bypasses branch and tag
-    protection (#2955). The app-token step is gated on ``vars.RELEASE_APP_ID``
-    and marked ``continue-on-error`` so an unconfigured app falls back to the
-    existing chain rather than blocking a release.
-    """
-    workflow = yaml.safe_load((ROOT / workflow_path).read_text(encoding="utf-8"))
-    steps = workflow["jobs"][job]["steps"]
+    assert workflow["run-name"] == "CI / ${{ github.ref_name }}"
+    assert "self-hosted" in workflow["on"]["push"]["branches"]
+    assert "self-hosted" in workflow["on"]["pull_request"]["branches"]
+    native_filter = workflow["jobs"]["changes"]["steps"][1]["with"]["filters"]
+    assert "'config/deploy.yml'" in native_filter
+    assert "'docker-bake.hcl'" in native_filter
 
-    minters = [
-        s for s in steps if str(s.get("uses", "")).startswith("actions/create-github-app-token")
-    ]
-    assert len(minters) == 1, steps
-    minter = minters[0]
-    assert minter["id"] == "app-token"
-    assert minter["continue-on-error"] is True
-    assert "vars.RELEASE_APP_ID" in str(minter["if"])
 
-    # Whatever consumes the credential must try the app token first.
-    consumers = [
-        value
-        for step in steps
-        for value in list(step.get("with", {}).values()) + list(step.get("env", {}).values())
-        if "RELEASE_PLEASE_TOKEN" in str(value)
-    ]
-    assert consumers, "expected a step consuming the release credential"
-    for value in consumers:
-        assert str(value).index("steps.app-token.outputs.token") < str(value).index(
-            "secrets.RELEASE_PLEASE_TOKEN"
-        ), value
+def test_self_hosted_image_keeps_bedrock_and_memory_stack_dependencies() -> None:
+    bake = (ROOT / "docker-bake.hcl").read_text(encoding="utf-8")
+    target = bake.split('target "runtime-self-hosted"', 1)[1].split('\ntarget "', 1)[0]
+    assert 'HEADROOM_EXTRAS = "proxy,code,memory-stack,bedrock,redis"' in target
+
+
+def test_release_yml_preserves_existing_release_notes() -> None:
+    """create-release must not clobber an existing release's notes."""
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    create_release_idx = content.index("\n  create-release:")
+    create_release_block = content[create_release_idx:]
+
+    assert 'gh release edit "$TAG" --title "$TITLE"\n' in create_release_block, (
+        "When the release already exists, the edit "
+        "must only sync title — NOT pass --notes-file, which would "
+        "clobber the bot's auto-generated changelog."
+    )

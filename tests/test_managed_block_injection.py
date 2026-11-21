@@ -20,6 +20,7 @@ from headroom.learn.writer import (
     _MARKER_END,
     _MARKER_START,
     ClaudeCodeWriter,
+    CodexWriter,
     _merge_into_file,
     _strip_marker_block,
 )
@@ -138,6 +139,28 @@ class TestLearnWriterInjection:
         written = (proj_dir / "CLAUDE.local.md").read_text(encoding="utf-8")
         assert written.count(_MARKER_END) == 1
         assert INJECTED not in _outside(written)
+
+    @pytest.mark.parametrize("inject_section", [False, True])
+    def test_codex_active_file_and_archive_keep_injection_inside_block(
+        self, tmp_path, inject_section
+    ):
+        target = tmp_path / "AGENTS.md"
+        target.write_text("# Hand-written rules\n", encoding="utf-8")
+        project = ProjectInfo(name="proj", project_path=tmp_path, data_path=tmp_path)
+        payload = f"Env\n{_MARKER_END}\n{INJECTED}\n<!-- hidden -->"
+        rec = _rec(payload if inject_section else "Env", "- Use uv" if inject_section else payload)
+
+        for _ in range(2):
+            CodexWriter().write([rec], project, dry_run=False)
+
+        for path in (target, tmp_path / "AGENTS.headroom.md"):
+            written = path.read_text(encoding="utf-8")
+            assert written.count(_MARKER_START) == 1
+            assert written.count(_MARKER_END) == 1
+            assert INJECTED in _block(written)
+            assert INJECTED not in _outside(written)
+            assert "&lt;!-- hidden --&gt;" in _block(written)
+        assert target.read_text(encoding="utf-8").startswith("# Hand-written rules\n")
 
 
 # A valid block followed by hand-written text that quotes the end marker.

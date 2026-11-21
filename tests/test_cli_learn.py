@@ -76,6 +76,36 @@ class FakeAnalyzer:
         )
 
 
+def _write_codex_verbosity_session(root: Path) -> Path:
+    session_dir = root / "2026" / "06" / "27"
+    session_dir.mkdir(parents=True)
+    path = session_dir / "rollout.jsonl"
+    lines = [
+        {
+            "type": "response_item",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "please inspect this repo"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "model": "gpt-5.3-codex-spark",
+                "content": [{"type": "output_text", "text": " ".join(["word"] * 240)}],
+                "usage": {"input_tokens": 5000, "output_tokens": 240},
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(line) for line in lines))
+    return path
+
+
 def test_agent_choice_convert_and_shell_complete(monkeypatch: pytest.MonkeyPatch) -> None:
     choice = _AgentChoice()
     monkeypatch.setattr(click, "shell_completion", click_shell_completion)
@@ -324,7 +354,7 @@ def test_verbosity_all_apply_aggregates_baselines_across_projects(
         str(proj_b.project_path): (_Profile(3), base_b),
     }
 
-    def fake_analyze(session_paths, project_path, llm_judge=None):  # noqa: ANN001, ANN201
+    def fake_analyze(session_paths, project_path, llm_judge=None, on_progress=None):  # noqa: ANN001, ANN201
         return results[project_path]
 
     monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
@@ -533,6 +563,66 @@ def test_learn_main_only_flag_threads_to_scanner(
     )
     assert result.exit_code == 0, result.output
     assert plugin.last_include_subagents is False
+
+
+def test_learn_verbosity_codex_apply_writes_baseline(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    data_path = tmp_path / "codex-sessions"
+    expected_session = _write_codex_verbosity_session(data_path)
+    workspace = tmp_path / "workspace"
+
+    class CodexVerbosityPlugin(FakePlugin):
+        def __init__(self) -> None:
+            super().__init__(
+                "codex",
+                "OpenAI Codex CLI",
+                [SimpleNamespace(name="codex", project_path=project_path, data_path=data_path)],
+            )
+            self.verbosity_calls: list[Path] = []
+
+        def verbosity_session_paths(self, root: Path) -> list[Path]:
+            self.verbosity_calls.append(root)
+            return sorted(root.rglob("*.jsonl"))
+
+    plugin = CodexVerbosityPlugin()
+
+    monkeypatch.setattr("headroom.learn.registry.get_registry", lambda: {"codex": plugin})
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.paths.ensure_workspace_dir", lambda: workspace)
+
+    result = runner.invoke(
+        main,
+        [
+            "learn",
+            "--agent",
+            "codex",
+            "--verbosity",
+            "--project",
+            str(project_path),
+            "--apply",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert plugin.verbosity_calls == [data_path]
+    assert "Verbosity — codex" in result.output
+    assert "Discovering OpenAI Codex CLI sessions..." in result.output
+    assert "Reading responses (pass 1/2): 0/1 completed" in result.output
+    assert "Reading responses (pass 1/2): 1/1 completed" in result.output
+    assert "Checking reading times (pass 2/2): 1/1 completed" in result.output
+    assert "Saving verbosity preference and savings baseline..." in result.output
+    assert "[WROTE]" in result.output
+    assert expected_session.exists()
+
+    verbosity = json.loads((workspace / "verbosity.json").read_text())
+    assert verbosity["project_path"] == str(project_path)
+
+    ledger = json.loads((workspace / "output_savings.json").read_text())
+    assert ledger["baseline"]["glob"]["n"] == 1
 
 
 class TargetAwareWriter(FakeWriter):
@@ -772,9 +862,16 @@ def _apply_learned_level(
     monkeypatch.setattr(
         "headroom.learn.registry.get_plugin", lambda name: FakePlugin(name, "Claude", [project])
     )
+
+    def fake_analyze(session_paths, project_path, llm_judge=None, on_progress=None):  # noqa: ANN001, ANN201
+        assert callable(on_progress), "verbosity analysis must receive a progress callback"
+        on_progress("Reading responses (pass 1/2)", 0, 1)
+        on_progress("Reading responses (pass 1/2)", 1, 1)
+        return profile, baseline
+
     monkeypatch.setattr(
         "headroom.learn.verbosity.analyze",
-        lambda session_paths, project_path, llm_judge=None: (profile, baseline),
+        fake_analyze,
     )
     monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
     monkeypatch.setenv("HEADROOM_PORT", str(_PROXY_PORT))
@@ -786,6 +883,8 @@ def _apply_learned_level(
         catch_exceptions=False,
     )
     assert result.exit_code == 0, result.output
+    assert "Reading responses (pass 1/2): 0/1 completed" in result.output
+    assert "Reading responses (pass 1/2): 1/1 completed" in result.output
     return result.output
 
 

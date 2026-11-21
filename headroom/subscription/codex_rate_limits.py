@@ -52,6 +52,10 @@ import httpx
 
 from headroom.offline import OfflineEgressBlocked, guard_egress, is_offline, note_refusal
 from headroom.subscription.base import QuotaTracker
+from headroom.subscription.credential_policy import (
+    CODEX_QUOTA_OPERATOR_ENV,
+    is_configured_codex_operator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -345,9 +349,14 @@ class CodexRateLimitState(QuotaTracker):
         self._latest: CodexRateLimitSnapshot | None = None
         self._last_poll_monotonic: float = 0.0
         self._poll_inflight: bool = False
+        self._operator_headers: dict[str, str] | None = None
 
     def update_from_headers(self, headers: dict[str, str]) -> None:
         """Update state from a response header dict (no-op if no Codex headers)."""
+        # In pinned mode only the authenticated usage GET is authoritative;
+        # another proxy client's response headers cannot replace operator data.
+        if os.environ.get(CODEX_QUOTA_OPERATOR_ENV, "").strip():
+            return
         snapshot = parse_codex_rate_limits(headers)
         if snapshot is None:
             return
@@ -385,6 +394,23 @@ class CodexRateLimitState(QuotaTracker):
     def _end_poll(self) -> None:
         with self._lock:
             self._poll_inflight = False
+
+    def remember_operator_headers(self, headers: dict[str, str]) -> None:
+        """Keep the selected operator's current access token in memory only."""
+        with self._lock:
+            self._operator_headers = dict(headers)
+
+    def operator_headers(self) -> dict[str, str] | None:
+        with self._lock:
+            headers = dict(self._operator_headers) if self._operator_headers else None
+        if headers is None:
+            return None
+        if is_configured_codex_operator(headers):
+            return headers
+        with self._lock:
+            self._operator_headers = None
+            self._latest = None
+        return None
 
     @property
     def latest(self) -> CodexRateLimitSnapshot | None:
@@ -455,7 +481,14 @@ async def _fetch_and_store_usage(url: str, headers: dict[str, str]) -> None:
         async with httpx.AsyncClient(timeout=_USAGE_POLL_TIMEOUT_S) as client:
             resp = await client.get(url, headers=headers)
         if resp.status_code == 200:
+            selected = is_configured_codex_operator(headers)
+            if os.environ.get(CODEX_QUOTA_OPERATOR_ENV, "").strip() and not selected:
+                return
             if state.update_from_usage_payload(resp.json()):
+                if selected:
+                    # Remember credentials only after OpenAI accepted them.
+                    # Forged identity claims must not replace a working token.
+                    state.remember_operator_headers(headers)
                 logger.debug("codex usage poll: refreshed rate-limit window")
             else:
                 logger.debug("codex usage poll: 200 but no usable rate-limit data")
@@ -486,12 +519,17 @@ def maybe_schedule_usage_poll(
     :func:`_build_usage_headers` and internally throttled to at most one live
     poll per ``min_interval_s``. Returns ``True`` when a poll was scheduled.
 
-    The poll spends the *caller's* bearer, so it runs only when
-    ``from_local_operator`` is true (the handler passes
-    :func:`headroom.subscription.credential_policy.is_local_operator_connection`).
-    A network caller on a shared proxy never drives it (VAPT 01-F16).
+    By default only direct local operators may drive this poll (VAPT 01-F16).
+    With HEADROOM_CODEX_QUOTA_OPERATOR set, only that pinned issuer/user/workspace
+    may drive it, including through a remote proxy. OpenAI still validates the
+    bearer on the usage GET. Other callers never drive operator quota polling.
     """
-    if not from_local_operator:
+    from headroom.providers.codex.runtime import resolve_codex_routing_headers
+
+    request_headers, _ = resolve_codex_routing_headers(request_headers)
+    pinned = bool(os.environ.get(CODEX_QUOTA_OPERATOR_ENV, "").strip())
+    selected = is_configured_codex_operator(request_headers) if pinned else False
+    if (pinned and not selected) or (not pinned and not from_local_operator):
         return False
     headers = _build_usage_headers(request_headers)
     if headers is None:
@@ -510,4 +548,16 @@ def maybe_schedule_usage_poll(
     if not state._try_begin_poll(min_interval_s):
         return False
     loop.create_task(_fetch_and_store_usage(url, headers))
+    return True
+
+
+async def refresh_operator_usage() -> bool:
+    """Bounded on-demand refresh using only a previously selected operator token."""
+    if is_offline():
+        return False
+    state = get_codex_rate_limit_state()
+    headers = state.operator_headers()
+    if headers is None or not state._try_begin_poll(USAGE_POLL_MIN_INTERVAL_S):
+        return False
+    await _fetch_and_store_usage(CODEX_USAGE_URL, headers)
     return True

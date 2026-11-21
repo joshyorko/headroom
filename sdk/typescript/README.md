@@ -33,6 +33,8 @@ const response = await openai.chat.completions.create({
 });
 ```
 
+Requires a running Headroom proxy (`headroom proxy`) or Headroom Cloud API key.
+
 Pass `baseUrl` if the proxy is not on `http://localhost:8787`.
 
 ## Framework Adapters

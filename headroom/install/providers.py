@@ -104,10 +104,10 @@ def _remove_unix_env_scope(mutations: list[ManagedMutation]) -> None:
         path = Path(mutation.path)
         if not path.exists():
             continue
-        content = fsutil.read_text(path)
+        content = path.read_text()
         if _ENV_MARKER_START not in content:
             continue
-        fsutil.write_text(path, _ENV_PATTERN.sub("", content).strip() + "\n")
+        path.write_text(_ENV_PATTERN.sub("", content).strip() + "\n")
 
 
 def _apply_windows_env_scope(manifest: DeploymentManifest) -> list[ManagedMutation]:

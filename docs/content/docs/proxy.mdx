@@ -38,6 +38,47 @@ The install id is a random UUID generated on first run and stored in your config
 
 Disable it with `HEADROOM_BEACON=off`, `HEADROOM_TELEMETRY=off` (or `--no-telemetry`), the `DO_NOT_TRACK=1` convention, or `HEADROOM_OFFLINE=1` (which also disables update checks and license reporting). `HEADROOM_BEACON=on` keeps the beacon on even with local stats off. `headroom telemetry` names the setting that turned it off.
 
+## T3 Code hub usage reporting
+
+This self-hosted build supports T3 Code's existing hub usage reader. In T3's
+hub settings, enter the Headroom **base URL**, such as `http://10.10.10.89`,
+and use `HEADROOM_PROXY_TOKEN` as the management key/password. Do not append
+`/v1` or a management endpoint. An existing hub can be refreshed after the
+updated Headroom image is deployed; no T3 build update is needed.
+
+Headroom implements `GET /v0/management/auth-files` and
+`POST /v0/management/api-call` for reporting cached Claude and Codex quota
+windows. The records represent Headroom's provider trackers, not an inventory
+of separate signed-in accounts. Polling and credential acquisition continue
+to follow Headroom's existing subscription-tracking policy; adding a hub does
+not sign in to a provider or start polling with the management key.
+
+For a self-hosted proxy serving your remote Codex sessions, opt in to quota
+collection for your own account. On the workstation where Codex is signed in,
+run `python -m headroom.subscription.credential_policy` using your Headroom
+environment. Put the printed fingerprint in `HEADROOM_CODEX_QUOTA_OPERATOR` in
+`.env.kamal.local`, then redeploy. The fingerprint selects the token issuer,
+user, and workspace, so it survives ordinary access-token rotation. It is not
+an access token or refresh token.
+
+After redeployment, send one Codex turn through Headroom to establish the
+operator session. Matching HTTP and WebSocket sessions can refresh the quota;
+T3 hub reads can then request a bounded refresh at most once per minute.
+OpenAI validates the bearer on the fixed usage endpoint before Headroom stores
+its response. Forwarded access tokens are held only in process memory. No
+refresh token is copied to the server. After a restart or an expired token,
+a new matching Codex session supplies the current token.
+
+Without this opt-in, remote callers remain unable to drive background usage
+polling. Other users and workspaces cannot replace the pinned operator's
+snapshot. Claude still requires its existing operator credential setup.
+
+Missing or expired quota is reported as unavailable until the tracker receives
+usable data. Copilot is not listed because T3's current hub reader has no
+Copilot provider. Reset-credit actions and other management operations are
+unsupported. Reporting requests never forward their supplied URL or headers
+to another server, and use the same operator-read access checks as `/quota`.
+
 ## CLI options
 
 ### Core
@@ -516,13 +557,10 @@ curl http://localhost:8787/metrics
 ```
 headroom_requests_total{mode="optimize"} 1234
 headroom_tokens_saved_total 5678900
-headroom_persistent_savings_tokens_saved_total 5678900
 headroom_compression_ratio_bucket{le="0.5"} 890
 headroom_latency_seconds_bucket{le="0.01"} 800
 headroom_cache_hits_total 456
 ```
-
-`headroom_tokens_saved_total` is the runtime counter for the current proxy process. Use `headroom_persistent_savings_tokens_saved_total` for durable lifetime savings that match `/stats.persistent_savings`.
 
 ### `POST /v1/messages`
 

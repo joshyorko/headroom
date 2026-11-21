@@ -11,6 +11,7 @@ byte-identical.
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import json
 import sys
@@ -207,6 +208,19 @@ _CODEX_HEADERS = {
 }
 
 
+def _oauth_headers() -> dict[str, str]:
+    payload = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                {"https://api.openai.com/auth": {"chatgpt_account_id": "acct_test"}}
+            ).encode()
+        )
+        .decode()
+        .rstrip("=")
+    )
+    return {"authorization": f"Bearer header.{payload}.signature"}
+
+
 def _post(
     body_bytes: bytes, *, stream: bool, extra_headers: dict[str, str] | None = None
 ) -> tuple[bytes, list[str]]:
@@ -274,6 +288,35 @@ def test_http_bypass_request_is_forwarded_byte_identical(stream: bool) -> None:
     assert not any("event=web_search_history" in m for m in logs)
 
 
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "buffered"])
+@pytest.mark.parametrize("custom", [False, True], ids=["openai", "custom"])
+def test_http_api_key_preserves_web_search_history(stream: bool, custom: bool) -> None:
+    body_bytes = json.dumps(_compaction_body(stream=stream), indent=2).encode()
+    headers = {"authorization": "Bearer test-token", "content-type": "application/json"}
+    if custom:
+        headers["x-headroom-base-url"] = "https://example.com/v1"
+    client, transport = _make_no_optimize_app()
+    response = client.post("/v1/responses", headers=headers, content=body_bytes)
+    assert response.status_code == 200
+    assert transport.captured_body == body_bytes
+    assert transport.captured_url is not None
+    assert transport.captured_url.startswith(
+        "https://example.com/" if custom else "https://api.openai.com/"
+    )
+
+
+def test_http_oauth_claim_routes_to_chatgpt_and_drops_history() -> None:
+    client, transport = _make_no_optimize_app()
+    response = client.post(
+        "/v1/responses", headers=_oauth_headers(), json=_compaction_body(stream=False)
+    )
+    assert response.status_code == 200
+    assert transport.captured_url is not None
+    assert transport.captured_url.startswith("https://chatgpt.com/")
+    assert transport.captured_body is not None
+    assert "web_search_call" not in _types(json.loads(transport.captured_body))
+
+
 # --- Codex WebSocket /v1/responses ------------------------------------------
 
 
@@ -291,7 +334,7 @@ def _upstream_events() -> list[str]:
 @pytest.mark.asyncio
 async def test_ws_first_frame_reaches_upstream_without_web_search_calls() -> None:
     upstream = _FakeUpstream(_upstream_events())
-    client_ws = _FakeWebSocket(frames=[_frame(_compaction_body())])
+    client_ws = _FakeWebSocket(frames=[_frame(_compaction_body())], headers=_CODEX_HEADERS)
 
     with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
         await _DummyOpenAIHandler().handle_openai_responses_ws(client_ws)
@@ -337,9 +380,9 @@ async def test_ws_bypass_session_frames_reach_upstream_unchanged() -> None:
 async def test_ws_escaped_web_search_call_frame(bypass: bool) -> None:
     escaped = (
         '{"type":"response.create","response":{"model":"gpt-5-codex","input":'
-        '[{"type":"web_search\\u005fcall","id":"ws_1"}],"tools":[]}}'
+        '[{"type":"web_search\\u005fcall","id":"ws_1"}],"tools":[],"store":false}}'
     )
-    headers = {"authorization": "Bearer test"}
+    headers = dict(_CODEX_HEADERS)
     if bypass:
         headers["x-headroom-bypass"] = "true"
     upstream = _FakeUpstream([], hold_after_events=True)
@@ -370,7 +413,9 @@ async def test_ws_later_frame_reaches_upstream_without_web_search_calls() -> Non
     normal_turn = _frame(_compaction_body(tools=[{"type": "web_search"}]))
     compaction = _frame(_compaction_body())
     upstream = _FakeUpstream([], hold_after_events=True)
-    client_ws = _FakeWebSocket(frames=[normal_turn, compaction], hold_after_initial=True)
+    client_ws = _FakeWebSocket(
+        frames=[normal_turn, compaction], headers=_CODEX_HEADERS, hold_after_initial=True
+    )
 
     async def _disconnect_soon() -> None:
         await asyncio.sleep(0.05)
@@ -389,6 +434,40 @@ async def test_ws_later_frame_reaches_upstream_without_web_search_calls() -> Non
     # The turn that declares the tool goes out as the client sent it.
     assert upstream.sent[0] == normal_turn
     assert "web_search_call" not in upstream.sent[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("custom", [False, True], ids=["openai", "custom"])
+async def test_ws_api_key_preserves_web_search_history(custom: bool) -> None:
+    compaction = _frame(_compaction_body())
+    upstream = _FakeUpstream([], hold_after_events=True)
+    client_ws = _FakeWebSocket(frames=[compaction, compaction], hold_after_initial=True)
+    handler = _DummyOpenAIHandler()
+    if custom:
+        handler.OPENAI_API_URL = "https://example.com"
+
+    async def _disconnect_soon() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        trigger = asyncio.create_task(_disconnect_soon())
+        try:
+            await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+        finally:
+            trigger.cancel()
+
+    assert upstream.sent == [compaction, compaction]
+
+
+@pytest.mark.asyncio
+async def test_ws_oauth_claim_drops_history() -> None:
+    upstream = _FakeUpstream(_upstream_events())
+    client_ws = _FakeWebSocket(frames=[_frame(_compaction_body())], headers=_oauth_headers())
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await _DummyOpenAIHandler().handle_openai_responses_ws(client_ws)
+    assert len(upstream.sent) == 1
+    assert "web_search_call" not in _types(json.loads(upstream.sent[0])["response"])
 
 
 @pytest.mark.asyncio

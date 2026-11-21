@@ -83,6 +83,7 @@ def _auth_signals(headers: Mapping[str, Any] | Any) -> AuthSignals:
         x_api_key=_header_get(headers, "x-api-key"),
         x_goog_api_key=_header_get(headers, "x-goog-api-key"),
         x_client=_header_get(headers, "x-client"),
+        x_headroom_client=_header_get(headers, "x-headroom-client"),
     )
 
 
@@ -94,10 +95,10 @@ def classify_auth_mode(headers: Mapping[str, Any] | Any) -> AuthMode:
     1. **Subscription UA prefix** → :data:`AuthMode.SUBSCRIPTION`.
        The CLI's own auth-mode wins over the bearer token shape it
        happens to be carrying — a Claude Code session uses a
-       ``sk-ant-oat*`` token but is a subscription client, not OAuth.
-    2. **``Authorization: Bearer sk-ant-oat*``** → :data:`AuthMode.OAUTH`
+       ``sk-ant-oat-*`` token but is a subscription client, not OAuth.
+    2. **``Authorization: Bearer sk-ant-oat-*``** → :data:`AuthMode.OAUTH`
        (Claude Pro / Max OAuth). Checked before the broader ``sk-``
-       PAYG rule because ``sk-ant-oat`` shares the ``sk-`` prefix.
+       PAYG rule because ``sk-ant-oat-`` shares the ``sk-`` prefix.
     3. **``Authorization: Bearer sk-ant-api*`` or ``Bearer sk-*``** →
        :data:`AuthMode.PAYG` (Anthropic / OpenAI API key).
     4. **``Authorization: Bearer <jwt>``** (3 dot-separated segments)
@@ -129,11 +130,13 @@ def classify_client(headers: Mapping[str, Any] | Any, *, default: str | None = N
     1. **``X-Client`` header** (explicit override) — clients that
        know they're talking to Headroom can self-identify with a
        short name. Trimmed, lowercased. Wins over UA matching.
-    2. **User-Agent substring match** against :data:`CLIENT_UA_MAP`
+    2. **``X-Headroom-Client`` header** — internal path-prefix attribution
+       added by Headroom for clients that cannot set headers.
+    3. **User-Agent substring match** against :data:`CLIENT_UA_MAP`
        — covers the unmodified-client case. Substring, not prefix,
        because some clients prepend a corporate-wrapper UA before
        their own.
-    3. **None** when neither produces a hit. ``None`` is the loud
+    4. **None** when neither produces a hit. ``None`` is the loud
        "unknown harness" signal; downstream consumers can group
        these as "unidentified" rather than silently bucketing them
        into a default.

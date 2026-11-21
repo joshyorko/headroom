@@ -55,8 +55,9 @@ SCOPE_USER = "user"
 
 #: Claude Code scope covering only sessions started in one directory.
 SCOPE_LOCAL = "local"
+SCOPE_PROJECT = "project"
 
-_VALID_SCOPES = (SCOPE_USER, SCOPE_LOCAL)
+_VALID_SCOPES = (SCOPE_USER, SCOPE_LOCAL, SCOPE_PROJECT)
 
 
 class ClaudeConfigMutationError(ValueError):
@@ -128,6 +129,8 @@ class ClaudeRegistrar(MCPRegistrar):
     # ------------------------------------------------------------------
 
     def detect(self) -> bool:
+        if self.scope == SCOPE_PROJECT:
+            return True
         if self._claude_cli:
             return True
         return self._claude_dir.is_dir() or self._modern_config.exists()
@@ -184,7 +187,7 @@ class ClaudeRegistrar(MCPRegistrar):
     def validate_configs_for_mutation(self) -> None:
         """Validate every Claude config root before an explicit mutation."""
         seen: set[Path] = set()
-        for config_path in (self._modern_config, self._legacy_config):
+        for config_path in self._config_paths(self.scope):
             if config_path in seen or not config_path.exists():
                 continue
             seen.add(config_path)
@@ -306,7 +309,11 @@ class ClaudeRegistrar(MCPRegistrar):
         # Prefer the modern config path. If only the legacy file exists,
         # write to that to avoid surprising older clients — but project scope
         # only exists in the modern config, so it always goes there.
-        target = self._modern_config
+        target = (
+            (self._project_dir() / ".mcp.json")
+            if self.scope == SCOPE_PROJECT
+            else self._modern_config
+        )
         if (
             self.scope == SCOPE_USER
             and not self._modern_config.exists()
@@ -369,6 +376,8 @@ class ClaudeRegistrar(MCPRegistrar):
             if scope not in _VALID_SCOPES:
                 raise ValueError(f"scope must be one of {_VALID_SCOPES}, got {scope!r}")
             return (scope,)
+        if self.scope == SCOPE_PROJECT:
+            return (SCOPE_PROJECT,)
         return (SCOPE_LOCAL, SCOPE_USER)
 
     def _config_paths(self, scope: str) -> tuple[Path, ...]:
@@ -377,6 +386,8 @@ class ClaudeRegistrar(MCPRegistrar):
         The legacy ``~/.claude/mcp.json`` has no notion of projects, so it is
         only consulted for user scope.
         """
+        if scope == SCOPE_PROJECT:
+            return (self._project_dir() / ".mcp.json",)
         if scope == SCOPE_LOCAL:
             return (self._modern_config,)
         return (self._modern_config, self._legacy_config)
@@ -394,7 +405,7 @@ class ClaudeRegistrar(MCPRegistrar):
             # Preserve the pre-scope key so existing installs migrate safely.
             return server_name
         project = os.path.normcase(os.path.normpath(str(self._project_dir().resolve())))
-        return f"{server_name}:local:{project}"
+        return f"{server_name}:{target_scope}:{project}"
 
     def _project_key(self, config: dict[str, Any]) -> str:
         """Key under ``projects`` naming the current directory.
@@ -459,7 +470,7 @@ class ClaudeRegistrar(MCPRegistrar):
         working directory, so a registrar pointed at a different project
         directory has to move the subprocess with it.
         """
-        if scope != SCOPE_LOCAL or self._project_dir_override is None:
+        if scope not in (SCOPE_LOCAL, SCOPE_PROJECT) or self._project_dir_override is None:
             return None
         return str(self._project_dir_override)
 
@@ -505,7 +516,7 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path) as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return {}

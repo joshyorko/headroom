@@ -13,7 +13,7 @@ By participating, you agree to our [Code of Conduct](CODE_OF_CONDUCT.md).
 | 🧹 Refactor-only | **Don't.** Only if a maintainer asked, as part of a concrete fix. |
 | 🧪 Test/CI-only PR chasing a known `main` failure | **Don't.** We're tracking it. |
 | 📦 New dep or version bump | **PR with written justification.** |
-| ❓ Question | Ask in **Discord `#help`** |
+| ❓ Question | **Discord `#help` |
 
 **Open PR cap: 10 per author.** Get existing ones merged before opening more.
 
@@ -124,12 +124,6 @@ Two configs ship for VS Code / Codespaces:
 - **`.devcontainer/memory-stack/devcontainer.json`** — adds Qdrant + Neo4j sidecars (use `qdrant:6333`, `neo4j://neo4j:7687`).
 
 Inside, use: `uv run ruff check .`, `uv run pytest`, etc.
-
-## Optional automated review
-
-This repository includes `.github/copilot-instructions.md` so maintainers can opt into GitHub Copilot code review without adding workflow billing noise to every PR.
-
-Enable or disable automatic Copilot review in **Settings → Rules → Rulesets → Automatically request Copilot code review**. Keep it off unless maintainers explicitly want the extra review traffic.
 
 ## Coding standards
 

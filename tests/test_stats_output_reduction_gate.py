@@ -35,6 +35,8 @@ def test_inactive_shaper_claims_zero_regardless_of_ledger():
     assert payload["tokens_saved"] == 0
     assert payload["reduction_percent"] == 0.0
     assert payload["requests"] == 0
+    assert payload["estimate_reliable"] is False
+    assert payload["display_tokens_saved"] is None
     # Still an available, well-formed layer entry, so consumers can render
     # "inactive" instead of mistaking absence for zero measurement.
     assert payload["available"] is True
@@ -49,6 +51,8 @@ def test_active_shaper_publishes_the_estimate_as_before():
     assert payload["tokens_saved"] == -7_522_490
     assert payload["reduction_percent"] == -147.9
     assert payload["requests"] == 19_644
+    assert payload["estimate_reliable"] is False
+    assert payload["display_tokens_saved"] is None
 
 
 def test_active_shaper_without_data_stays_unavailable():

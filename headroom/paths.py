@@ -99,26 +99,19 @@ def _env(name: str) -> str:
 # ---------------------------------------------------------------------------
 # Process-wide stateless flag
 # ---------------------------------------------------------------------------
-# Stateless mode forbids writes to the workspace. Many persisters are
-# module-level singletons reached without a config object, so the proxy records
-# the mode here once at startup and writers consult ``process_is_stateless()``.
 
 _PROCESS_STATELESS: bool = False
 
 
 def set_process_stateless(value: bool) -> None:
-    """Record process-wide stateless mode (set once at proxy startup)."""
+    """Record process-wide stateless mode for module-level persisters."""
 
     global _PROCESS_STATELESS
     _PROCESS_STATELESS = bool(value)
 
 
 def process_is_stateless() -> bool:
-    """True when the process must not write to the workspace.
-
-    True if ``set_process_stateless(True)`` was called OR the ``HEADROOM_STATELESS``
-    environment variable is set, so non-proxy entrypoints honor it too.
-    """
+    """Return true when this process must not write workspace state."""
 
     if _PROCESS_STATELESS:
         return True

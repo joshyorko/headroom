@@ -236,23 +236,24 @@ headroom wrap openclaw
 
 ## How It Works
 
-Headroom runs a two-stage pipeline on every request:
+Headroom runs a three-stage pipeline on every request:
 
 ```mermaid
 graph LR
     A[Your Prompt] --> B[CacheAligner]
     B --> C[ContentRouter]
-    C --> E[LLM Provider]
+    C --> D[IntelligentContext]
+    D --> E[LLM Provider]
 
     C -->|JSON| F[SmartCrusher]
     C -->|Code| G[CodeCompressor]
     C -->|Text| H[Kompress]
     C -->|Logs| I[LogCompressor]
 
-    F --> E
-    G --> E
-    H --> E
-    I --> E
+    F --> D
+    G --> D
+    H --> D
+    I --> D
 ```
 
 **Stage 1: CacheAligner** — Stabilizes message prefixes so the provider's KV cache actually hits. Claude offers a 90% read discount on cached prefixes; CacheAligner makes that work.
@@ -269,7 +270,7 @@ graph LR
 | Git diffs | **DiffCompressor** | Preserves change hunks, drops unchanged context. |
 | HTML | **HTMLExtractor** | Strips markup, extracts readable content. |
 
-Context management is handled automatically inside the pipeline (live-zone-only compression): Headroom compresses only the newest content blocks (the latest user message and tool results) and never drops messages from history. The system prompt, tool definitions, and older turns — the provider cache hot zone — are left untouched so prompt caching keeps working.
+**Stage 3: IntelligentContext** — If the conversation still exceeds the model's context limit, scores each message by importance (recency, references, density) and drops the lowest-value ones.
 
 **Nothing is lost.** Compressed content goes into the CCR store (Compress-Cache-Retrieve). The LLM gets a `headroom_retrieve` tool and can fetch full originals when it needs more detail.
 

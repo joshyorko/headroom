@@ -1,0 +1,8 @@
+{
+  "name": "headroom-builder",
+  "engineVersion": "v0.21.7",
+  "sdk": {
+    "source": "python"
+  },
+  "source": ".dagger"
+}

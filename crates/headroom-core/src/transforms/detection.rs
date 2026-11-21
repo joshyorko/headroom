@@ -28,14 +28,6 @@
 //! issue. Loud-on-error stays at the [`magika_detect`] entry point for
 //! callers who care; the chain swallows the err with a log line.
 //!
-//! # CPU compatibility
-//!
-//! Precompiled ONNX Runtime binaries from `ort-sys` may contain AVX2-family
-//! instructions. On x86/x86_64 CPUs where AVX2 is unavailable, the magika
-//! session init returns an init error before touching ONNX. The chain
-//! handles this identically to any other tier-1 error — logs it and falls
-//! through to Tier 2 / Tier 3.
-//!
 //! # SearchResults / BuildOutput
 //!
 //! The retired regex detector recognized grep-style search output
@@ -159,8 +151,7 @@ mod tests {
                     +    print(\"new\")\n";
         // Either magika tags it `diff` (Tier 1 hit) or magika
         // mis-classifies as text and unidiff catches it (Tier 2).
-        // On no-AVX2 hosts, magika is unavailable so Tier 2 still
-        // catches the diff. Both paths produce GitDiff.
+        // Both paths produce GitDiff.
         assert_eq!(detect(diff), ContentType::GitDiff);
     }
 
@@ -169,7 +160,7 @@ mod tests {
         // Magika often mis-classifies naked hunks (no `diff --git`
         // wrapper) because the visible bytes look like ordinary
         // patch lines mixed with code. Tier 2 (unidiff parser)
-        // catches these — even when magika is unavailable.
+        // catches these.
         let diff = "--- a/foo.py\n\
                     +++ b/foo.py\n\
                     @@ -1,2 +1,2 @@\n\
@@ -262,8 +253,6 @@ mod tests {
     fn chain_is_deterministic_across_repeated_calls() {
         // Magika returns the same label for identical input on
         // repeated calls; the chain wraps that determinism.
-        // On no-AVX2 hosts, the chain always falls through to
-        // PlainText — which is equally deterministic.
         let payload = r#"{"users": [{"id": 1}, {"id": 2}]}"#;
         let a = detect(payload);
         let b = detect(payload);

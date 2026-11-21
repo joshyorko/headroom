@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if kamal_path="$(command -v kamal 2>/dev/null)" && {
+  [[ "$kamal_path" != "${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims/"* ]] ||
+    mise which kamal >/dev/null 2>&1
+}; then
+  exec "$kamal_path" "$@"
+fi
+
+exec docker run --rm -it \
+  --network host \
+  -v "$PWD:/work" \
+  -v "$HOME/.ssh:/root/.ssh:ro" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -w /work \
+  ghcr.io/basecamp/kamal:latest "$@"

@@ -28,12 +28,6 @@
 //! - **No router rewiring here.** PR3 lands the detector + tests
 //!   only. PR5 flips the ContentRouter to call us instead of the
 //!   regex-based [`crate::transforms::content_detector`].
-//!
-//! - **CPU compatibility.** The precompiled ONNX Runtime binary shipped by
-//!   `ort-sys` may contain AVX2-family instructions on x86/x86_64. Where
-//!   AVX2 is unavailable on those targets, the session init returns an
-//!   error early instead of crashing with SIGILL; the detection chain then
-//!   falls through to Tier 2 and Tier 3 normally.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;

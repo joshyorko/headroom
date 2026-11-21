@@ -159,7 +159,8 @@ def _connect_name(host: str) -> str | None:
     import httpx  # local: this module otherwise needs only the standard library
 
     try:
-        return httpx.URL(scheme="https", host=key).raw_host.decode("ascii").lower()
+        raw_host: bytes = httpx.URL(scheme="https", host=key).raw_host
+        return raw_host.decode("ascii").lower()
     except (httpx.InvalidURL, UnicodeError):
         return None
 

@@ -162,11 +162,7 @@ class _Accum:
         return max(0.0, (self.qsumsq - self.qsum * self.qsum / self.qn) / (self.qn - 1))
 
     def merge(self, other: _Accum) -> None:
-        """Fold another accumulator's observations into this one.
-
-        n / sum / sumsq are additive, so merging is element-wise addition and
-        is exactly equivalent to having ``add``-ed both observation streams.
-        """
+        """Fold another accumulator into this one."""
         self.n += other.n
         self.sum += other.sum
         self.sumsq += other.sumsq
@@ -219,16 +215,9 @@ class BaselineModel:
         self.glob.add(output_tokens)
 
     def merge(self, other: BaselineModel) -> None:
-        """Fold another baseline's observations into this one.
-
-        Per-stratum and global accumulators are additive, so merging is
-        element-wise and order-independent — the result is identical to having
-        observed both corpora against a single model. Used to aggregate a
-        cross-project baseline from per-project ``analyze`` results without
-        re-reading transcripts.
-        """
-        for key, acc in other.strata.items():
-            self.strata.setdefault(key, _Accum()).merge(acc)
+        """Accumulate another learned baseline without losing its sample weights."""
+        for key, source in other.strata.items():
+            self.strata.setdefault(key, _Accum()).merge(source)
         self.glob.merge(other.glob)
 
     def lookup(self, key: str, *, fall_back_to_global: bool = False) -> tuple[float, float, int]:
@@ -377,6 +366,12 @@ class SavingsEstimate:
     # "measured" (A/B holdout) > "estimated" (synthetic control) >
     # "modelled" (benchmark default factor -- not this deployment's traffic)
     kind: str
+    # Retain downstream reliability metadata for the self-hosted dashboard and
+    # CLI. Modelled estimates explicitly remain unmeasured deployment claims.
+    estimate_reliable: bool = False
+    estimate_status: str = "unmeasured"
+    estimate_reasons: list[str] = field(default_factory=list)
+    estimate_quality: str = "unmeasured"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -592,6 +587,13 @@ class SavingsLedger:
         hi = total_saved + 1.96 * se
         ci_low = (lo / total_baseline * 100.0) if total_baseline > 0 else 0.0
         ci_high = (hi / total_baseline * 100.0) if total_baseline > 0 else 0.0
+        estimate_reliable, estimate_status, estimate_reasons = SavingsLedger._estimate_status(
+            tokens_saved=total_saved,
+            pct=pct,
+            ci_low_pct=ci_low,
+            ci_high_pct=ci_high,
+            n_requests=n_requests,
+        )
         return SavingsEstimate(
             tokens_saved=total_saved,
             baseline_tokens=total_baseline,
@@ -600,7 +602,38 @@ class SavingsLedger:
             ci_high_pct=ci_high,
             n_requests=n_requests,
             kind=kind,
+            estimate_reliable=estimate_reliable,
+            estimate_status=estimate_status,
+            estimate_reasons=estimate_reasons,
+            estimate_quality=estimate_status,
         )
+
+    @staticmethod
+    def _estimate_status(
+        *,
+        tokens_saved: float,
+        pct: float,
+        ci_low_pct: float,
+        ci_high_pct: float,
+        n_requests: int,
+    ) -> tuple[bool, str, list[str]]:
+        reasons: list[str] = []
+        if n_requests < 30:
+            reasons.append("low_sample")
+        if ci_low_pct <= 0 <= ci_high_pct:
+            reasons.append("inconclusive")
+        if tokens_saved < 0:
+            reasons.append("negative")
+        if abs(pct) > 100:
+            reasons.append("unstable")
+        if not reasons:
+            return True, "stable", []
+        if "low_sample" in reasons:
+            return False, "warming", reasons
+        for status in ("inconclusive", "negative", "unstable"):
+            if status in reasons:
+                return False, status, reasons
+        return False, reasons[0], reasons
 
     def estimate_from_model(self, level: int) -> SavingsEstimate | None:
         """Weakest tier: apply a benchmark factor to observed treatment output.
@@ -648,6 +681,10 @@ class SavingsLedger:
             ci_high_pct=hi_pct,
             n_requests=n_requests,
             kind="modelled",
+            estimate_reliable=False,
+            estimate_status="unmeasured",
+            estimate_reasons=["modelled"],
+            estimate_quality="modelled",
         )
 
     def best_estimate(self, level: int | None = None) -> SavingsEstimate:
@@ -991,7 +1028,7 @@ class SavingsRecorder:
         from ..paths import process_is_stateless
 
         if process_is_stateless():
-            # Stateless: keep the in-memory ledger but never write to disk.
+            # Stateless mode keeps the in-memory ledger but never writes it.
             self._since_flush = 0
             return
         try:

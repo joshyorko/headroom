@@ -15,6 +15,9 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
+
+import click
 
 from headroom import fsutil
 from headroom._subprocess import run
@@ -24,7 +27,6 @@ try:
 except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
-import click
 from click.core import ParameterSource
 
 from headroom.cli.port_discovery import (
@@ -33,6 +35,7 @@ from headroom.cli.port_discovery import (
     reconcile_default_port,
     warn_codex_provider_port_change,
 )
+from headroom.copilot_auth import DEFAULT_API_URL as DEFAULT_COPILOT_API_URL
 from headroom.install.models import ConfigScope, InstallPreset, RuntimeKind, SupervisorKind
 from headroom.install.paths import (
     claude_settings_path,
@@ -47,6 +50,7 @@ from headroom.install.providers import _apply_unix_env_scope, _apply_windows_env
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
     resolve_headroom_command,
+    resolve_headroom_config_command,
     runtime_ownership,
     runtime_status,
     start_detached_agent,
@@ -69,6 +73,7 @@ from headroom.providers.codex.install import (
     codex_uses_chatgpt_auth,
 )
 from headroom.providers.codex.threads import retag_to_headroom
+from headroom.proxy.project_context import with_client_prefix, with_copilot_upstream_prefix
 
 from .main import main
 
@@ -81,10 +86,15 @@ _GLOBAL_PROFILE = "init-user"
 _CLAUDE_HOOK_MARKER = "headroom-init-claude"
 _COPILOT_HOOK_MARKER = "headroom-init-copilot"
 _CODEX_HOOK_MARKER = "headroom-init-codex"
-_CODEX_PROVIDER_MARKER_START = "# --- Headroom init provider ---"
-_CODEX_PROVIDER_MARKER_END = "# --- end Headroom init provider ---"
+_CODEX_PROVIDER_MARKER_START = "# --- Headroom Codex provider ---"
+_CODEX_PROVIDER_MARKER_END = "# --- end Headroom Codex provider ---"
+_LEGACY_CODEX_PROVIDER_MARKERS = (
+    ("# --- Headroom init provider ---", "# --- end Headroom init provider ---"),
+    ("# --- Headroom proxy (auto-injected by headroom wrap codex) ---", "# --- end Headroom ---"),
+)
 _CODEX_FEATURE_MARKER_START = "# --- Headroom init features ---"
 _CODEX_FEATURE_MARKER_END = "# --- end Headroom init features ---"
+_PROJECT_HEADER_NAME = "X-Headroom-Project"
 _SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw")
 _LOCAL_TARGETS = {"claude", "codex"}
 _GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw"}
@@ -96,7 +106,10 @@ _STARTUP_READY_TIMEOUT_SECONDS = 15
 # report ready, and every session is permanently cold.
 _HOOK_ENSURE_TIMEOUT_SECONDS = 60
 _TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
-_ROOT_PROVIDER_KEY_RE = re.compile(r"[ \t]*(?:model_provider|openai_base_url)[ \t]*=")
+_ROOT_PROVIDER_KEY_RE = re.compile(
+    r"[ \t]*(?:model_provider|openai_base_url|experimental_realtime_(?:webrtc_call|ws)_base_url)"
+    r"[ \t]*="
+)
 _TOML_FEATURES_NAME_RE = r"(?:features|\"features\"|'features')"
 _TOML_CODEX_HOOKS_NAME_RE = r"(?:codex_hooks|\"codex_hooks\"|'codex_hooks')"
 _CODEX_FEATURES_TABLE_RE = re.compile(
@@ -118,7 +131,7 @@ def _command_string(parts: list[str]) -> str:
 
 
 def _hook_command(*parts: str) -> str:
-    return _command_string([*resolve_headroom_command(), "init", "hook", "ensure", *parts])
+    return _command_string([*resolve_headroom_config_command(), "init", "hook", "ensure", *parts])
 
 
 def _powershell_matcher() -> str:
@@ -158,6 +171,39 @@ def _local_profile(cwd: Path | None = None) -> str:
         raw = os.fsencode(root)
     digest = sha1(raw).hexdigest()[:8]
     return validate_profile_name(f"init-{slug or 'repo'}-{digest}")
+
+
+def _local_project_name(cwd: Path | None = None) -> str:
+    root = (cwd or Path.cwd()).resolve()
+    return root.name.strip() or "project"
+
+
+def _normalize_proxy_url(proxy_url: str | None, port: int) -> str:
+    return (proxy_url or f"http://127.0.0.1:{port}").rstrip("/")
+
+
+def _proxy_url_uses_local_runtime(proxy_url: str) -> bool:
+    host = (urlsplit(proxy_url.rstrip("/")).hostname or "").lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def _proxy_v1_url(proxy_url: str) -> str:
+    url = proxy_url.rstrip("/")
+    return url if url.endswith("/v1") else f"{url}/v1"
+
+
+def _proxy_project_v1_url(proxy_url: str, project: str) -> str:
+    parts = urlsplit(proxy_url.rstrip("/"))
+    path = parts.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[: -len("/v1")].rstrip("/")
+    path = f"{path}/p/{quote(project, safe='')}/v1"
+    return urlunsplit(parts._replace(path=path))
+
+
+def _toml_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _runtime_profile(global_scope: bool, cwd: Path | None = None) -> str:
@@ -207,6 +253,52 @@ def _json_file(path: Path) -> dict[str, Any]:
             f"{path} contains invalid JSON ({e}); fix it and re-run, or move it aside."
         ) from e
     return payload if isinstance(payload, dict) else {}
+
+
+def _strip_json_comments(content: str) -> str:
+    """Strip JSONC-style comments while preserving string contents."""
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    i = 0
+    while i < len(content):
+        char = content[i]
+        next_char = content[i + 1] if i + 1 < len(content) else ""
+
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            result.append(char)
+            i += 1
+            continue
+
+        if char == "/" and next_char == "/":
+            i += 2
+            while i < len(content) and content[i] not in "\r\n":
+                i += 1
+            continue
+
+        if char == "/" and next_char == "*":
+            i += 2
+            while i + 1 < len(content) and not (content[i] == "*" and content[i + 1] == "/"):
+                result.append("\n" if content[i] in "\r\n" else " ")
+                i += 1
+            i += 2 if i + 1 < len(content) else 0
+            continue
+
+        result.append(char)
+        i += 1
+    return "".join(result)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -313,6 +405,26 @@ def _replace_marker_block(
         lines = split_toml_lines(content)
         for index, line in enumerate(lines):
             if _TOML_TABLE_HEADER_RE.search(line):
+                # A first table may belong to a marked MCP block. Keep its
+                # opening marker outside the root block being inserted.
+                comment_start = index
+                while comment_start and (
+                    not lines[comment_start - 1].strip()
+                    or lines[comment_start - 1].lstrip().startswith("#")
+                ):
+                    comment_start -= 1
+                open_mcp: tuple[int, str] | None = None
+                for marker_index in range(comment_start, index):
+                    marker = lines[marker_index].strip()
+                    if re.fullmatch(r"# --- Headroom MCP server(?:: [^\r\n]+)? ---", marker):
+                        open_mcp = (
+                            marker_index,
+                            marker.replace("# --- Headroom", "# --- end Headroom", 1),
+                        )
+                    elif open_mcp is not None and marker == open_mcp[1]:
+                        open_mcp = None
+                if open_mcp is not None:
+                    index = open_mcp[0]
                 head = "\n".join(lines[:index]).rstrip()
                 tail = "\n".join(lines[index:]).lstrip("\n")
                 prefix = f"{head}\n\n" if head else ""
@@ -328,6 +440,23 @@ def _remove_marker_block(content: str, marker_start: str, marker_end: str) -> st
     return content[:start].rstrip() + "\n\n" + content[end:].lstrip()
 
 
+def _strip_codex_provider_marker_spans(content: str) -> str:
+    for marker_start, marker_end in (
+        (_CODEX_PROVIDER_MARKER_START, _CODEX_PROVIDER_MARKER_END),
+        *_LEGACY_CODEX_PROVIDER_MARKERS,
+    ):
+        while marker_start in content and marker_end in content:
+            start = content.index(marker_start)
+            end_idx = content.index(marker_end, start)
+            if end_idx < start:
+                break
+            end = end_idx + len(marker_end)
+            content = content[:start].rstrip("\n") + "\n" + content[end:].lstrip("\n")
+        content = content.replace(marker_start + "\n", "")
+        content = content.replace(marker_end + "\n", "")
+    return content
+
+
 def _strip_codex_root_routing_orphans(content: str) -> str:
     """Drop Headroom loopback routing keys left at the document root.
 
@@ -340,12 +469,28 @@ def _strip_codex_root_routing_orphans(content: str) -> str:
     first_table = re.search(r"(?m)^[ \t]*\[", content)
     split = first_table.start() if first_table else len(content)
     root, rest = content[:split], content[split:]
-    root = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", root)
-    root = re.sub(
-        r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
-        "",
-        root,
+    owns_route = bool(
+        re.search(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?$', root)
+        or re.search(
+            r'(?m)^[ \t]*name[ \t]*=[ \t]*"(?:Headroom init proxy|OpenAI via Headroom proxy)"[ \t]*\r?$',
+            rest,
+        )
+        or re.search(rf'(?m)^[ \t]*env_http_headers[ \t]*=.*"{_PROJECT_HEADER_NAME}"', rest)
     )
+    root = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", root)
+    if owns_route:
+        root = re.sub(r"(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n", "", root)
+        root = re.sub(
+            r"(?m)^[ \t]*experimental_realtime_(?:webrtc_call|ws)_base_url[ \t]*=.*\r?\n",
+            "",
+            root,
+        )
+    else:
+        root = re.sub(
+            r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
+            "",
+            root,
+        )
     return root + rest
 
 
@@ -369,18 +514,7 @@ def _strip_codex_init_block(content: str, *, restore_provider: bool = True) -> s
 
     provider_snapshot = _codex_init_provider_snapshot(content)
 
-    # Remove any provider marker → end marker span, possibly repeated.
-    while _CODEX_PROVIDER_MARKER_START in content and _CODEX_PROVIDER_MARKER_END in content:
-        start = content.index(_CODEX_PROVIDER_MARKER_START)
-        end_idx = content.index(_CODEX_PROVIDER_MARKER_END, start)
-        if end_idx < start:
-            break
-        end = end_idx + len(_CODEX_PROVIDER_MARKER_END)
-        content = content[:start].rstrip("\n") + "\n" + content[end:].lstrip("\n")
-
-    # Remove stale unpaired markers.
-    content = content.replace(_CODEX_PROVIDER_MARKER_START + "\n", "")
-    content = content.replace(_CODEX_PROVIDER_MARKER_END + "\n", "")
+    content = _strip_codex_provider_marker_spans(content)
 
     # Strip any orphan top-level keys that a crashed or partial write may have
     # left outside the marker block.
@@ -389,7 +523,12 @@ def _strip_codex_init_block(content: str, *, restore_provider: bool = True) -> s
     # Strip any orphaned [model_providers.headroom] table that is recognisably ours.
     orphan_headroom_table = re.compile(
         r"(?ms)^\[model_providers\.headroom\][^\[]*?"
-        r'base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[^\[]*?'
+        r"("
+        r'name[ \t]*=[ \t]*"(?:Headroom init proxy|OpenAI via Headroom proxy)"'
+        r"|"
+        rf'env_http_headers[ \t]*=.*"{_PROJECT_HEADER_NAME}"'
+        r")"
+        r"[^\[]*?"
         r"(?=^\[|\Z)"
     )
     content = orphan_headroom_table.sub("", content)
@@ -399,17 +538,100 @@ def _strip_codex_init_block(content: str, *, restore_provider: bool = True) -> s
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
 
-def _ensure_codex_provider(path: Path, port: int) -> None:
+def _strip_all_codex_headroom_provider_tables(content: str) -> str:
+    """Remove every Headroom-managed Codex provider table before reinserting one."""
+
+    content = _strip_codex_provider_marker_spans(content)
+
+    # Inspect each bounded candidate before removing it. A name-like line in
+    # user text does not establish ownership, and indented headers still end
+    # the table. Ambiguous or malformed candidates survive for validation.
+    candidate_table = re.compile(
+        r"(?ms)^[ \t]*\[model_providers\.headroom\][ \t]*(?:#[^\r\n]*)?\r?\n"
+        r"(?:(?!^[ \t]*\[).)*(?=^[ \t]*\[|\Z)"
+    )
+    owned_names = {"Headroom proxy", "Headroom init proxy", "OpenAI via Headroom proxy"}
+
+    def _remove_owned_table(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        try:
+            document = tomllib.loads(candidate)
+        except tomllib.TOMLDecodeError:
+            return candidate
+        provider = document.get("model_providers", {}).get("headroom", {})
+        if provider.get("name") not in owned_names:
+            return candidate
+        # Leading comments for the next table may include its MCP opener.
+        # Keep the trailing comment/blank run rather than claiming it as ours.
+        lines = candidate.splitlines(keepends=True)
+        tail = len(lines)
+        while tail and (not lines[tail - 1].strip() or lines[tail - 1].lstrip().startswith("#")):
+            tail -= 1
+        return "".join(lines[tail:])
+
+    content = candidate_table.sub(_remove_owned_table, content)
+    return content.lstrip("\n").rstrip() + "\n"
+
+
+def _codex_provider_matches(content: str, provider_url: str, *, requires_openai_auth: bool) -> bool:
+    if not content.strip():
+        return False
+    try:
+        parsed = tomllib.loads(content)
+    except tomllib.TOMLDecodeError:
+        return False
+
+    provider = parsed.get("model_providers", {}).get("headroom")
+    if not isinstance(provider, dict):
+        return False
+    headers = provider.get("env_http_headers")
+    if not isinstance(headers, dict):
+        return False
+
+    if parsed.get("model_provider") != "headroom":
+        return False
+    if parsed.get("openai_base_url") != provider_url:
+        return False
+    expected_call_url = (
+        f"{provider_url.removesuffix('/v1')}/backend-api/codex"
+        if requires_openai_auth
+        else provider_url
+    )
+    if parsed.get("experimental_realtime_webrtc_call_base_url") != expected_call_url:
+        return False
+    if parsed.get("experimental_realtime_ws_base_url") != provider_url:
+        return False
+    if provider.get("name") != "OpenAI":
+        return False
+    if provider.get("base_url") != provider_url:
+        return False
+    if provider.get("supports_websockets") is not True:
+        return False
+    if headers.get(_PROJECT_HEADER_NAME) != "HEADROOM_PROJECT":
+        return False
+    if requires_openai_auth:
+        return provider.get("requires_openai_auth") is True
+    return provider.get("requires_openai_auth") is not True
+
+
+def _ensure_codex_provider(path: Path, provider_url: str | int) -> None:
     import re
 
-    logger.debug("ensure codex provider block: %s (port=%s)", path, port)
-    warn_codex_provider_port_change(path, port)
+    if isinstance(provider_url, int):
+        warn_codex_provider_port_change(path, provider_url)
+        provider_url = _proxy_v1_url(_normalize_proxy_url(None, provider_url))
+    else:
+        parsed_url = urlsplit(provider_url)
+        if parsed_url.hostname == "127.0.0.1" and parsed_url.port:
+            warn_codex_provider_port_change(path, parsed_url.port)
+    logger.debug("ensure codex provider block: %s (provider_url=%s)", path, provider_url)
     auth_path = codex_home_dir() / "auth.json"
-    # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
-    # account menu); omitting it for API-key users avoids forcing an OAuth
-    # login (#406).
-    requires_openai_auth = (
-        "requires_openai_auth = true\n" if codex_uses_chatgpt_auth(auth_path) else ""
+    uses_chatgpt_auth = codex_uses_chatgpt_auth(auth_path)
+    requires_openai_auth = "requires_openai_auth = true\n" if uses_chatgpt_auth else ""
+    realtime_call_url = (
+        f"{provider_url.removesuffix('/v1')}/backend-api/codex"
+        if uses_chatgpt_auth
+        else provider_url
     )
     try:
         auth_config = build_codex_auth_config(auth_path, config_path=path)
@@ -418,19 +640,32 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
     block = (
         f"{_CODEX_PROVIDER_MARKER_START}\n"
         'model_provider = "headroom"\n'
-        f'openai_base_url = "http://127.0.0.1:{port}/v1"\n\n'
+        f"openai_base_url = {_toml_string(provider_url)}\n"
+        f"experimental_realtime_webrtc_call_base_url = {_toml_string(realtime_call_url)}\n"
+        f"experimental_realtime_ws_base_url = {_toml_string(provider_url)}\n\n"
         "[model_providers.headroom]\n"
         # Codex derives remote-compaction support from the provider display
         # name. Keep the proxy's provider id as ``headroom`` for routing, but
         # use the built-in OpenAI name so the capability is preserved.
         'name = "OpenAI"\n'
-        f'base_url = "http://127.0.0.1:{port}/v1"\n'
+        f"base_url = {_toml_string(provider_url)}\n"
         "supports_websockets = true\n"
         f"{auth_config}"
         f"{requires_openai_auth}"
+        f'env_http_headers = {{ "{_PROJECT_HEADER_NAME}" = "HEADROOM_PROJECT" }}\n'
         f"{_CODEX_PROVIDER_MARKER_END}"
     )
     content = path.read_text(encoding="utf-8") if path.exists() else ""
+    generated_provider = tomllib.loads(block)["model_providers"]["headroom"]
+    if _codex_provider_matches(content, provider_url, requires_openai_auth=uses_chatgpt_auth):
+        existing_provider = tomllib.loads(content)["model_providers"]["headroom"]
+        auth_keys = {"auth", "env_key", "experimental_bearer_token"}
+        if all(existing_provider.get(key) == generated_provider.get(key) for key in auth_keys):
+            retag_to_headroom(path.parent)
+            return
+    for old_start, old_end in _LEGACY_CODEX_PROVIDER_MARKERS:
+        content = content.replace(old_start, _CODEX_PROVIDER_MARKER_START)
+        content = content.replace(old_end, _CODEX_PROVIDER_MARKER_END)
     # Adopt an existing unmarked provider table instead of declaring it twice.
     # Keep user options that are not owned by the generated provider block.
     provider_snapshot = _codex_init_provider_snapshot(content)
@@ -465,9 +700,9 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         )
         if _CODEX_PROVIDER_MARKER_START not in content:
             content = content[: provider_table.start()] + content[table_end:]
-    content = _replace_marker_block(
-        content, _CODEX_PROVIDER_MARKER_START, _CODEX_PROVIDER_MARKER_END, "", at_root=True
-    )
+    # Preserve the captured options/snapshot, then repair every stale managed
+    # copy. A duplicate user-owned provider is left intact and fails validation.
+    content = _strip_all_codex_headroom_provider_tables(content)
     if provider_snapshot is not None:
         block = block.replace(
             _CODEX_PROVIDER_MARKER_END,
@@ -630,19 +865,48 @@ def _ensure_codex_feature_flag(path: Path) -> None:
     fsutil.write_text(path, content)
 
 
-def _ensure_codex_hooks(path: Path, profile: str) -> None:
+def _ensure_codex_hooks(path: Path, profile: str, proxy_url: str) -> None:
     logger.debug("ensure codex hooks: %s (profile=%s)", path, profile)
-    command = f"{_hook_command('--profile', profile)} --marker {_CODEX_HOOK_MARKER}"
+    uses_local_runtime = _proxy_url_uses_local_runtime(proxy_url)
+    ensure_command = (
+        f"{_hook_command('--profile', profile)} --marker {_CODEX_HOOK_MARKER}"
+        if uses_local_runtime
+        else None
+    )
+    session_command = ensure_command
+    session_hooks = (
+        [
+            {
+                "type": "command",
+                "command": session_command,
+                "timeout": _HOOK_ENSURE_TIMEOUT_SECONDS,
+            }
+        ]
+        if session_command
+        else []
+    )
+    desired_hooks: dict[str, tuple[str, list[dict[str, Any]]] | None] = {
+        "SessionStart": ("startup|resume", session_hooks) if session_hooks else None,
+        "PreToolUse": (
+            "Bash",
+            [
+                {
+                    "type": "command",
+                    "command": ensure_command,
+                    "timeout": _HOOK_ENSURE_TIMEOUT_SECONDS,
+                }
+            ],
+        )
+        if ensure_command
+        else None,
+    }
     # Read-merge-write rather than overwrite: the previous version wrote a fresh
     # payload wholesale, destroying any user-managed hooks (and other top-level
     # keys) in codex hooks.json. Merge per event and dedup on the Headroom
     # marker, matching _ensure_claude_hooks / _ensure_copilot_hooks.
     payload = _json_file(path)
     hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
-    for event, matcher in (
-        ("SessionStart", "startup|resume"),
-        ("PreToolUse", "Bash"),
-    ):
+    for event, desired in desired_hooks.items():
         entries = list(hooks.get(event) or []) if isinstance(hooks.get(event), list) else []
         retained: list[dict[str, Any]] = []
         for entry in entries:
@@ -653,29 +917,53 @@ def _ensure_codex_hooks(path: Path, profile: str) -> None:
             if not isinstance(hook_items, list):
                 retained.append(entry)
                 continue
-            has_headroom = any(
-                isinstance(item, dict)
-                and item.get("command")
-                and _CODEX_HOOK_MARKER in str(item.get("command"))
+            unmanaged_items = [
+                item
                 for item in hook_items
-            )
-            if not has_headroom:
-                retained.append(entry)
-        retained.append(
-            {
-                "matcher": matcher,
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": command,
-                        "timeout": _HOOK_ENSURE_TIMEOUT_SECONDS,
-                    }
-                ],
-            }
-        )
-        hooks[event] = retained
+                if not (
+                    isinstance(item, dict)
+                    and item.get("command")
+                    and (
+                        _CODEX_HOOK_MARKER in str(item.get("command"))
+                        or "mcp report-rtk" in str(item.get("command"))
+                    )
+                )
+            ]
+            if unmanaged_items:
+                retained.append({**entry, "hooks": unmanaged_items})
+        if desired is not None:
+            matcher, hook_items = desired
+            retained.append({"matcher": matcher, "hooks": hook_items})
+        if retained:
+            hooks[event] = retained
+        else:
+            hooks.pop(event, None)
     payload["hooks"] = hooks
+    if payload == {"hooks": {}}:
+        if path.exists():
+            path.unlink()
+            _prune_codex_hook_trust(path)
+        return
     _write_json(path, payload)
+    _prune_codex_hook_trust(path)
+
+
+def _prune_codex_hook_trust(hooks_path: Path) -> None:
+    """Drop stale Codex trust hashes for a hooks file we just rewrote."""
+
+    config_path = codex_config_path()
+    if not config_path.exists():
+        return
+    content = config_path.read_text(encoding="utf-8")
+    resolved = str(hooks_path.resolve()).replace("\\", "\\\\").replace('"', '\\"')
+    pattern = re.compile(
+        rf'(?ms)^\[hooks\.state\."{re.escape(resolved)}:[^"]+"\]\n'
+        rf"(?:[^\n]*\n)*?"
+        rf"(?=^\[|\Z)"
+    )
+    cleaned = pattern.sub("", content)
+    if cleaned != content:
+        config_path.write_text(cleaned, encoding="utf-8")
 
 
 def _manifest_changed(
@@ -711,9 +999,8 @@ def _ensure_runtime_manifest(
     profile = _runtime_profile(global_scope)
     try:
         existing = load_manifest(profile)
-    except ManifestError as e:
-        # Recover from a corrupt manifest by overwriting it rather than crashing.
-        click.echo(f"Warning: {e}; overwriting.")
+    except ManifestError as exc:
+        click.echo(f"Warning: {exc}; overwriting.")
         existing = None
     merged_targets = sorted(set(existing.targets if existing else []).union(targets))
     manifest = build_manifest(
@@ -782,15 +1069,26 @@ def _apply_user_env(values: dict[str, str]) -> None:
         _apply_unix_env_scope(manifest)
 
 
-def _resolve_copilot_env(port: int, backend: str) -> dict[str, str]:
+def _resolve_copilot_env(port: int, backend: str, proxy_url: str | None = None) -> dict[str, str]:
+    root_url = _normalize_proxy_url(proxy_url, port)
+    if proxy_url is not None:
+        provider_url = with_copilot_upstream_prefix(
+            _proxy_v1_url(root_url), DEFAULT_COPILOT_API_URL
+        )
+        return {
+            "COPILOT_PROVIDER_TYPE": "openai",
+            "COPILOT_PROVIDER_BASE_URL": with_client_prefix(provider_url, "copilot"),
+            "COPILOT_PROVIDER_WIRE_API": "completions",
+            "COPILOT_PROVIDER_BEARER_TOKEN": "headroom-proxy",
+        }
     if backend == "anthropic":
         return {
             "COPILOT_PROVIDER_TYPE": "anthropic",
-            "COPILOT_PROVIDER_BASE_URL": f"http://127.0.0.1:{port}",
+            "COPILOT_PROVIDER_BASE_URL": with_client_prefix(root_url, "copilot"),
         }
     return {
         "COPILOT_PROVIDER_TYPE": "openai",
-        "COPILOT_PROVIDER_BASE_URL": f"http://127.0.0.1:{port}/v1",
+        "COPILOT_PROVIDER_BASE_URL": with_client_prefix(_proxy_v1_url(root_url), "copilot"),
         "COPILOT_PROVIDER_WIRE_API": "completions",
     }
 
@@ -882,7 +1180,6 @@ def _suppress_hook_output() -> Iterator[None]:
 
 
 def _ensure_profile_running(profile: str) -> None:
-    # Best-effort hook path: a corrupt manifest must not crash the session.
     try:
         manifest = load_manifest(profile)
     except ManifestError:
@@ -1011,24 +1308,105 @@ def _init_claude(*, global_scope: bool, profile: str, port: int) -> None:
     click.echo("Restart Claude Code to activate Headroom hooks and provider routing.")
 
 
-def _init_copilot(*, global_scope: bool, profile: str, port: int, backend: str) -> None:
+def _init_copilot(
+    *,
+    global_scope: bool,
+    profile: str,
+    port: int,
+    backend: str,
+    proxy_url: str | None = None,
+) -> None:
     if not global_scope:
         raise click.ClickException(
             "Copilot durable init currently requires -g (current-user scope)."
         )
     _ensure_copilot_hooks(_copilot_config_path(), profile)
-    _apply_user_env(_resolve_copilot_env(port, backend))
+    _apply_user_env(_resolve_copilot_env(port, backend, proxy_url=proxy_url))
     _install_copilot_marketplace()
     click.echo("Configured GitHub Copilot CLI (user scope).")
     click.echo("Restart Copilot CLI to activate Headroom hooks and provider routing.")
 
 
-def _init_codex(*, global_scope: bool, profile: str, port: int) -> None:
-    config_path = _codex_scope_path(global_scope)
-    _ensure_codex_provider(config_path, port)
-    _ensure_codex_feature_flag(config_path)
-    _ensure_codex_hooks(_codex_hooks_path(global_scope), profile)
+def _configure_codex_durable_setup(
+    *,
+    global_scope: bool,
+    profile: str,
+    port: int,
+    proxy_url: str | None = None,
+    install_hooks: bool = True,
+    install_headroom_mcp: bool = True,
+    serena: bool = False,
+    no_serena: bool = False,
+    no_tokensave: bool = False,
+    code_graph: bool = False,
+    verbose: bool = False,
+) -> str:
+    normalized_proxy_url = _normalize_proxy_url(proxy_url, port)
+    project_config_path = _codex_scope_path(global_scope)
+
+    if global_scope:
+        _ensure_codex_provider(project_config_path, _proxy_v1_url(normalized_proxy_url))
+    else:
+        _ensure_codex_provider(codex_config_path(), _proxy_v1_url(normalized_proxy_url))
+    if install_hooks:
+        _ensure_codex_feature_flag(project_config_path)
+        _ensure_codex_hooks(_codex_hooks_path(global_scope), profile, normalized_proxy_url)
+
+    if install_headroom_mcp:
+        _install_headroom_mcp_for_targets(
+            targets=["codex"],
+            proxy_url=normalized_proxy_url,
+            force=True,
+            global_scope=global_scope,
+        )
+
+    if serena or no_serena or no_tokensave:
+        from headroom.cli import wrap as wrap_cli
+        from headroom.mcp_registry import CodexRegistrar
+
+        registrar = CodexRegistrar(
+            scope="user" if global_scope else "project",
+            project_dir=Path.cwd(),
+        )
+        wrap_cli._setup_coding_compressor(
+            registrar,
+            serena_context="codex",
+            serena=serena,
+            no_serena=no_serena,
+            no_tokensave=no_tokensave,
+            verbose=verbose,
+            force=True,
+        )
+
+    return normalized_proxy_url
+
+
+def _init_codex(
+    *,
+    global_scope: bool,
+    profile: str,
+    port: int,
+    proxy_url: str | None = None,
+    serena: bool = False,
+    no_serena: bool = False,
+    no_tokensave: bool = False,
+    verbose: bool = False,
+) -> None:
+    _configure_codex_durable_setup(
+        global_scope=global_scope,
+        profile=profile,
+        port=port,
+        proxy_url=proxy_url,
+        install_hooks=True,
+        install_headroom_mcp=True,
+        serena=serena,
+        no_serena=no_serena,
+        no_tokensave=no_tokensave,
+        verbose=verbose,
+    )
     click.echo(f"Configured Codex ({'user' if global_scope else 'local'} scope).")
+    if proxy_url and not _proxy_url_uses_local_runtime(proxy_url):
+        click.echo("Remote proxy selected; local proxy startup hooks are not required.")
     if os.name == "nt":
         click.echo(
             "Codex hooks are currently disabled upstream on Windows; provider routing was still installed."
@@ -1062,34 +1440,66 @@ def _run_init_targets(
     anyllm_provider: str | None,
     region: str | None,
     memory: bool,
+    proxy_url: str | None = None,
+    serena: bool = False,
+    no_serena: bool = False,
+    no_tokensave: bool = False,
+    verbose: bool = False,
 ) -> None:
+    normalized_proxy_url = _normalize_proxy_url(proxy_url, port)
     logger.debug(
-        "run_init_targets: targets=%s global_scope=%s port=%s backend=%s memory=%s",
+        "run_init_targets: targets=%s global_scope=%s port=%s proxy_url=%s backend=%s memory=%s",
         targets,
         global_scope,
         port,
+        normalized_proxy_url,
         backend,
         memory,
     )
-    runtime_targets = [target for target in targets if target != "openclaw"]
-    profile = _ensure_runtime_manifest(
-        global_scope=global_scope,
-        targets=runtime_targets,
-        port=port,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-        memory=memory,
+    codex_uses_remote_proxy = "codex" in targets and not _proxy_url_uses_local_runtime(
+        normalized_proxy_url
     )
+    runtime_targets = [
+        target
+        for target in targets
+        if target != "openclaw" and not (target == "codex" and codex_uses_remote_proxy)
+    ]
+    if not runtime_targets:
+        profile = _runtime_profile(global_scope)
+    else:
+        profile = _ensure_runtime_manifest(
+            global_scope=global_scope,
+            targets=runtime_targets,
+            port=port,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+            memory=memory,
+        )
     logger.debug("run_init_targets: using profile=%s", profile)
     for target in targets:
         logger.debug("run_init_targets: dispatching -> %s", target)
         if target == "claude":
             _init_claude(global_scope=global_scope, profile=profile, port=port)
         elif target == "copilot":
-            _init_copilot(global_scope=global_scope, profile=profile, port=port, backend=backend)
+            _init_copilot(
+                global_scope=global_scope,
+                profile=profile,
+                port=port,
+                backend=backend,
+                proxy_url=normalized_proxy_url,
+            )
         elif target == "codex":
-            _init_codex(global_scope=global_scope, profile=profile, port=port)
+            _init_codex(
+                global_scope=global_scope,
+                profile=profile,
+                port=port,
+                proxy_url=normalized_proxy_url,
+                serena=serena,
+                no_serena=no_serena,
+                no_tokensave=no_tokensave,
+                verbose=verbose,
+            )
         elif target == "openclaw":
             _init_openclaw(global_scope=global_scope, port=port)
 
@@ -1097,15 +1507,30 @@ def _run_init_targets(
     # a registrar implemented. Wave 1 covers Claude Code; subsequent waves
     # add Cursor / Codex / Continue / Cline / Windsurf / Goose without
     # touching the call sites.
-    _install_headroom_mcp_for_targets(targets=targets, port=port)
+    non_codex_targets = [target for target in targets if target != "codex"]
+    _install_headroom_mcp_for_targets(
+        targets=non_codex_targets,
+        proxy_url=normalized_proxy_url,
+        global_scope=global_scope,
+    )
 
 
-def _install_headroom_mcp_for_targets(*, targets: list[str], port: int) -> None:
+def _install_headroom_mcp_for_targets(
+    *, targets: list[str], proxy_url: str, global_scope: bool, force: bool = False
+) -> None:
     """Install the headroom MCP server into each detected target agent."""
     from headroom.mcp_registry import format_results, install_everywhere
 
-    proxy_url = f"http://127.0.0.1:{port}"
-    results = install_everywhere(proxy_url=proxy_url, agents=targets)
+    if not targets:
+        return
+
+    results = install_everywhere(
+        proxy_url=proxy_url,
+        agents=targets,
+        force=force,
+        scope="user" if global_scope else "project",
+        project_dir=Path.cwd(),
+    )
     if not results:
         return
 
@@ -1126,7 +1551,7 @@ def _resolve_init_port(ctx: click.Context, port: int) -> int:
     Skipped for the internal ``init hook`` group: hooks run non-interactively
     on every session start and must stay silent and fast.
     """
-    if ctx.invoked_subcommand == "hook":
+    if ctx.invoked_subcommand == "hook" or ctx.params.get("proxy_url"):
         return port
     if ctx.get_parameter_source("port") is not ParameterSource.DEFAULT:
         return port
@@ -1148,6 +1573,11 @@ def _resolve_init_port(ctx: click.Context, port: int) -> int:
         "live Headroom proxy on another port is detected and offered."
     ),
 )
+@click.option(
+    "--proxy-url",
+    default=None,
+    help="Headroom proxy URL for provider and MCP routing (default: http://127.0.0.1:<port>).",
+)
 @click.option("--backend", default="anthropic", show_default=True, help="Proxy backend.")
 @click.option("--anyllm-provider", default=None, help="Provider for any-llm backends.")
 @click.option("--region", default=None, help="Cloud region for Bedrock / Vertex style backends.")
@@ -1164,6 +1594,7 @@ def init(
     ctx: click.Context,
     global_scope: bool,
     port: int,
+    proxy_url: str | None,
     backend: str,
     anyllm_provider: str | None,
     region: str | None,
@@ -1175,25 +1606,22 @@ def init(
         _enable_verbose_logging()
     port = _resolve_init_port(ctx, port)
     logger.debug(
-        "init: global_scope=%s port=%s backend=%s anyllm_provider=%s region=%s memory=%s "
-        "invoked_subcommand=%s",
+        "init: global_scope=%s port=%s proxy_url=%s backend=%s anyllm_provider=%s region=%s "
+        "memory=%s invoked_subcommand=%s",
         global_scope,
         port,
+        proxy_url,
         backend,
         anyllm_provider,
         region,
         memory,
         ctx.invoked_subcommand,
     )
-    if anyllm_provider and backend != "anyllm":
-        click.echo(
-            f"Warning: --anyllm-provider is ignored unless --backend anyllm "
-            f"(got --backend {backend})."
-        )
     if ctx.invoked_subcommand is not None:
         ctx.obj = {
             "global_scope": global_scope,
             "port": port,
+            "proxy_url": proxy_url,
             "backend": backend,
             "anyllm_provider": anyllm_provider,
             "region": region,
@@ -1211,6 +1639,7 @@ def init(
         targets=targets,
         global_scope=global_scope,
         port=port,
+        proxy_url=proxy_url,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
@@ -1230,10 +1659,12 @@ def init_claude(ctx: click.Context) -> None:
         targets=["claude"],
         global_scope=bool(_ctx_value(ctx, "global_scope")),
         port=int(_ctx_value(ctx, "port") or 8787),
+        proxy_url=_ctx_value(ctx, "proxy_url"),
         backend=str(_ctx_value(ctx, "backend") or "anthropic"),
         anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
         region=_ctx_value(ctx, "region"),
         memory=bool(_ctx_value(ctx, "memory")),
+        verbose=bool(_ctx_value(ctx, "verbose")),
     )
 
 
@@ -1245,25 +1676,48 @@ def init_copilot(ctx: click.Context) -> None:
         targets=["copilot"],
         global_scope=bool(_ctx_value(ctx, "global_scope")),
         port=int(_ctx_value(ctx, "port") or 8787),
+        proxy_url=_ctx_value(ctx, "proxy_url"),
         backend=str(_ctx_value(ctx, "backend") or "anthropic"),
         anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
         region=_ctx_value(ctx, "region"),
         memory=bool(_ctx_value(ctx, "memory")),
+        verbose=bool(_ctx_value(ctx, "verbose")),
     )
 
 
 @init.command("codex")
+@click.option(
+    "--no-tokensave",
+    is_flag=True,
+    help="Remove a Headroom-installed tokensave MCP entry instead of leaving it untouched.",
+)
+@click.option(
+    "--serena",
+    is_flag=True,
+    help="Explicitly install Serena MCP for Codex.",
+)
+@click.option("--no-serena", is_flag=True, help="Remove a Headroom-installed Serena MCP entry.")
 @click.pass_context
-def init_codex(ctx: click.Context) -> None:
+def init_codex(
+    ctx: click.Context,
+    no_tokensave: bool,
+    serena: bool,
+    no_serena: bool,
+) -> None:
     """Install Codex durable hooks and provider routing."""
     _run_init_targets(
         targets=["codex"],
         global_scope=bool(_ctx_value(ctx, "global_scope")),
         port=int(_ctx_value(ctx, "port") or 8787),
+        proxy_url=_ctx_value(ctx, "proxy_url"),
         backend=str(_ctx_value(ctx, "backend") or "anthropic"),
         anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
         region=_ctx_value(ctx, "region"),
         memory=bool(_ctx_value(ctx, "memory")),
+        serena=serena,
+        no_serena=no_serena,
+        no_tokensave=no_tokensave,
+        verbose=bool(_ctx_value(ctx, "verbose")),
     )
 
 
@@ -1275,10 +1729,12 @@ def init_openclaw(ctx: click.Context) -> None:
         targets=["openclaw"],
         global_scope=bool(_ctx_value(ctx, "global_scope")),
         port=int(_ctx_value(ctx, "port") or 8787),
+        proxy_url=_ctx_value(ctx, "proxy_url"),
         backend=str(_ctx_value(ctx, "backend") or "anthropic"),
         anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
         region=_ctx_value(ctx, "region"),
         memory=bool(_ctx_value(ctx, "memory")),
+        verbose=bool(_ctx_value(ctx, "verbose")),
     )
 
 

@@ -99,7 +99,6 @@ async def handle_chatgpt_codex_images(
             codex_image_url(sub_path, request.url.query),
             headers=headers,
             content=body,
-            timeout=120.0,
         )
         return Response(
             content=resp.content,

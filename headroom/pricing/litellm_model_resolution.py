@@ -38,19 +38,34 @@ class LiteLLMModelPrefixRule:
 #
 # The undated target is deliberate: it survives a dated release being retired.
 MODEL_ALIASES: dict[str, str] = {
-    # All three retired here are Sonnet-tier ($3/$15 per 1M in/out), so they
-    # alias to the current Sonnet. Pick a target litellm still prices: these
-    # pointed at claude-sonnet-4-20250514 until litellm pruned it, after which
-    # they fell through to the unknown-model default and billed at the GPT-4o
-    # tier ($2.50/$10.00). test_model_alias_targets_are_priced.py fails if a
-    # target goes unpriced again.
+    # Retired Sonnet-tier models use a currently priced, undated model key.
     "claude-3-5-sonnet-20241022": "claude-sonnet-4-5",
     "claude-3-5-sonnet-20240620": "claude-sonnet-4-5",
-    # claude-3-sonnet-20240229 previously aliased to claude-3-haiku-20240307
-    # ($0.25/$1.25) — a different (Haiku) tier that underpriced every cost and
-    # savings figure for it by ~12x.
     "claude-3-sonnet-20240229": "claude-sonnet-4-5",
+    # ChatGPT exposes subscription variants with zero-priced rows; use the
+    # canonical Codex list price for savings estimates.
+    "gpt-5.3-codex-spark": "gpt-5.3-codex",
+    "chatgpt/gpt-5.3-codex-spark": "gpt-5.3-codex",
+    # DeepSeek retains these compatibility names, but LiteLLM's legacy rows
+    # carry pre-V4 pricing and context limits.
+    "deepseek-chat": "deepseek/deepseek-v4-flash",
+    "deepseek-reasoner": "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-chat": "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-reasoner": "deepseek/deepseek-v4-flash",
 }
+
+# These aliases intentionally override an existing LiteLLM row rather than
+# serving only as a fallback for a retired name.
+MODEL_ALIAS_OVERRIDES = frozenset(
+    {
+        "gpt-5.3-codex-spark",
+        "chatgpt/gpt-5.3-codex-spark",
+        "deepseek-chat",
+        "deepseek-reasoner",
+        "deepseek/deepseek-chat",
+        "deepseek/deepseek-reasoner",
+    }
+)
 
 
 MODEL_PREFIX_RULES: tuple[LiteLLMModelPrefixRule, ...] = (
@@ -82,34 +97,36 @@ def _strip_vertex_version_suffix(model: str) -> str:
 
 def resolution_candidates(model: str) -> tuple[str, ...]:
     """Return ordered LiteLLM keys to try for cost-per-token resolution."""
-    candidates = [model]
-
     # If the model has a Vertex @YYYYMMDD version suffix, also try the bare
     # name. Vertex appends these at runtime; LiteLLM stores bare names only.
     bare = _strip_vertex_version_suffix(model)
     is_vertex_versioned = bare != model
-    if is_vertex_versioned:
-        candidates.append(bare)
+    forms = tuple(dict.fromkeys([model, bare]))
+    alias = MODEL_ALIASES.get(model) or MODEL_ALIASES.get(bare)
+    is_override = any(form in MODEL_ALIAS_OVERRIDES for form in forms)
+    candidates = [alias] if alias and is_override else list(forms)
 
     # Apply prefix rules to both the original and bare name so that e.g.
     # "anthropic/claude-haiku-4-5" is tried after "claude-haiku-4-5".
-    for m in dict.fromkeys([model, bare]):
-        candidates.extend(
-            candidate
-            for rule in MODEL_PREFIX_RULES
-            for candidate in (rule.candidate_for(m),)
-            if candidate is not None
-        )
+    prefixed = [
+        candidate
+        for form in forms
+        for rule in MODEL_PREFIX_RULES
+        for candidate in (rule.candidate_for(form),)
+        if candidate is not None
+    ]
+    if model.lower().startswith("deepseek-") and not is_override:
+        candidates = [*prefixed, *candidates]
+    else:
+        candidates.extend(prefixed)
 
     # Only add vertex_ai/ candidates for models with @YYYYMMDD suffix —
     # these are known Vertex-routed models. Non-versioned models should not
     # get vertex_ai/ candidates to avoid matching wrong pricing tier.
     if is_vertex_versioned:
-        for m in dict.fromkeys([model, bare]):
-            candidates.append(f"vertex_ai/{m}")
+        candidates.extend(f"vertex_ai/{form}" for form in forms)
 
-    alias = MODEL_ALIASES.get(model) or MODEL_ALIASES.get(bare)
-    if alias:
+    if alias and not is_override:
         candidates.append(alias)
     return tuple(dict.fromkeys(candidates))
 
@@ -132,24 +149,23 @@ def pricing_lookup_candidates(model: str) -> tuple[str, ...]:
     """Return ordered LiteLLM model_cost keys to try for pricing lookup."""
     bare = _strip_vertex_version_suffix(model)
     is_vertex_versioned = bare != model
+    forms = tuple(dict.fromkeys([model, bare]))
+    alias = MODEL_ALIASES.get(model) or MODEL_ALIASES.get(bare)
+    is_override = any(form in MODEL_ALIAS_OVERRIDES for form in forms)
 
-    candidates = [model]
-    if is_vertex_versioned:
-        candidates.append(bare)
+    candidates = [alias] if alias and is_override else list(forms)
 
     # Try all provider prefixes for both the original and bare name.
-    for m in dict.fromkeys([model, bare]):
-        candidates.extend(f"{prefix}{m}" for prefix in PRICE_LOOKUP_PROVIDER_PREFIXES)
-
+    for form in forms:
+        candidates.extend(f"{prefix}{form}" for prefix in PRICE_LOOKUP_PROVIDER_PREFIXES)
     # Unwrapped forms come after the prefixed ones so existing precedence is
     # unchanged for names that already resolved.
-    for m in dict.fromkeys([model, bare]):
-        candidates.extend(unwrapped_model_forms(m))
+    for form in forms:
+        candidates.extend(unwrapped_model_forms(form))
 
     # Only add vertex_ai/ candidates for models with @YYYYMMDD suffix.
     if is_vertex_versioned:
-        for m in dict.fromkeys([model, bare]):
-            candidates.append(f"vertex_ai/{m}")
+        candidates.extend(f"vertex_ai/{form}" for form in forms)
 
     candidates.extend(
         alias for candidate in tuple(candidates) if (alias := MODEL_ALIASES.get(candidate))

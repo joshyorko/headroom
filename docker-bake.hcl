@@ -25,6 +25,15 @@ target "runtime" {
   }
 }
 
+target "runtime-self-hosted" {
+  inherits = ["_common", "docker-metadata-action"]
+  target   = "runtime"
+  args = {
+    HEADROOM_EXTRAS = "proxy,code,memory-stack,bedrock,redis"
+    RUNTIME_USER    = "nonroot"
+  }
+}
+
 target "runtime-nonroot" {
   inherits = ["_common", "docker-metadata-action"]
   target   = "runtime"

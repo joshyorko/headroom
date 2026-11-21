@@ -38,6 +38,10 @@ _ORPHAN_MODEL_PROVIDER = re.compile(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"hea
 _ORPHAN_OPENAI_BASE_URL = re.compile(
     r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n'
 )
+_ORPHAN_REALTIME_BASE_URL = re.compile(
+    r"(?m)^[ \t]*experimental_realtime_(?:webrtc_call|ws)_base_url[ \t]*=[ \t]*"
+    r'"http://127\.0\.0\.1:\d+/(?:v1|backend-api/codex)"[ \t]*\r?\n'
+)
 _ORPHAN_HEADROOM_TABLE = re.compile(
     r"(?ms)^\[model_providers\.headroom\][^\[]*?"
     r'base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[^\[]*?'
@@ -47,6 +51,9 @@ _ORPHAN_HEADROOM_TABLE = re.compile(
 _TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
 _ROOT_MODEL_PROVIDER_RE = re.compile(r"^[ \t]*model_provider[ \t]*=")
 _ROOT_OPENAI_BASE_URL_RE = re.compile(r"^[ \t]*openai_base_url[ \t]*=")
+_ROOT_REALTIME_BASE_URL_RE = re.compile(
+    r"^[ \t]*experimental_realtime_(?:webrtc_call|ws)_base_url[ \t]*="
+)
 _CODEX_API_KEY_HELPER = """from pathlib import Path
 import json
 
@@ -380,7 +387,11 @@ def _strip_root_provider_assignments(content: str) -> str:
         line
         for index, line in enumerate(split_toml_lines(content, keepends=True))
         if index not in root_lines
-        or not (_ROOT_MODEL_PROVIDER_RE.match(line) or _ROOT_OPENAI_BASE_URL_RE.match(line))
+        or not (
+            _ROOT_MODEL_PROVIDER_RE.match(line)
+            or _ROOT_OPENAI_BASE_URL_RE.match(line)
+            or _ROOT_REALTIME_BASE_URL_RE.match(line)
+        )
     )
 
 
@@ -391,10 +402,19 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
 
     path = codex_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    uses_chatgpt_auth = codex_uses_chatgpt_auth(path.parent / "auth.json")
+    realtime_ws_base_url = proxy_base_url(manifest.port)
+    realtime_call_base_url = (
+        f"{realtime_ws_base_url.removesuffix('/v1')}/backend-api/codex"
+        if uses_chatgpt_auth
+        else realtime_ws_base_url
+    )
     section = (
         f"{_CODEX_MARKER_START}\n"
         'model_provider = "headroom"\n'
-        f'openai_base_url = "{proxy_base_url(manifest.port)}"\n\n'
+        f'openai_base_url = "{realtime_ws_base_url}"\n'
+        f'experimental_realtime_webrtc_call_base_url = "{realtime_call_base_url}"\n'
+        f'experimental_realtime_ws_base_url = "{realtime_ws_base_url}"\n\n'
         + build_provider_section(
             port=manifest.port,
             name="Headroom persistent proxy",
@@ -437,6 +457,7 @@ def revert_provider_scope(mutation: ManagedMutation, manifest: DeploymentManifes
     # left outside the marker block (mirrors wrap.py _strip_codex_headroom_blocks).
     content = _ORPHAN_MODEL_PROVIDER.sub("", content)
     content = _ORPHAN_OPENAI_BASE_URL.sub("", content)
+    content = _ORPHAN_REALTIME_BASE_URL.sub("", content)
     content = _ORPHAN_HEADROOM_TABLE.sub("", content)
     path.write_text(content.strip() + "\n", encoding="utf-8")
     if helper_was_referenced is True:

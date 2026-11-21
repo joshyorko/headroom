@@ -3,8 +3,8 @@
 This module provides generators for realistic conversation patterns that
 exercise Headroom transforms:
 
-- Agentic conversations: Multi-turn with tool calls (SmartCrusher)
-- RAG conversations: Large context injection (CacheAligner)
+- Agentic conversations: Multi-turn with tool calls (SmartCrusher, RollingWindow)
+- RAG conversations: Large context injection (CacheAligner, RollingWindow)
 
 These generators produce conversations that mirror real-world usage patterns
 from production agentic systems.

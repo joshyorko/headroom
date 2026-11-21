@@ -150,9 +150,7 @@ class TestFetchBedrockInferenceProfiles:
         mock_client.list_inference_profiles.side_effect = Exception(
             "AccessDeniedException: not authorized"
         )
-        mock_session = MagicMock()
-        mock_session.client.return_value = mock_client
-        mock_boto3.Session.return_value = mock_session
+        mock_boto3.client.return_value = mock_client
 
         with patch("headroom.backends.litellm.boto3", mock_boto3, create=True):
             # Patch the import inside the function
@@ -190,9 +188,7 @@ class TestFetchBedrockInferenceProfiles:
                 {"inferenceProfileId": "eu.meta.llama-3-70b-v1:0"},  # non-Anthropic, should skip
             ]
         }
-        mock_session = MagicMock()
-        mock_session.client.return_value = mock_client
-        mock_boto3.Session.return_value = mock_session
+        mock_boto3.client.return_value = mock_client
 
         import builtins
 
@@ -216,24 +212,12 @@ class TestFetchBedrockInferenceProfiles:
         )
 
     def test_caching_prevents_repeated_api_calls(self):
-        """Second call for same region+profile should return cached result."""
+        """Second call for same region should return cached result."""
         _bedrock_profiles_cache.clear()
-        _bedrock_profiles_cache["us-east-1:"] = {"test": "bedrock/test-model"}
+        _bedrock_profiles_cache["us-east-1"] = {"test": "bedrock/test-model"}
 
         result = _fetch_bedrock_inference_profiles("us-east-1")
         assert result == {"test": "bedrock/test-model"}
-
-    def test_profile_cache_isolation(self):
-        """Different profiles for the same region must not share a cache entry."""
-        _bedrock_profiles_cache.clear()
-        _bedrock_profiles_cache["us-east-1:profileA"] = {"model": "bedrock/profile-a-model"}
-        _bedrock_profiles_cache["us-east-1:profileB"] = {"model": "bedrock/profile-b-model"}
-
-        result_a = _fetch_bedrock_inference_profiles("us-east-1", profile_name="profileA")
-        result_b = _fetch_bedrock_inference_profiles("us-east-1", profile_name="profileB")
-        assert result_a["model"] == "bedrock/profile-a-model"
-        assert result_b["model"] == "bedrock/profile-b-model"
-        assert result_a != result_b
 
 
 # =============================================================================

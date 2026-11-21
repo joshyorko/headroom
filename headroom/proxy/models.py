@@ -272,14 +272,13 @@ class ProxyConfig:
 
     # Force ALL compressible content through Kompress (kompress-v2-base),
     # bypassing per-type compressor selection (SmartCrusher/CodeAware/log/
-    # diff/html/tabular/search). Tool ground truth stays protected: excluded
-    # tools (Read/Glob/Grep/...) and reversibility-gated tool output are never
-    # touched. Off by default; opt-in for systems that want one uniform
-    # compressor at the cost of per-type structural fidelity.
+    # diff/html/tabular/search). Tool ground truth stays protected.
     # CLI: --force-kompress-all; env: HEADROOM_FORCE_KOMPRESS_ALL=1.
     force_kompress_all: bool = False
 
-    lossless: bool = False  # CLI: --lossless; env: HEADROOM_LOSSLESS=1. No-CCR mode: compress without any retrieval marker.
+    # No-CCR mode: compress without retrieval markers.
+    # CLI: --lossless; env: HEADROOM_LOSSLESS=1.
+    lossless: bool = False
 
     # Compress requests that fall through to the catch-all passthrough handler
     # (custom proxy paths that don't match a built-in API route, e.g.
@@ -536,16 +535,11 @@ class ProxyConfig:
     # Stateless mode — disable all filesystem writes for read-only / container deployments
     stateless: bool = False
 
-    # Optional inbound auth. When set, non-loopback requests to the data-plane
-    # routes must present this token (``Authorization: Bearer <token>`` or the
-    # ``X-Headroom-Proxy-Token`` header). Loopback callers are exempt. Closes the
-    # gap where a container bound to 0.0.0.0 exposes unauthenticated /v1/* routes
-    # to the pod network. Env: HEADROOM_PROXY_TOKEN.
+    # Optional inbound auth. Non-loopback data-plane requests must present this
+    # token when set. Env: HEADROOM_PROXY_TOKEN.
     proxy_token: str | None = None
 
-    # Air-gap master switch — hard-disable ALL outbound network egress
-    # (telemetry beacon, update check, license/usage reporter, HuggingFace model
-    # downloads) for fully offline / regulated deployments. Env: HEADROOM_OFFLINE=1.
+    # Air-gap master switch. Env: HEADROOM_OFFLINE=1.
     offline: bool = False
 
     # Unit 4: Bounded pre-upstream concurrency for Anthropic replay storms.
@@ -567,7 +561,7 @@ class ProxyConfig:
     # Precedence: CLI > env > auto-compute.
     anthropic_pre_upstream_concurrency: int | None = None
     # Upper bound for waiting on the Anthropic pre-upstream semaphore
-    # before failing open to passthrough compression. Keeps the queue bounded
+    # before failing fast with a 503 + Retry-After. Keeps the queue bounded
     # when all pre-upstream slots are occupied by slow/hung work.
     anthropic_pre_upstream_acquire_timeout_seconds: float = 15.0
     # Fail-open timeout for Anthropic memory-context lookup while the request

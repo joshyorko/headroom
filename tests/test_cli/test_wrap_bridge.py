@@ -26,6 +26,7 @@ def _set_test_home(monkeypatch, tmp_path: Path) -> None:
     home = str(tmp_path)
     monkeypatch.setenv("HOME", home)
     monkeypatch.setenv("USERPROFILE", home)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
 
 
 def test_wrap_claude_prepare_only_skips_host_binary_lookup() -> None:
@@ -40,6 +41,7 @@ def test_wrap_claude_prepare_only_skips_host_binary_lookup() -> None:
 
 def test_wrap_codex_prepare_only_updates_config(monkeypatch, tmp_path: Path) -> None:
     _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.delenv("HEADROOM_PROXY_URL", raising=False)
     runner = CliRunner()
 
     with patch("headroom.cli.wrap.ensure_proxy_dependencies", return_value=None):

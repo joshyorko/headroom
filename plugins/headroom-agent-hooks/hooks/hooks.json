@@ -1,5 +1,4 @@
 {
-  "description": "Headroom plugin hooks — ensure the local Headroom runtime is available for initialized agents.",
   "hooks": {
     "SessionStart": [
       {

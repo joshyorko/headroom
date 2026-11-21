@@ -32,6 +32,10 @@ from headroom.providers.openai_images import (
     OpenAIImageEndpoint,
     handle_openai_image_endpoint,
 )
+from headroom.providers.openai_realtime import (
+    handle_realtime_call,
+    relay_realtime_websocket,
+)
 from headroom.providers.openai_responses import (
     OPENAI_RESPONSES_ROOT_PATHS,
     OPENAI_RESPONSES_SUBPATH_ROUTES,
@@ -452,6 +456,66 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     _register_openai_responses_routes(app, proxy)
 
+    @app.post("/v1/realtime/calls")
+    async def openai_realtime_call(request: Request):
+        assert proxy.http_client is not None
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base and not await is_safe_upstream_url_async(custom_base):
+            raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+        return await handle_realtime_call(
+            proxy.http_client,
+            request,
+            api_base_url=custom_base.rstrip("/") or _api_target(proxy, "openai"),
+            chatgpt_backend=False,
+            extra_headers=getattr(proxy.config, "openai_extra_headers", None),
+            config=proxy.config,
+            custom_upstream=bool(custom_base),
+        )
+
+    @app.post("/backend-api/codex/realtime/calls")
+    async def chatgpt_realtime_call(request: Request):
+        assert proxy.http_client is not None
+        return await handle_realtime_call(
+            proxy.http_client,
+            request,
+            api_base_url=_api_target(proxy, "openai"),
+            chatgpt_backend=True,
+            extra_headers=getattr(proxy.config, "openai_extra_headers", None),
+            config=proxy.config,
+        )
+
+    @app.websocket("/v1/realtime")
+    async def openai_realtime_sideband(websocket: WebSocket):
+        custom_base = websocket.headers.get("x-headroom-base-url", "").strip()
+        if custom_base and not await is_safe_upstream_url_async(custom_base):
+            await websocket.close(code=1008, reason="Rejected unsafe upstream base URL")
+            return
+        await relay_realtime_websocket(
+            websocket,
+            api_base_url=custom_base.rstrip("/") or _api_target(proxy, "openai"),
+            upstream_path="/v1/realtime",
+            proxy_token=getattr(proxy.config, "proxy_token", None),
+            extra_headers=getattr(proxy.config, "openai_extra_headers", None),
+            config=proxy.config,
+            custom_upstream=bool(custom_base),
+        )
+
+    @app.websocket("/v1/live/{call_id}")
+    async def openai_live_sideband(websocket: WebSocket, call_id: str):
+        custom_base = websocket.headers.get("x-headroom-base-url", "").strip()
+        if custom_base and not await is_safe_upstream_url_async(custom_base):
+            await websocket.close(code=1008, reason="Rejected unsafe upstream base URL")
+            return
+        await relay_realtime_websocket(
+            websocket,
+            api_base_url=custom_base.rstrip("/") or _api_target(proxy, "openai"),
+            upstream_path=f"/v1/live/{call_id}",
+            proxy_token=getattr(proxy.config, "proxy_token", None),
+            extra_headers=getattr(proxy.config, "openai_extra_headers", None),
+            config=proxy.config,
+            custom_upstream=bool(custom_base),
+        )
+
     _register_provider_handler_routes(app, proxy)
 
     @app.post(
@@ -661,7 +725,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             provider_name=provider_name,
         )
 
-    @app.get("/v1/models/{model_id}")
+    @app.get("/v1/models/{model_id:path}")
     async def get_model(request: Request, model_id: str):
         provider_name, base_url = await _model_metadata_route(request)
         return await handle_model_metadata_endpoint(
@@ -670,6 +734,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             endpoint=model_metadata_get_endpoint(model_id),
             provider_api_base_url=base_url,
             provider_name=provider_name,
+            model_id=model_id,
         )
 
     @app.post("/v1/alpha/search")

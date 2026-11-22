@@ -8,16 +8,8 @@ name: SDK (TypeScript)
 # test + typecheck + build whenever it (or this workflow) changes, mirroring
 # the OpenCode plugin gate in opencode-plugin.yml.
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - "sdk/typescript/**"
-      - ".github/workflows/sdk-typescript.yml"
-  push:
-    branches: [main]
-    paths:
-      - "sdk/typescript/**"
-      - ".github/workflows/sdk-typescript.yml"
+  # Broad upstream validation is opt-in in this downstream repository.
+  workflow_dispatch:
 
 permissions:
   contents: read

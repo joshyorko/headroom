@@ -5,14 +5,8 @@ name: tools-hash-refresh
 # refreshing pins (run scripts/refresh_tool_hashes.py locally). See WEB-03.
 
 on:
-  pull_request:
-    paths:
-      - "headroom/tools.json"
-      - "scripts/refresh_tool_hashes.py"
-      - ".github/workflows/tools-hash-refresh.yml"
-  schedule:
-    - cron: "0 6 * * 1" # Mondays 06:00 UTC
-  workflow_dispatch: {}
+  # Broad upstream validation is opt-in in this downstream repository.
+  workflow_dispatch:
 
 permissions:
   contents: read

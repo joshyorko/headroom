@@ -1,29 +1,7 @@
 name: Wrap E2E
 
 on:
-  pull_request:
-    branches: [main]
-    # Scoped to what the `headroom wrap` flow actually exercises (mirrors
-    # wrap-native-e2e), not all of headroom/** — a pure-Python logic change
-    # elsewhere shouldn't spin up a docker wrap E2E.
-    paths:
-      - 'headroom/cli/**'
-      - 'headroom/providers/**'
-      - 'crates/**'
-      - 'docker/**'
-      - 'Dockerfile'
-      - 'e2e/**'
-      - 'scripts/install*'
-      - 'pyproject.toml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'uv.lock'
-      - 'sdk/typescript/**'
-      - 'plugins/openclaw/**'
-      - '.github/workflows/wrap-e2e.yml'
-  push:
-    branches: [main]
+  # Broad upstream validation is opt-in in this downstream repository.
   workflow_dispatch:
 
 concurrency:

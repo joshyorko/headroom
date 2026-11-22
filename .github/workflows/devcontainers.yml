@@ -1,20 +1,7 @@
 name: Dev Containers
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".devcontainer/**"
-      - ".github/workflows/devcontainers.yml"
-      - "pyproject.toml"
-      - "uv.lock"
-  pull_request:
-    branches: [main]
-    paths:
-      - ".devcontainer/**"
-      - ".github/workflows/devcontainers.yml"
-      - "pyproject.toml"
-      - "uv.lock"
+  # Broad upstream validation is opt-in in this downstream repository.
   workflow_dispatch:
 
 permissions:

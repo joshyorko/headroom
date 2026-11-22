@@ -1,6 +1,6 @@
 name: Init Native E2E
 
-# Cross-platform (linux / macos / windows) smoke tests for the per-subcommand
+# Native smoke tests for the per-subcommand
 # ``headroom init -g <target>`` flows. Each matrix cell drops a noop shim for
 # the target agent onto PATH and asserts ``headroom init -g <target>``
 # succeeds, writes the expected settings file, and (for claude/codex) places
@@ -10,7 +10,7 @@ name: Init Native E2E
 # avoid bloating CI minutes on every push to every feature branch. The Docker
 # init-e2e.yml still runs on every PR and provides the deeper functional
 # coverage; this workflow exists to catch platform-specific bugs (Windows
-# path separators, macos keychain prompts, PowerShell-vs-bash hook matchers)
+# path separators and PowerShell-vs-bash hook matchers)
 # that the single-platform Docker suite can miss.
 #
 # Extending to other commands (``headroom install``, ``headroom wrap``) is
@@ -19,17 +19,7 @@ name: Init Native E2E
 # each per-command workflow only supplies its matrix and assertion steps.
 
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - "headroom/cli/init.py"
-      - "headroom/install/**"
-      - "e2e/_lib/**"
-      - "e2e/init/**"
-      - ".github/actions/headroom-e2e-setup/**"
-      - ".github/workflows/init-native-e2e.yml"
-  push:
-    branches: [main]
+  # Broad upstream validation is opt-in in this downstream repository.
   workflow_dispatch:
 
 permissions:
@@ -47,9 +37,9 @@ jobs:
         # with conflicting MSVC C runtime libraries (/MT vs /MD), so the
         # Rust extension cannot build for `win_amd64` until the upstream
         # CRT conflict is resolved. Re-add `windows-latest` once the wheel
-        # builds cleanly there. Tracked in the project plan; not a blocker
-        # for headroom-ai installs on Linux + macOS.
-        os: [ubuntu-latest, macos-latest]
+        # builds cleanly there. Tracked in the project plan; Linux remains
+        # the active runner for this workflow.
+        os: [ubuntu-latest]
         target: [claude, codex, copilot, openclaw]
         exclude:
           # openclaw delegates to ``headroom wrap openclaw`` which needs a

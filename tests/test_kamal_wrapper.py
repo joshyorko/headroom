@@ -43,4 +43,6 @@ def test_kamal_wrapper_uses_docker_when_mise_shim_is_inactive(tmp_path: Path) ->
         env=environment,
     )
 
-    assert "ghcr.io/basecamp/kamal:latest" in docker_args.read_text().splitlines()
+    arguments = docker_args.read_text().splitlines()
+    assert "ghcr.io/basecamp/kamal:latest" in arguments
+    assert arguments[arguments.index("--security-opt") + 1] == "label=disable"

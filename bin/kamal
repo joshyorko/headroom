@@ -8,7 +8,9 @@ if kamal_path="$(command -v kamal 2>/dev/null)" && {
   exec "$kamal_path" "$@"
 fi
 
+# SELinux must allow this Docker client to use the host daemon's socket.
 exec docker run --rm -it \
+  --security-opt label=disable \
   --network host \
   -v "$PWD:/work" \
   -v "$HOME/.ssh:/root/.ssh:ro" \

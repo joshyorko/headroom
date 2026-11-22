@@ -31,6 +31,7 @@ jobs:
       - name: Check downstream deployment and workflow contracts
         run: |
           python -m pytest --noconftest -o addopts='' -q \
+            tests/test_kamal_wrapper.py \
             tests/test_self_hosted_deploy_config.py \
             tests/test_release_workflows.py::test_downstream_ci_targets_main_and_keeps_upstream_suites_manual \
             tests/test_release_workflows.py::test_homebrew_dispatch_skips_without_pat_and_runs_when_configured \

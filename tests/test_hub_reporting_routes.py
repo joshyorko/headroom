@@ -127,9 +127,10 @@ def test_claude_report_uses_real_subscription_snapshot_without_token_prefix(hub,
     relay.assert_not_awaited()
 
 
-def test_real_startup_registers_trackers_for_the_hub(monkeypatch):
+def test_real_startup_omits_trackers_without_usage(monkeypatch):
     monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     monkeypatch.setattr("headroom.subscription.tracker._tracker_instance", None)
+    monkeypatch.setattr("headroom.subscription.codex_rate_limits._state", None)
     app = server.create_app(
         ProxyConfig(
             proxy_token=TOKEN,
@@ -146,7 +147,7 @@ def test_real_startup_registers_trackers_for_the_hub(monkeypatch):
             f"{MANAGEMENT}/auth-files", headers={"Authorization": f"Bearer {TOKEN}"}
         )
         assert response.status_code == 200
-        assert [account["provider"] for account in response.json()["files"]] == ["codex"]
+        assert response.json()["files"] == []
 
 
 @pytest.mark.parametrize(

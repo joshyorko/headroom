@@ -40,7 +40,10 @@ def _payload(response: dict):
 
 
 def test_list_auth_files_has_fixed_supported_accounts_without_identity_secrets():
-    registry = _registry(subscription_window=(None, True), codex_rate_limits=(None, True))
+    registry = _registry(
+        subscription_window=({"latest": {"five_hour": {"utilization_pct": 0}}}, True),
+        codex_rate_limits=({"primary": {"used_percent": 0}}, True),
+    )
     assert list_auth_files(registry) == {
         "files": [
             {
@@ -60,7 +63,10 @@ def test_list_auth_files_has_fixed_supported_accounts_without_identity_secrets()
 
 
 def test_list_auth_files_omits_unregistered_and_unavailable_trackers():
-    registry = _registry(subscription_window=(None, False), codex_rate_limits=(None, True))
+    registry = _registry(
+        subscription_window=({"latest": None}, True),
+        codex_rate_limits=({"primary": {"used_percent": 3}}, True),
+    )
     assert [item["provider"] for item in list_auth_files(registry)["files"]] == ["codex"]
     assert list_auth_files(_registry()) == {"files": []}
 

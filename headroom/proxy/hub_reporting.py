@@ -22,12 +22,9 @@ def _response(status_code: int, payload: Any) -> dict[str, Any]:
 def list_auth_files(registry: QuotaTrackerRegistry) -> dict[str, Any]:
     """Describe available provider trackers, without pretending to export credentials."""
     files = []
-    for key, auth_index, provider in (
-        ("subscription_window", CLAUDE_AUTH_INDEX, "claude"),
-        ("codex_rate_limits", CODEX_AUTH_INDEX, "codex"),
-    ):
-        tracker = registry.get(key)
-        if tracker is not None and tracker.is_available():
+    for auth_index, (key, provider, _, convert) in _ACCOUNTS.items():
+        stats = _stats(registry, key)
+        if stats is not None and convert(stats) is not None:
             files.append(
                 {
                     "id": auth_index,
@@ -111,6 +108,12 @@ def _codex_usage(stats: dict[str, Any]) -> dict[str, Any] | None:
     return {"rate_limit": rate_limit} if rate_limit else None
 
 
+_ACCOUNTS = {
+    CLAUDE_AUTH_INDEX: ("subscription_window", "claude", CLAUDE_USAGE_URL, _claude_usage),
+    CODEX_AUTH_INDEX: ("codex_rate_limits", "codex", CODEX_USAGE_URL, _codex_usage),
+}
+
+
 def report_api_call(
     registry: QuotaTrackerRegistry,
     *,
@@ -119,18 +122,14 @@ def report_api_call(
     url: str,
 ) -> dict[str, Any]:
     """Serve only the two exact provider usage GETs; never makes network calls."""
-    accounts = {
-        CLAUDE_AUTH_INDEX: ("subscription_window", CLAUDE_USAGE_URL, _claude_usage),
-        CODEX_AUTH_INDEX: ("codex_rate_limits", CODEX_USAGE_URL, _codex_usage),
-    }
-    account = accounts.get(auth_index)
+    account = _ACCOUNTS.get(auth_index)
     if account is None:
         return _response(404, {"error": "unknown account"})
     if method.upper() != "GET":
         return _response(405, {"error": "method not allowed"})
     if auth_index == CODEX_AUTH_INDEX and url == CODEX_CREDITS_URL:
         return _response(501, {"error": "reset credits are not reported"})
-    key, allowed_url, convert = account
+    key, _, allowed_url, convert = account
     if url != allowed_url:
         return _response(403, {"error": "unsupported URL"})
     stats = _stats(registry, key)

@@ -8,12 +8,22 @@ if kamal_path="$(command -v kamal 2>/dev/null)" && {
   exec "$kamal_path" "$@"
 fi
 
-# SELinux must allow this Docker client to use the host daemon's socket.
+docker_host="${DOCKER_HOST:-}"
+if [[ -n "${DOCKER_CONTEXT:-}" || -z "$docker_host" ]]; then
+  docker_host="$(docker context inspect --format '{{.Endpoints.docker.Host}}')"
+fi
+case "$docker_host" in
+  unix://*) docker_socket="${docker_host#unix://}" ;;
+  *)
+    echo "The Kamal container requires a local Unix Docker socket." >&2
+    exit 1
+    ;;
+esac
+
 exec docker run --rm -it \
-  --security-opt label=disable \
   --network host \
   -v "$PWD:/work" \
   -v "$HOME/.ssh:/root/.ssh:ro" \
-  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v "$docker_socket:/var/run/docker.sock" \
   -w /work \
   ghcr.io/basecamp/kamal:latest "$@"

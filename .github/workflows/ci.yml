@@ -15,15 +15,7 @@ run-name: CI / ${{ github.ref_name }}
 # Linux wheel, then uploads as a separate artifact for downstream consumption.
 
 on:
-  push:
-    # Verify the self-hosted deployment branch before its image is published.
-    branches: [main, self-hosted]
-  pull_request:
-    branches: [main, self-hosted]
-    paths-ignore:
-      - 'docs/**'
-      - 'wiki/**'
-      - '**/*.md'
+  # Broad upstream validation is opt-in in this downstream repository.
   workflow_dispatch:
 
 permissions:

@@ -19,17 +19,7 @@ name: Init Native E2E
 # each per-command workflow only supplies its matrix and assertion steps.
 
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - "headroom/cli/init.py"
-      - "headroom/install/**"
-      - "e2e/_lib/**"
-      - "e2e/init/**"
-      - ".github/actions/headroom-e2e-setup/**"
-      - ".github/workflows/init-native-e2e.yml"
-  push:
-    branches: [main]
+  # Broad upstream validation is opt-in in this downstream repository.
   workflow_dispatch:
 
 permissions:

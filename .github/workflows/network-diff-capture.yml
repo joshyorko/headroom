@@ -1,6 +1,7 @@
 name: Network Diff Capture
 
 on:
+  # Broad upstream validation is opt-in in this downstream repository.
   workflow_dispatch:
 
 permissions:

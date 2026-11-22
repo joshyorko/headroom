@@ -18,11 +18,7 @@ name: Validate Docs
 # `wiki/cli.md`); nothing builds or publishes it, so it needs no syncing.
 
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - 'docs/**'
-      - '.github/workflows/docs.yml'
+  # Broad upstream validation is opt-in in this downstream repository.
   workflow_dispatch:
 
 permissions:

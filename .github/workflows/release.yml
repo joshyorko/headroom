@@ -30,26 +30,6 @@ on:
   # workflow. Ordinary branch pushes never publish packages.
   release:
     types: [published]
-  # X2: PR-time release dry-run. Trigger on PRs that touch release-
-  # critical paths so the wheel matrix + smoke-import gate run BEFORE
-  # merge — not after the tag is pushed and main is broken. Path
-  # filter is deliberately narrow: source-only PRs to headroom-core
-  # / headroom-proxy don't change wheel layout, so they don't need
-  # the dry-run. Issues this would have caught: #379 (docker bake
-  # name=), #382 (sdist os-mismatch), #384/#385/#386 (glibc shim
-  # iterations), #387's own shellcheck regression.
-  pull_request:
-    paths:
-      - ".github/workflows/release.yml"
-      - ".github/workflows/docker.yml"
-      - "crates/headroom-py/**"
-      - "pyproject.toml"
-      - "scripts/verify-versions.py"
-      - "scripts/version-sync.py"
-      - "scripts/build_npm_release_assets.mjs"
-      - "scripts/verify_npm_release_assets.mjs"
-      - "Cargo.toml"
-      - "Cargo.lock"
   workflow_dispatch:
     inputs:
       version:

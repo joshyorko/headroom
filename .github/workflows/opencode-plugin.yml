@@ -6,20 +6,8 @@ name: OpenCode Plugin
 # zero build evidence. This gate runs the plugin's own typecheck + build + test
 # whenever it (or this workflow) changes.
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - "plugins/opencode/**"
-      - "headroom/providers/opencode/_dist/**"
-      - "headroom/providers/opencode/hook-shim/**"
-      - ".github/workflows/opencode-plugin.yml"
-  push:
-    branches: [main]
-    paths:
-      - "plugins/opencode/**"
-      - "headroom/providers/opencode/_dist/**"
-      - "headroom/providers/opencode/hook-shim/**"
-      - ".github/workflows/opencode-plugin.yml"
+  # Broad upstream validation is opt-in in this downstream repository.
+  workflow_dispatch:
 
 permissions:
   contents: read

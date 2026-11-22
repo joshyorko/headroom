@@ -465,7 +465,7 @@ def test_only_the_root_cell_can_ever_publish_a_bare_latest_tag() -> None:
     # The self-hosted root lane intentionally emits :latest on self-hosted
     # branch pushes; the matrix assertion above proves no nonroot cell exists.
     assert (
-        "type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref_name == 'self-hosted' && matrix.variant.name == '' }}"
+        "type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref_name == 'main' && matrix.variant.name == '' }}"
         in meta["with"]["tags"]
     )
 
@@ -1735,17 +1735,18 @@ def test_release_please_automation_is_not_present() -> None:
     assert not [path for path in obsolete_paths if (ROOT / path).exists()]
 
 
-def test_ci_covers_self_hosted_pushes_and_pull_requests() -> None:
+def test_downstream_ci_targets_main_and_keeps_upstream_suites_manual() -> None:
     workflow = yaml.load(
-        (ROOT / ".github" / "workflows" / "ci.yml").read_text(), Loader=yaml.BaseLoader
+        (ROOT / ".github/workflows/downstream-ci.yml").read_text(), Loader=yaml.BaseLoader
     )
-
-    assert workflow["run-name"] == "CI / ${{ github.ref_name }}"
-    assert "self-hosted" in workflow["on"]["push"]["branches"]
-    assert "self-hosted" in workflow["on"]["pull_request"]["branches"]
-    native_filter = workflow["jobs"]["changes"]["steps"][1]["with"]["filters"]
-    assert "'config/deploy.yml'" in native_filter
-    assert "'docker-bake.hcl'" in native_filter
+    assert workflow["on"]["push"]["branches"] == ["main"]
+    assert workflow["on"]["pull_request"]["branches"] == ["main"]
+    for path in (ROOT / ".github/workflows").glob("*.yml"):
+        triggers = yaml.load(path.read_text(), Loader=yaml.BaseLoader)["on"]
+        if path.name not in {"downstream-ci.yml", "docker.yml", "release.yml"}:
+            assert set(triggers) == {"workflow_dispatch"}, path
+    docker = yaml.load((ROOT / ".github/workflows/docker.yml").read_text(), Loader=yaml.BaseLoader)
+    assert docker["on"]["push"]["branches"] == ["main"]
 
 
 def test_self_hosted_image_keeps_bedrock_and_memory_stack_dependencies() -> None:

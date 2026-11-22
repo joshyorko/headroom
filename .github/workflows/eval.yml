@@ -1,17 +1,8 @@
 name: Evaluation Suite
 
 on:
-  schedule:
-    - cron: '0 6 * * 1'  # Weekly on Monday 6am UTC
-  workflow_dispatch:       # Manual trigger
-  pull_request:
-    paths:
-      - 'headroom/transforms/**'
-      - 'headroom/evals/**'
-      - 'headroom/compress.py'
-      - 'crates/**'          # Rust compressors are compiled into headroom._core
-      - 'Cargo.toml'         # and exercised by the eval smoke test (SmartCrusher
-      - 'Cargo.lock'         # import in the smoke-test job); Rust-only PRs currently skip it
+  # Broad upstream validation is opt-in in this downstream repository.
+  workflow_dispatch:
 
 permissions:
   contents: read

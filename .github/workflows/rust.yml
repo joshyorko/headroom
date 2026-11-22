@@ -10,14 +10,8 @@ name: rust
 # Same coverage as the old filter — the path list moved verbatim into
 # `rust-changes` — but `parity` is now safe to mark required on `main`.
 on:
-  push:
-    branches: [ main, rust-rewrite ]
-  pull_request:
-  schedule:
-    # Nightly parity run at 07:17 UTC (weekdays only). Redundant with the
-    # per-PR gate below, but catches drift from toolchain/dependency updates
-    # that land without touching any filtered path.
-    - cron: '17 7 * * 1-5'
+  # Broad upstream validation is opt-in in this downstream repository.
+  workflow_dispatch:
 
 concurrency:
   group: rust-${{ github.ref }}

@@ -119,7 +119,7 @@ def resolve_headroom_command() -> list[str]:
     if checkout_script.is_file() and os.access(checkout_script, os.X_OK):
         return [str(checkout_script)]
 
-    return [sys.executable, "-m", "headroom.cli"]
+    return [sys.executable, "-P", "-m", "headroom.cli"]
 
 
 def resolve_headroom_config_command() -> list[str]:
@@ -164,7 +164,7 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
     """Build the raw foreground command that runs the proxy."""
 
     if manifest.runtime_kind == RuntimeKind.PYTHON.value:
-        return [sys.executable, "-m", "headroom.cli", "proxy", *manifest.proxy_args]
+        return [sys.executable, "-P", "-m", "headroom.cli", "proxy", *manifest.proxy_args]
 
     _ensure_host_dirs()
     home = str(Path.home())

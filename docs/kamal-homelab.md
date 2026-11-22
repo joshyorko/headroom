@@ -74,7 +74,7 @@ For later changes:
 bin/kamal deploy
 ```
 
-Before redeploying, confirm the `CI` and `Docker` workflows succeeded for the `self-hosted` commit. The Docker workflow publishes the `latest` image only after its image smoke checks pass.
+Before redeploying, confirm the `Downstream CI` and `Docker` workflows succeeded for the `main` commit. The Docker workflow publishes the `latest` image only after its image smoke checks pass.
 
 ## Calibrate output shaping
 
